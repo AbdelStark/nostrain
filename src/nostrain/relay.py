@@ -76,6 +76,8 @@ class CollectedGradientEvent:
             "event_id": self.event_id,
             "kind": self.parsed.event.kind,
             "created_at": self.parsed.event.created_at,
+            "signed": self.parsed.event.is_signed,
+            "pubkey": self.parsed.event.pubkey,
             "run": self.parsed.metadata.run_name,
             "round": self.parsed.metadata.round_index,
             "worker": self.parsed.metadata.worker_id,

@@ -2,23 +2,24 @@
 
 Distributed ML training over Nostr relays.
 
-The project vision is still the same: no coordinator, no central server, just workers exchanging sparse pseudo-gradients through Nostr. The repository now ships the protocol/payload toolkit plus the first relay transport slice: model snapshots, DiLoCo-style deltas, sparse transport payloads, nostrain event envelopes, and relay collection for one round.
+The project vision is still the same: no coordinator, no central server, just workers exchanging sparse pseudo-gradients through Nostr. The repository now ships the protocol/payload toolkit plus a signed relay transport slice: model snapshots, DiLoCo-style deltas, sparse transport payloads, NIP-01-compatible nostrain event envelopes, and relay collection for one round.
 
 ## Current status
 
-`nostrain` v0.2.0 is a protocol and relay toolchain. It implements:
+`nostrain` v0.3.0 is a protocol and relay toolchain. It implements:
 
 - canonical model-state JSON loading and hashing
 - pseudo-gradient computation (`current - initial`)
 - top-k sparsification + int8 quantization + wire compression
 - multi-worker delta aggregation
 - momentum-backed local outer updates
+- deterministic NIP-01 event IDs plus BIP340 Schnorr signing/verification
 - nostrain gradient event construction and validation
 - websocket relay publish/subscribe for gradient events
 - replay-safe event collection and round aggregation over a relay
 - a CLI for encoding, decoding, applying, publishing, collecting, and inspecting payloads
 
-It does **not** yet implement Nostr event signing, worker discovery, or training-script orchestration. Public relays that enforce signed NIP-01 events will reject these envelopes today; the transport milestone in this repository targets local or permissive relay endpoints while signing remains the next protocol upgrade.
+It does **not** yet implement worker discovery, multi-relay redundancy, or training-script orchestration. The signed transport path now targets public NIP-01 relays as well as local/mock websocket endpoints.
 
 ## Install
 
@@ -103,7 +104,14 @@ nostrain build-event payload.json \
   --round 7 \
   --worker worker-pubkey \
   --model "$(nostrain hash-state initial.json)" \
+  --sec-key 0000000000000000000000000000000000000000000000000000000000000003 \
   -o event.json
+```
+
+Derive an x-only Nostr pubkey from a worker secret key:
+
+```bash
+nostrain derive-pubkey 0000000000000000000000000000000000000000000000000000000000000003
 ```
 
 Publish the event to a relay-compatible websocket endpoint:
@@ -144,6 +152,8 @@ nostrain inspect-event event.json --json
 
 Gradient events still target Nostr kind `33333`. The implemented envelope includes:
 
+- NIP-01 top-level fields: `id`, `pubkey`, `created_at`, `kind`, `tags`, `content`, `sig`
+
 - `d`: `run:<run-name>:worker:<worker-id>:round:<round>`
 - `t`: `nostrain`
 - `run`
@@ -164,7 +174,7 @@ The event content is a base64 wire payload containing:
 4. int8 quantized values + scale
 5. compressed bytes (`zlib` now, optional `zstd` when installed)
 
-Relay collection currently subscribes on `kind=33333` and `#t=["nostrain"]`, then narrows `run` and `round` client-side. This avoids relying on non-standard multi-character tag indexing at the relay layer.
+Relay collection currently subscribes on `kind=33333` and `#t=["nostrain"]`, then narrows `run` and `round` client-side. This avoids relying on non-standard multi-character tag indexing at the relay layer while remaining compatible with NIP-01 relay indexing rules.
 
 ## Roadmap
 
@@ -177,7 +187,7 @@ Relay collection currently subscribes on `kind=33333` and `#t=["nostrain"]`, the
 - [x] CLI for local encode/decode/apply/inspect workflows
 - [x] Relay publish/subscribe transport
 - [x] Replay-safe relay round collection and aggregation
-- [ ] Event signing for public relays
+- [x] Event signing for public relays
 - [ ] Worker discovery and heartbeat events
 - [ ] Training-script integration with DiLoCo inner/outer loops
 - [ ] Multi-relay redundancy

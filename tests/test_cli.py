@@ -13,6 +13,8 @@ from tests.helpers import assert_state_json_almost_equal
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
+TEST_SECRET_KEY = "0000000000000000000000000000000000000000000000000000000000000003"
+TEST_PUBLIC_KEY = "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9"
 
 
 class CliWorkflowTests(unittest.TestCase):
@@ -44,6 +46,9 @@ class CliWorkflowTests(unittest.TestCase):
 
             digest = self._run("hash-state", str(FIXTURES / "initial_state.json")).stdout.strip()
             self.assertEqual(len(digest), 64)
+
+            derived_pubkey = self._run("derive-pubkey", TEST_SECRET_KEY).stdout.strip()
+            self.assertEqual(derived_pubkey, TEST_PUBLIC_KEY)
 
             self._run(
                 "encode-delta",
@@ -137,6 +142,8 @@ class CliWorkflowTests(unittest.TestCase):
                 "500",
                 "--created-at",
                 "1700000000",
+                "--sec-key",
+                TEST_SECRET_KEY,
                 "-o",
                 str(event_path),
             )
@@ -147,6 +154,10 @@ class CliWorkflowTests(unittest.TestCase):
             self.assertEqual(summary["run"], "demo-run")
             self.assertEqual(summary["round"], 7)
             self.assertEqual(summary["worker"], "worker-pubkey")
+            self.assertTrue(summary["signed"])
+            self.assertEqual(summary["signing_state"], "signed")
+            self.assertEqual(summary["pubkey"], TEST_PUBLIC_KEY)
+            self.assertEqual(len(summary["event_id"]), 64)
 
 
 if __name__ == "__main__":

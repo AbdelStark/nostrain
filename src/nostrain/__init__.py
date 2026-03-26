@@ -8,6 +8,7 @@ from .compression import (
     decompress_payload,
     inspect_payload,
 )
+from .crypto import schnorr_sign, schnorr_verify, secret_key_to_public_key
 from .model import (
     ModelState,
     TensorLayout,
@@ -61,9 +62,12 @@ __all__ = [
     "parse_gradient_event",
     "publish_gradient_event",
     "scale_state",
+    "schnorr_sign",
+    "schnorr_verify",
+    "secret_key_to_public_key",
     "state_digest",
     "subtract_states",
     "zeros_like",
 ]
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

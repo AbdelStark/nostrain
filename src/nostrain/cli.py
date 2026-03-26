@@ -8,6 +8,7 @@ from typing import Any
 
 from .aggregation import aggregate_deltas, nesterov_outer_step
 from .compression import CompressionCodec, compress_delta, decompress_payload, inspect_payload
+from .crypto import secret_key_to_public_key
 from .model import ModelState, apply_delta, compute_delta, state_digest
 from .protocol import GradientEventMetadata, build_gradient_event, parse_gradient_event
 from .relay import collect_gradient_events, publish_gradient_event
@@ -50,6 +51,11 @@ def _handle_hash_state(args: argparse.Namespace) -> int:
     return 0
 
 
+def _handle_derive_pubkey(args: argparse.Namespace) -> int:
+    _write_text(args.output, secret_key_to_public_key(args.sec_key))
+    return 0
+
+
 def _handle_encode_delta(args: argparse.Namespace) -> int:
     initial = ModelState.from_path(args.initial)
     current = ModelState.from_path(args.current)
@@ -80,15 +86,30 @@ def _handle_apply_payload(args: argparse.Namespace) -> int:
 
 def _handle_build_event(args: argparse.Namespace) -> int:
     payload = _load_payload_string(args.payload)
+    worker_id = args.worker
+    if worker_id is None and args.sec_key:
+        worker_id = secret_key_to_public_key(args.sec_key)
+    if worker_id is None and args.pubkey:
+        worker_id = args.pubkey.strip().lower()
+    if worker_id is None:
+        raise ValueError("--worker is required unless --sec-key or --pubkey is provided")
+
     metadata = GradientEventMetadata(
         run_name=args.run,
         round_index=args.round,
-        worker_id=args.worker,
+        worker_id=worker_id,
         model_hash=args.model,
         inner_steps=args.steps,
         created_at=args.created_at,
     )
-    event = build_gradient_event(metadata, payload)
+    event = build_gradient_event(
+        metadata,
+        payload,
+        secret_key_hex=args.sec_key,
+        public_key_hex=args.pubkey,
+        signature_hex=args.sig,
+        event_id=args.event_id,
+    )
     _write_json(args.output, event.to_json_obj())
     return 0
 
@@ -225,8 +246,12 @@ def _event_summary(path: str | Path) -> dict[str, Any]:
     event = _load_json(path)
     parsed = parse_gradient_event(event)
     return {
+        "event_id": parsed.event.fingerprint(),
         "kind": parsed.event.kind,
         "created_at": parsed.event.created_at,
+        "signed": parsed.event.is_signed,
+        "signing_state": parsed.event.signing_state,
+        "pubkey": parsed.event.pubkey,
         "run": parsed.metadata.run_name,
         "round": parsed.metadata.round_index,
         "worker": parsed.metadata.worker_id,
@@ -249,8 +274,12 @@ def _handle_inspect_event(args: argparse.Namespace) -> int:
         return 0
 
     lines = [
+        f"event_id: {summary['event_id']}",
         f"kind: {summary['kind']}",
         f"created_at: {summary['created_at']}",
+        f"signed: {summary['signed']}",
+        f"signing_state: {summary['signing_state']}",
+        f"pubkey: {summary['pubkey'] or '-'}",
         f"run: {summary['run']}",
         f"round: {summary['round']}",
         f"worker: {summary['worker']}",
@@ -281,6 +310,14 @@ def build_parser() -> argparse.ArgumentParser:
     hash_state.add_argument("state", help="Path to a model state JSON file.")
     hash_state.add_argument("-o", "--output", help="Optional output path.")
     hash_state.set_defaults(handler=_handle_hash_state)
+
+    derive_pubkey = subparsers.add_parser(
+        "derive-pubkey",
+        help="Derive a Nostr x-only public key from a 32-byte secp256k1 secret key.",
+    )
+    derive_pubkey.add_argument("sec_key", help="Lowercase hex-encoded 32-byte secret key.")
+    derive_pubkey.add_argument("-o", "--output", help="Optional output path.")
+    derive_pubkey.set_defaults(handler=_handle_derive_pubkey)
 
     encode_delta = subparsers.add_parser(
         "encode-delta",
@@ -336,18 +373,37 @@ def build_parser() -> argparse.ArgumentParser:
 
     build_event = subparsers.add_parser(
         "build-event",
-        help="Wrap a compressed payload in a nostrain gradient event envelope.",
+        help="Wrap a compressed payload in a nostrain gradient event envelope, optionally signed for NIP-01 relays.",
     )
     build_event.add_argument("payload", help="Path to a raw payload or payload JSON file.")
     build_event.add_argument("--run", required=True, help="Training run name.")
     build_event.add_argument("--round", type=int, required=True, help="Outer round number.")
-    build_event.add_argument("--worker", required=True, help="Worker identity or pubkey.")
+    build_event.add_argument(
+        "--worker",
+        help="Worker identity tag. Defaults to the derived/provided pubkey when signing inputs are supplied.",
+    )
     build_event.add_argument("--model", required=True, help="Model snapshot hash.")
     build_event.add_argument(
         "--steps",
         type=int,
         default=500,
         help="Inner training steps represented by this payload (default: 500).",
+    )
+    build_event.add_argument(
+        "--sec-key",
+        help="Lowercase hex-encoded 32-byte secret key used to sign the event locally.",
+    )
+    build_event.add_argument(
+        "--pubkey",
+        help="Lowercase hex-encoded x-only public key for delegated signing workflows.",
+    )
+    build_event.add_argument(
+        "--sig",
+        help="Lowercase hex-encoded Schnorr signature to attach to a delegated-signing event.",
+    )
+    build_event.add_argument(
+        "--event-id",
+        help="Optional explicit event id to verify against the canonical serialized event.",
     )
     build_event.add_argument(
         "--created-at",

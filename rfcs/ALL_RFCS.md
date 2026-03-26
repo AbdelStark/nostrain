@@ -13,7 +13,7 @@ Kind `33333` (parameterized replaceable). Workers publish one event per outer ro
 - `run`, `round`, `worker`, `model`, `steps`
 - `compression`, `params`, `values`, `selected`
 
-Event content is a base64-encoded compressed pseudo-gradient payload. The current transport subscribes with relay filter `kinds=[33333], #t=["nostrain"]` and narrows `run` and `round` client-side, since NIP-01 standardizes relay indexing only for single-letter tags. Event signing is still pending, so public relays may reject these envelopes.
+Event content is a base64-encoded compressed pseudo-gradient payload. The current transport subscribes with relay filter `kinds=[33333], #t=["nostrain"]` and narrows `run` and `round` client-side, since NIP-01 standardizes relay indexing only for single-letter tags. Publication now supports canonical NIP-01 event ids and BIP340 Schnorr signatures so the same envelope can be accepted by public relays.
 
 # RFC-003: Compression Pipeline
 

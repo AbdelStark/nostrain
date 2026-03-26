@@ -13,15 +13,25 @@ import unittest
 
 import websockets
 
-from nostrain.model import ModelState, compute_delta, state_digest
-from nostrain.protocol import GradientEventMetadata, NostrainEvent, build_gradient_event
-from nostrain.relay import collect_gradient_events
 from nostrain.compression import compress_delta
+from nostrain.model import ModelState, compute_delta, state_digest
+from nostrain.protocol import (
+    GradientEventMetadata,
+    NostrainEvent,
+    build_gradient_event,
+    parse_gradient_event,
+)
+from nostrain.relay import collect_gradient_events
 from tests.helpers import assert_state_json_almost_equal
 
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
+WORKER_SECRET_KEYS = {
+    "worker-a": "0000000000000000000000000000000000000000000000000000000000000003",
+    "worker-b": "0000000000000000000000000000000000000000000000000000000000000004",
+    "worker-c": "0000000000000000000000000000000000000000000000000000000000000005",
+}
 
 
 def _frame(payload: list[Any]) -> str:
@@ -50,6 +60,7 @@ def _build_event(
             created_at=created_at,
         ),
         payload,
+        secret_key_hex=WORKER_SECRET_KEYS[worker_id],
     )
     return event.to_json_obj()
 
@@ -115,16 +126,26 @@ class MockRelay:
             ]
 
     async def _handle_publish(self, websocket, frame: list[Any]) -> None:
-        event = frame[1]
-        event_id = NostrainEvent.from_json_obj(event).fingerprint()
         accepted = True
         message = "stored"
+        parsed_event_json: dict[str, Any] | None = None
+        event_id = ""
         try:
-            self._events.append(event)
-            await self._broadcast_event(event)
-        except Exception as exc:  # pragma: no cover - not exercised in current tests
+            parsed = parse_gradient_event(frame[1])
+            if not parsed.event.is_signed:
+                raise ValueError("relay requires fully signed NIP-01 events")
+            event_id = parsed.event.fingerprint()
+            parsed_event_json = parsed.event.to_json_obj()
+            self._events.append(parsed_event_json)
+            await self._broadcast_event(parsed_event_json)
+        except Exception as exc:
             accepted = False
             message = f"invalid: {exc}"
+            if parsed_event_json is None:
+                try:
+                    event_id = NostrainEvent.from_json_obj(frame[1]).fingerprint()
+                except Exception:
+                    event_id = ""
         await websocket.send(_frame(["OK", event_id, accepted, message]))
 
     async def _handle_subscription(self, websocket, frame: list[Any]) -> None:
@@ -185,6 +206,10 @@ class MockRelay:
             return False
 
         for key, values in relay_filter.items():
+            if key == "authors":
+                if str(event.get("pubkey")) not in {str(value) for value in values}:
+                    return False
+                continue
             if not key.startswith("#"):
                 continue
             tag_name = key[1:]
@@ -235,7 +260,7 @@ class RelayTransportTests(unittest.TestCase):
             current_fixture="current_state.json",
             created_at=1_700_000_030,
         )
-        invalid["content"] = "not-a-valid-payload"
+        invalid["sig"] = "00" * 64
 
         with MockRelay([older, wrong_round, invalid, newer]) as relay:
             collection = asyncio.run(
@@ -252,6 +277,7 @@ class RelayTransportTests(unittest.TestCase):
         self.assertEqual(collection.invalid_events, 1)
         self.assertEqual(collection.events[0].parsed.event.created_at, 1_700_000_010)
         self.assertEqual(collection.worker_ids, ("worker-a",))
+        self.assertTrue(collection.events[0].parsed.event.is_signed)
 
     def test_cli_publish_collect_and_aggregate_roundtrip(self) -> None:
         expected_average = {
@@ -318,6 +344,8 @@ class RelayTransportTests(unittest.TestCase):
                 digest,
                 "--created-at",
                 "1700000001",
+                "--sec-key",
+                WORKER_SECRET_KEYS["worker-a"],
                 "-o",
                 str(event_a),
             )
@@ -334,6 +362,8 @@ class RelayTransportTests(unittest.TestCase):
                 digest,
                 "--created-at",
                 "1700000002",
+                "--sec-key",
+                WORKER_SECRET_KEYS["worker-b"],
                 "-o",
                 str(event_b),
             )
@@ -360,6 +390,7 @@ class RelayTransportTests(unittest.TestCase):
             publish_result = json.loads(publish_a.read_text(encoding="utf-8"))
             self.assertTrue(publish_result["accepted"])
             self.assertEqual(publish_result["relay"], relay.url)
+            self.assertEqual(len(publish_result["event_id"]), 64)
 
             self._run(
                 "collect-events",
@@ -382,6 +413,7 @@ class RelayTransportTests(unittest.TestCase):
             self.assertEqual(sorted(collected_json["workers"]), ["worker-a", "worker-b"])
             self.assertEqual(collected_json["duplicates_discarded"], 0)
             self.assertEqual(collected_json["invalid_events"], 0)
+            self.assertTrue(all(event["signed"] for event in collected_json["events"]))
 
             self._run(
                 "aggregate-payloads",
@@ -425,6 +457,47 @@ class RelayTransportTests(unittest.TestCase):
             aggregation_summary_json = json.loads(aggregation_summary.read_text(encoding="utf-8"))
             self.assertEqual(aggregation_summary_json["event_count"], 2)
             self.assertEqual(sorted(aggregation_summary_json["workers"]), ["worker-a", "worker-b"])
+
+    def test_cli_publish_rejects_unsigned_event_on_signed_relay(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory, MockRelay() as relay:
+            tempdir = Path(temporary_directory)
+            payload_path = tempdir / "payload.json"
+            event_path = tempdir / "event.json"
+
+            digest = self._run("hash-state", str(FIXTURES / "initial_state.json")).stdout.strip()
+            self._run(
+                "encode-delta",
+                str(FIXTURES / "initial_state.json"),
+                str(FIXTURES / "current_state.json"),
+                "--topk",
+                "1.0",
+                "-o",
+                str(payload_path),
+            )
+            self._run(
+                "build-event",
+                str(payload_path),
+                "--run",
+                "demo-run",
+                "--round",
+                "7",
+                "--worker",
+                "worker-a",
+                "--model",
+                digest,
+                "--created-at",
+                "1700000001",
+                "-o",
+                str(event_path),
+            )
+
+            with self.assertRaises(subprocess.CalledProcessError):
+                self._run(
+                    "publish-event",
+                    str(event_path),
+                    "--relay",
+                    relay.url,
+                )
 
 
 if __name__ == "__main__":

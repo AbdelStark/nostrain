@@ -32,23 +32,23 @@ Delivered in the current repository state:
 - relay collection for one run/round with client-side run filtering and replay-safe deduplication
 - CLI commands for `publish-event`, `collect-events`, and `aggregate-round`
 - integration tests with a local mock relay covering publish/collect/aggregate flows
-- documentation updates describing the unsigned transport boundary
+- documentation updates describing the relay transport boundary
 
 This moves the project from offline payload tooling to a relay-connected prototype that can exchange and aggregate updates over a websocket transport.
 
-## Next milestone: event signing + public relay compatibility
+## Completed milestone: event signing + public relay compatibility
 
-Goal: upgrade the current unsigned transport envelope into a real signed Nostr event flow that interoperates with public relays.
+Delivered in the current repository state:
 
-Deliverables:
+- canonical NIP-01 event serialization and deterministic event IDs
+- BIP340 Schnorr signing support for worker keypairs
+- relay publish path validated against signed-event expectations
+- tests covering official BIP340 vectors plus signed-event relay roundtrips
+- CLI support for `derive-pubkey`, local `--sec-key` signing, and delegated `--pubkey`/`--sig` event assembly
 
-- canonical event serialization and deterministic event IDs
-- Schnorr signing support for worker keypairs
-- relay publish path that satisfies NIP-01 event requirements
-- validation tests against signed-event fixtures and the local mock relay
-- CLI support for worker key material or delegated signing inputs
+This moves the project from a permissive/unsigned relay prototype to a public-relay-compatible signed transport.
 
-## Milestone after that: training runner
+## Next milestone: training runner
 
 Goal: connect the protocol layer to an actual DiLoCo inner/outer training loop.
 
