@@ -15,7 +15,9 @@ Relay I/O and live training orchestration are intentionally out of scope for thi
 5. Quantize retained values to int8 with a shared scale factor
 6. Compress the wire payload (`zlib` by default, optional `zstd`)
 7. Base64-wrap the payload for Nostr event content
-8. Build and validate nostrain gradient events (kind `33333`)
+8. Average multiple worker deltas into one aggregated update
+9. Apply a local Nesterov-style outer update with persistent momentum state
+10. Build and validate nostrain gradient events (kind `33333`)
 
 ## Model state schema
 
@@ -94,10 +96,25 @@ Implemented commands:
 nostrain hash-state <state.json>
 nostrain encode-delta <initial.json> <current.json> [--topk 0.01] [--codec zlib|zstd]
 nostrain decode-payload <payload.json>
+nostrain aggregate-payloads <payload-a.json> <payload-b.json> [...]
 nostrain apply-payload <base.json> <payload.json>
+nostrain outer-step <base.json> <aggregated.json> [--learning-rate 0.7] [--momentum 0.9]
 nostrain build-event <payload.json> --run <name> --round <n> --worker <id> --model <sha256>
 nostrain inspect-event <event.json> [--json]
 ```
+
+## Local outer step semantics
+
+The repository now supports local round simulation over decoded worker deltas.
+
+Given worker deltas `d_1 ... d_n`:
+
+1. aggregate with an arithmetic mean
+2. update velocity: `v_t = momentum * v_(t-1) + d_avg`
+3. compute Nesterov-style update: `u_t = learning_rate * (d_avg + momentum * v_t)`
+4. apply `u_t` to the base model state
+
+This treats the aggregated pseudo-gradient as an update direction inferred from local training drift rather than as a raw loss gradient.
 
 ## Deferred from v0.1.0
 

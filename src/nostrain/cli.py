@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .aggregation import aggregate_deltas, nesterov_outer_step
 from .compression import CompressionCodec, compress_delta, decompress_payload, inspect_payload
 from .model import ModelState, apply_delta, compute_delta, state_digest
 from .protocol import GradientEventMetadata, build_gradient_event, parse_gradient_event
@@ -87,6 +88,57 @@ def _handle_build_event(args: argparse.Namespace) -> int:
     )
     event = build_gradient_event(metadata, payload)
     _write_json(args.output, event.to_json_obj())
+    return 0
+
+
+def _load_delta_input(path: str | Path) -> ModelState:
+    raw_text = Path(path).read_text(encoding="utf-8").strip()
+    if not raw_text:
+        raise ValueError("delta input file is empty")
+    if raw_text.startswith("{"):
+        data = json.loads(raw_text)
+        if not isinstance(data, dict):
+            raise ValueError("delta input JSON must be an object")
+        if "parameters" in data:
+            return ModelState.from_json_obj(data)
+        if "payload" in data:
+            return decompress_payload(str(data["payload"]))
+    return decompress_payload(raw_text)
+
+
+def _handle_aggregate_payloads(args: argparse.Namespace) -> int:
+    deltas = [_load_delta_input(path) for path in args.inputs]
+    aggregated = aggregate_deltas(deltas)
+    _write_json(args.output, aggregated.to_json_obj())
+    return 0
+
+
+def _handle_outer_step(args: argparse.Namespace) -> int:
+    base = ModelState.from_path(args.base)
+    aggregated_delta = _load_delta_input(args.delta)
+    previous_momentum = (
+        ModelState.from_path(args.momentum_state) if args.momentum_state else None
+    )
+    result = nesterov_outer_step(
+        base,
+        aggregated_delta,
+        learning_rate=args.learning_rate,
+        momentum=args.momentum,
+        previous_momentum=previous_momentum,
+    )
+    _write_json(args.output, result.next_state.to_json_obj())
+    if args.momentum_out:
+        _write_json(args.momentum_out, result.momentum_state.to_json_obj())
+    if args.summary_out:
+        _write_json(
+            args.summary_out,
+            {
+                "learning_rate": args.learning_rate,
+                "momentum": args.momentum,
+                "parameter_count": result.next_state.parameter_count,
+                "aggregated_values": result.aggregated_delta.total_values,
+            },
+        )
     return 0
 
 
@@ -182,6 +234,18 @@ def build_parser() -> argparse.ArgumentParser:
     decode_payload.add_argument("-o", "--output", help="Optional output path.")
     decode_payload.set_defaults(handler=_handle_decode_payload)
 
+    aggregate_payloads = subparsers.add_parser(
+        "aggregate-payloads",
+        help="Average one or more payloads or decoded delta JSON files into a single delta.",
+    )
+    aggregate_payloads.add_argument(
+        "inputs",
+        nargs="+",
+        help="Paths to raw payloads, payload JSON files, or decoded delta JSON files.",
+    )
+    aggregate_payloads.add_argument("-o", "--output", help="Optional output path.")
+    aggregate_payloads.set_defaults(handler=_handle_aggregate_payloads)
+
     apply_payload = subparsers.add_parser(
         "apply-payload",
         help="Apply a pseudo-gradient payload to a base model state to reconstruct the next state.",
@@ -213,6 +277,42 @@ def build_parser() -> argparse.ArgumentParser:
     )
     build_event.add_argument("-o", "--output", help="Optional output path.")
     build_event.set_defaults(handler=_handle_build_event)
+
+    outer_step = subparsers.add_parser(
+        "outer-step",
+        help="Apply a local DiLoCo-style outer update using an aggregated delta and optional momentum state.",
+    )
+    outer_step.add_argument("base", help="Path to the base model state JSON.")
+    outer_step.add_argument(
+        "delta",
+        help="Path to an aggregated delta JSON file, payload JSON file, or raw payload file.",
+    )
+    outer_step.add_argument(
+        "--learning-rate",
+        type=float,
+        default=0.7,
+        help="Outer learning rate (default: 0.7).",
+    )
+    outer_step.add_argument(
+        "--momentum",
+        type=float,
+        default=0.9,
+        help="Nesterov momentum coefficient (default: 0.9).",
+    )
+    outer_step.add_argument(
+        "--momentum-state",
+        help="Optional prior momentum state JSON file.",
+    )
+    outer_step.add_argument(
+        "--momentum-out",
+        help="Optional path to write the next momentum state JSON.",
+    )
+    outer_step.add_argument(
+        "--summary-out",
+        help="Optional path to write a small JSON summary of the outer step.",
+    )
+    outer_step.add_argument("-o", "--output", help="Optional output path.")
+    outer_step.set_defaults(handler=_handle_outer_step)
 
     inspect_event = subparsers.add_parser(
         "inspect-event",

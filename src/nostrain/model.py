@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
-import math
 import struct
 from pathlib import Path
 from typing import Any
@@ -190,42 +189,66 @@ def _check_same_structure(left: ModelState, right: ModelState) -> tuple[TensorSt
     return tuple(matched)
 
 
-def compute_delta(initial: ModelState, current: ModelState) -> ModelState:
-    current_parameters = _check_same_structure(initial, current)
-    deltas: list[TensorState] = []
-    for initial_parameter, current_parameter in zip(initial.parameters, current_parameters):
+def _combine_states(
+    left: ModelState,
+    right: ModelState,
+    op,
+) -> ModelState:
+    right_parameters = _check_same_structure(left, right)
+    combined: list[TensorState] = []
+    for left_parameter, right_parameter in zip(left.parameters, right_parameters):
         values = tuple(
-            current_value - initial_value
-            for initial_value, current_value in zip(
-                initial_parameter.values, current_parameter.values
-            )
+            op(left_value, right_value)
+            for left_value, right_value in zip(left_parameter.values, right_parameter.values)
         )
-        deltas.append(
+        combined.append(
             TensorState(
-                name=initial_parameter.name,
-                shape=initial_parameter.shape,
+                name=left_parameter.name,
+                shape=left_parameter.shape,
                 values=values,
             )
         )
-    return ModelState(parameters=tuple(deltas))
+    return ModelState(parameters=tuple(combined))
+
+
+def compute_delta(initial: ModelState, current: ModelState) -> ModelState:
+    return _combine_states(initial, current, lambda initial_value, current_value: current_value - initial_value)
 
 
 def apply_delta(base: ModelState, delta: ModelState) -> ModelState:
-    delta_parameters = _check_same_structure(base, delta)
-    updated: list[TensorState] = []
-    for base_parameter, delta_parameter in zip(base.parameters, delta_parameters):
-        values = tuple(
-            base_value + delta_value
-            for base_value, delta_value in zip(base_parameter.values, delta_parameter.values)
+    return _combine_states(base, delta, lambda base_value, delta_value: base_value + delta_value)
+
+
+def add_states(left: ModelState, right: ModelState) -> ModelState:
+    return _combine_states(left, right, lambda left_value, right_value: left_value + right_value)
+
+
+def subtract_states(left: ModelState, right: ModelState) -> ModelState:
+    return _combine_states(left, right, lambda left_value, right_value: left_value - right_value)
+
+
+def scale_state(state: ModelState, factor: float) -> ModelState:
+    scaled = [
+        TensorState(
+            name=parameter.name,
+            shape=parameter.shape,
+            values=tuple(value * factor for value in parameter.values),
         )
-        updated.append(
-            TensorState(
-                name=base_parameter.name,
-                shape=base_parameter.shape,
-                values=values,
-            )
+        for parameter in state.parameters
+    ]
+    return ModelState(parameters=tuple(scaled))
+
+
+def zeros_like(state: ModelState) -> ModelState:
+    zeroed = [
+        TensorState(
+            name=parameter.name,
+            shape=parameter.shape,
+            values=tuple(0.0 for _ in parameter.values),
         )
-    return ModelState(parameters=tuple(updated))
+        for parameter in state.parameters
+    ]
+    return ModelState(parameters=tuple(zeroed))
 
 
 def state_digest(state: ModelState) -> str:

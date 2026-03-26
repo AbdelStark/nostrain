@@ -34,9 +34,13 @@ class CliWorkflowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             tempdir = Path(temporary_directory)
             payload_path = tempdir / "payload.json"
+            payload_peer_path = tempdir / "payload-peer.json"
             reconstructed_path = tempdir / "reconstructed.json"
+            aggregated_path = tempdir / "aggregated.json"
             event_path = tempdir / "event.json"
             summary_path = tempdir / "summary.json"
+            next_state_path = tempdir / "next-state.json"
+            momentum_path = tempdir / "momentum.json"
 
             digest = self._run("hash-state", str(FIXTURES / "initial_state.json")).stdout.strip()
             self.assertEqual(len(digest), 64)
@@ -55,6 +59,16 @@ class CliWorkflowTests(unittest.TestCase):
             self.assertEqual(payload_json["stats"]["selected_values"], 12)
 
             self._run(
+                "encode-delta",
+                str(FIXTURES / "initial_state.json"),
+                str(FIXTURES / "current_state_peer.json"),
+                "--topk",
+                "1.0",
+                "-o",
+                str(payload_peer_path),
+            )
+
+            self._run(
                 "apply-payload",
                 str(FIXTURES / "initial_state.json"),
                 str(payload_path),
@@ -64,6 +78,49 @@ class CliWorkflowTests(unittest.TestCase):
             reconstructed = json.loads(reconstructed_path.read_text(encoding="utf-8"))
             current = json.loads((FIXTURES / "current_state.json").read_text(encoding="utf-8"))
             assert_state_json_almost_equal(self, reconstructed, current, places=2)
+
+            self._run(
+                "aggregate-payloads",
+                str(payload_path),
+                str(payload_peer_path),
+                "-o",
+                str(aggregated_path),
+            )
+            aggregated = json.loads(aggregated_path.read_text(encoding="utf-8"))
+            self.assertIn("parameters", aggregated)
+
+            self._run(
+                "outer-step",
+                str(FIXTURES / "initial_state.json"),
+                str(aggregated_path),
+                "--learning-rate",
+                "1.0",
+                "--momentum",
+                "0.0",
+                "--momentum-out",
+                str(momentum_path),
+                "-o",
+                str(next_state_path),
+            )
+            next_state = json.loads(next_state_path.read_text(encoding="utf-8"))
+            expected_average = {
+                "parameters": {
+                    "encoder.bias": {
+                        "shape": [3],
+                        "values": [0.0115, -0.0225, 0.0325],
+                    },
+                    "encoder.weight": {
+                        "shape": [2, 3],
+                        "values": [0.17, -0.11, 0.295, 0.435, -0.535, 0.615],
+                    },
+                    "head.weight": {
+                        "shape": [1, 3],
+                        "values": [0.625, -0.25, 0.77],
+                    },
+                }
+            }
+            assert_state_json_almost_equal(self, next_state, expected_average, places=2)
+            self.assertTrue(momentum_path.exists())
 
             self._run(
                 "build-event",

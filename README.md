@@ -11,6 +11,8 @@ The project vision is still the same: no coordinator, no central server, just wo
 - canonical model-state JSON loading and hashing
 - pseudo-gradient computation (`current - initial`)
 - top-k sparsification + int8 quantization + wire compression
+- multi-worker delta aggregation
+- momentum-backed local outer updates
 - nostrain gradient event construction and validation
 - a CLI for encoding, decoding, applying, and inspecting payloads
 
@@ -75,6 +77,22 @@ Apply a payload to reconstruct the updated model state:
 nostrain apply-payload initial.json payload.json -o reconstructed.json
 ```
 
+Average several worker payloads into one aggregated delta:
+
+```bash
+nostrain aggregate-payloads worker-a.json worker-b.json -o aggregated.json
+```
+
+Apply a local DiLoCo-style outer step:
+
+```bash
+nostrain outer-step initial.json aggregated.json \
+  --learning-rate 0.7 \
+  --momentum 0.9 \
+  --momentum-out next-momentum.json \
+  -o next-state.json
+```
+
 Build a nostrain event envelope:
 
 ```bash
@@ -121,6 +139,8 @@ The event content is a base64 wire payload containing:
 - [x] Canonical model-state format and hashing
 - [x] Pseudo-gradient delta computation
 - [x] Top-k + int8 compressed payload wire format
+- [x] Multi-worker delta aggregation
+- [x] Local outer-step simulation with momentum state
 - [x] nostrain gradient event builder and validator
 - [x] CLI for local encode/decode/apply/inspect workflows
 - [ ] Relay publish/subscribe transport
