@@ -2,22 +2,59 @@
 
 Inner optimizer: AdamW (lr=4e-4, weight_decay=0.1, warmup=1000 steps). Outer optimizer: Nesterov SGD (lr=0.7, momentum=0.9). Inner steps H=500 (configurable). Each worker maintains theta (current weights) and theta_initial (snapshot at start of round). Pseudo-gradient = theta - theta_initial. After outer step, all workers have the same theta and begin next round. Reference implementation: OpenDiLoCo by Prime Intellect.
 
+Implementation status: not yet wired into the repository runtime. The current codebase implements the payload math that this loop will emit and consume.
+
 # RFC-002: Nostr Event Protocol
 
-Kind 33333 (parameterized replaceable). Workers publish one event per outer round. Tags encode run metadata (name, round, worker pubkey, model hash, compression method). Content is base64-encoded compressed pseudo-gradients. Workers subscribe with filter: kinds=[33333], #t=["nostrain"], #run=[run_name], #round=[current_round]. Round completion: worker waits until it has events from N-1 other workers (or timeout). Multi-relay: publish to all configured relays, subscribe from all, deduplicate by event ID.
+Kind `33333` (parameterized replaceable). Workers publish one event per outer round. The implemented envelope tags are:
+
+- `d = run:<run-name>:worker:<worker-id>:round:<round>`
+- `t = nostrain`
+- `run`, `round`, `worker`, `model`, `steps`
+- `compression`, `params`, `values`, `selected`
+
+Event content is a base64-encoded compressed pseudo-gradient payload. Workers will eventually subscribe with filter `kinds=[33333], #t=["nostrain"], #run=[run_name], #round=[current_round]`.
 
 # RFC-003: Compression Pipeline
 
-Step 1 — Top-k sparsification: compute magnitudes of all gradient values, keep top k% (default 1%), zero the rest. Store as sparse tensor (indices as uint32 + values as float32). Step 2 — Int8 quantization: find max absolute value, compute scale = max_abs / 127, quantize values to int8, store scale as float32 header. Step 3 — zstd compression: compress the byte buffer (indices + quantized values + scale header). Step 4 — Base64 encode for Nostr event content field. Decompression is the exact reverse. Expected ratio: 50-200x for typical models.
+Implemented wire steps:
+
+1. Top-k sparsification over the flattened model value stream
+2. Sparse representation as a global index list plus quantized values
+3. Int8 quantization with a shared scale factor
+4. Container compression with `zlib` today and optional `zstd` support when installed
+5. Base64 encoding for Nostr event content
+
+The payload also stores a tensor layout manifest so sparse values can be reconstructed into named parameters.
 
 # RFC-004: Worker Discovery and Synchronization
 
-Discovery: workers publish a "heartbeat" event (kind 33334) every 60 seconds with worker metadata (pubkey, capabilities, current round). Other workers subscribe to heartbeats to know who is active. Round sync: configurable strategy. "strict" — wait for all known workers. "quorum" — wait for >50% of known workers. "async" — don't wait, use whatever arrived, apply outer step immediately. "timeout" — wait up to T seconds, then proceed with whatever arrived. Default: timeout with T=120s.
+Discovery: workers publish a "heartbeat" event (kind `33334`) every 60 seconds with worker metadata (pubkey, capabilities, current round). Other workers subscribe to heartbeats to know who is active. Round sync: configurable strategy. "strict" means wait for all known workers. "quorum" means wait for >50% of known workers. "async" means don't wait. "timeout" means wait up to `T` seconds, then proceed with whatever arrived. Default target remains timeout with `T=120s`.
+
+Implementation status: planned.
 
 # RFC-005: Fault Tolerance
 
-Worker crash: other workers detect via missing heartbeat (>3 missed = considered offline). Training continues with remaining workers. Crashed worker can rejoin by: (1) downloading latest model checkpoint from relay, (2) joining the current round. Relay failure: if publishing fails, retry with exponential backoff. If configured with multiple relays, failover to next relay. Stale gradients: if a worker's gradient arrives late (after outer step already applied), it is discarded. Consistency: since DiLoCo is robust to dropped gradients (paper shows tolerance up to 30% drop rate), occasional message loss does not break training.
+Worker crash: other workers detect via missing heartbeat (>3 missed = considered offline). Training continues with remaining workers. Crashed worker can rejoin by downloading the latest model checkpoint from the relay and joining the current round. Relay failure: retry with exponential backoff, then fail over across configured relays. Stale gradients that arrive after the outer step are discarded.
+
+Implementation status: planned.
 
 # RFC-006: CLI and User Interface
 
-Commands: `start` (create run, begin training), `join` (join existing run), `monitor` (read-only dashboard), `list` (show active runs on relay). Training script interface: user provides a standard PyTorch training script that defines model, dataset, and loss function. nostrain wraps it with the DiLoCo outer loop and Nostr communication. Rich terminal UI shows: current round, loss, number of active workers, bytes published/received, compression ratio, time per round.
+Implemented commands:
+
+- `hash-state`
+- `encode-delta`
+- `decode-payload`
+- `apply-payload`
+- `build-event`
+- `inspect-event`
+
+Deferred commands:
+
+- `start`
+- `join`
+- `monitor`
+- `list`
+
+The current CLI is intentionally protocol-first. Training orchestration and relay UX will be added once the transport layer exists.

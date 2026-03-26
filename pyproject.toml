@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nostrain"
+version = "0.1.0"
+description = "Protocol and payload tooling for distributed ML training over Nostr relays."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "Abdel Bakhta" }
+]
+keywords = ["nostr", "distributed-training", "machine-learning", "diloco"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Operating System :: OS Independent",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = []
+
+[project.optional-dependencies]
+zstd = ["zstandard>=0.22"]
+
+[project.scripts]
+nostrain = "nostrain.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
