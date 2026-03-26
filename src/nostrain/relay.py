@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import json
 import secrets
 import time
-from typing import Any
+from typing import Any, Sequence
 
 from .aggregation import aggregate_deltas
 from .compression import decompress_payload
@@ -53,6 +53,15 @@ def _subscription_id() -> str:
     return f"nostrain-{secrets.token_hex(8)}"
 
 
+def _normalize_relay_urls(relay_urls: Sequence[str]) -> tuple[str, ...]:
+    normalized = tuple(
+        dict.fromkeys(str(relay).strip() for relay in relay_urls if str(relay).strip())
+    )
+    if not normalized:
+        raise ValueError("at least one relay URL is required")
+    return normalized
+
+
 def _validate_sync_strategy(strategy: str) -> str:
     normalized = str(strategy).strip().lower()
     if normalized not in {"timeout", "strict", "quorum", "async"}:
@@ -79,6 +88,54 @@ class RelayPublishResult:
             "accepted": self.accepted,
             "message": self.message,
             "notices": list(self.notices),
+        }
+
+
+@dataclass(frozen=True)
+class RelayOperationError:
+    relay_url: str
+    operation: str
+    message: str
+
+    def to_json_obj(self) -> dict[str, Any]:
+        return {
+            "relay": self.relay_url,
+            "operation": self.operation,
+            "message": self.message,
+        }
+
+
+@dataclass(frozen=True)
+class MultiRelayPublishResult:
+    relay_urls: tuple[str, ...]
+    event_id: str
+    accepted_results: tuple[RelayPublishResult, ...]
+    failed_relays: tuple[RelayOperationError, ...]
+    require_all: bool = False
+
+    @property
+    def accepted(self) -> bool:
+        if self.require_all:
+            return (
+                len(self.accepted_results) == len(self.relay_urls)
+                and not self.failed_relays
+                and all(result.accepted for result in self.accepted_results)
+            )
+        return any(result.accepted for result in self.accepted_results)
+
+    @property
+    def accepted_relays(self) -> tuple[str, ...]:
+        return tuple(result.relay_url for result in self.accepted_results if result.accepted)
+
+    def to_json_obj(self) -> dict[str, Any]:
+        return {
+            "relays": list(self.relay_urls),
+            "event_id": self.event_id,
+            "accepted": self.accepted,
+            "accepted_relays": list(self.accepted_relays),
+            "accepted_count": len(self.accepted_relays),
+            "failed_relays": [failure.to_json_obj() for failure in self.failed_relays],
+            "results": [result.to_json_obj() for result in self.accepted_results],
         }
 
 
@@ -173,6 +230,49 @@ class HeartbeatCollectionResult:
 
 
 @dataclass(frozen=True)
+class MultiRelayHeartbeatCollectionResult:
+    relay_urls: tuple[str, ...]
+    run_name: str
+    target_round: int | None
+    events: tuple[CollectedHeartbeatEvent, ...]
+    duplicates_discarded: int
+    invalid_events: int
+    stale_events: int
+    notices: tuple[str, ...] = ()
+    failed_relays: tuple[RelayOperationError, ...] = ()
+    relay_results: tuple[HeartbeatCollectionResult, ...] = ()
+
+    @property
+    def worker_ids(self) -> tuple[str, ...]:
+        return tuple(event.parsed.metadata.worker_id for event in self.events)
+
+    @property
+    def successful_relays(self) -> tuple[str, ...]:
+        return tuple(result.relay_url for result in self.relay_results)
+
+    def to_json_obj(self, *, include_events: bool = True) -> dict[str, Any]:
+        data = {
+            "relays": list(self.relay_urls),
+            "successful_relays": list(self.successful_relays),
+            "run": self.run_name,
+            "target_round": self.target_round,
+            "event_count": len(self.events),
+            "workers": list(self.worker_ids),
+            "duplicates_discarded": self.duplicates_discarded,
+            "invalid_events": self.invalid_events,
+            "stale_events": self.stale_events,
+            "failed_relays": [failure.to_json_obj() for failure in self.failed_relays],
+            "notices": list(self.notices),
+            "relay_results": [
+                result.to_json_obj(include_events=False) for result in self.relay_results
+            ],
+        }
+        if include_events:
+            data["events"] = [event.to_json_obj() for event in self.events]
+        return data
+
+
+@dataclass(frozen=True)
 class RelayCollectionResult:
     relay_url: str
     run_name: str
@@ -209,6 +309,60 @@ class RelayCollectionResult:
             "sync_strategy": self.sync_strategy,
             "completion_reason": self.completion_reason,
             "notices": list(self.notices),
+        }
+        if include_events:
+            data["events"] = [event.to_json_obj() for event in self.events]
+        return data
+
+
+@dataclass(frozen=True)
+class MultiRelayCollectionResult:
+    relay_urls: tuple[str, ...]
+    run_name: str
+    round_index: int
+    events: tuple[CollectedGradientEvent, ...]
+    duplicates_discarded: int
+    invalid_events: int
+    notices: tuple[str, ...] = ()
+    known_workers: tuple[str, ...] = ()
+    sync_strategy: str = "timeout"
+    completion_reason: str = "idle-timeout"
+    failed_relays: tuple[RelayOperationError, ...] = ()
+    relay_results: tuple[RelayCollectionResult, ...] = ()
+
+    @property
+    def worker_ids(self) -> tuple[str, ...]:
+        return tuple(event.parsed.metadata.worker_id for event in self.events)
+
+    @property
+    def successful_relays(self) -> tuple[str, ...]:
+        return tuple(result.relay_url for result in self.relay_results)
+
+    def aggregate_delta(self) -> ModelState:
+        if not self.events:
+            raise ValueError("cannot aggregate an empty relay collection")
+        return aggregate_deltas(
+            decompress_payload(event.parsed.payload) for event in self.events
+        )
+
+    def to_json_obj(self, *, include_events: bool = True) -> dict[str, Any]:
+        data = {
+            "relays": list(self.relay_urls),
+            "successful_relays": list(self.successful_relays),
+            "run": self.run_name,
+            "round": self.round_index,
+            "event_count": len(self.events),
+            "workers": list(self.worker_ids),
+            "known_workers": list(self.known_workers),
+            "duplicates_discarded": self.duplicates_discarded,
+            "invalid_events": self.invalid_events,
+            "sync_strategy": self.sync_strategy,
+            "completion_reason": self.completion_reason,
+            "failed_relays": [failure.to_json_obj() for failure in self.failed_relays],
+            "notices": list(self.notices),
+            "relay_results": [
+                result.to_json_obj(include_events=False) for result in self.relay_results
+            ],
         }
         if include_events:
             data["events"] = [event.to_json_obj() for event in self.events]
@@ -278,6 +432,63 @@ async def publish_nostrain_event(
         nostrain_event,
         open_timeout=open_timeout,
         reply_timeout=reply_timeout,
+    )
+
+
+async def publish_nostrain_events(
+    relay_urls: Sequence[str],
+    event: NostrainEvent | dict[str, Any],
+    *,
+    open_timeout: float = 10.0,
+    reply_timeout: float = 10.0,
+    require_all: bool = False,
+) -> MultiRelayPublishResult:
+    normalized_relays = _normalize_relay_urls(relay_urls)
+    nostrain_event = event if isinstance(event, NostrainEvent) else NostrainEvent.from_json_obj(event)
+    parse_nostrain_event(nostrain_event)
+
+    results = await asyncio.gather(
+        *[
+            publish_nostrain_event(
+                relay_url,
+                nostrain_event,
+                open_timeout=open_timeout,
+                reply_timeout=reply_timeout,
+            )
+            for relay_url in normalized_relays
+        ],
+        return_exceptions=True,
+    )
+
+    accepted_results: list[RelayPublishResult] = []
+    failed_relays: list[RelayOperationError] = []
+    for relay_url, result in zip(normalized_relays, results):
+        if isinstance(result, Exception):
+            failed_relays.append(
+                RelayOperationError(
+                    relay_url=relay_url,
+                    operation="publish",
+                    message=f"{type(result).__name__}: {result}",
+                )
+            )
+            continue
+        if not result.accepted:
+            failed_relays.append(
+                RelayOperationError(
+                    relay_url=relay_url,
+                    operation="publish",
+                    message=result.message,
+                )
+            )
+            continue
+        accepted_results.append(result)
+
+    return MultiRelayPublishResult(
+        relay_urls=normalized_relays,
+        event_id=nostrain_event.fingerprint(),
+        accepted_results=tuple(accepted_results),
+        failed_relays=tuple(failed_relays),
+        require_all=require_all,
     )
 
 
@@ -449,6 +660,108 @@ async def collect_heartbeat_events(
         invalid_events=invalid_events,
         stale_events=stale_events,
         notices=tuple(notices),
+    )
+
+
+def _merge_heartbeat_results(
+    relay_urls: tuple[str, ...],
+    *,
+    run_name: str,
+    target_round: int | None,
+    relay_results: Sequence[HeartbeatCollectionResult],
+    failed_relays: Sequence[RelayOperationError],
+) -> MultiRelayHeartbeatCollectionResult:
+    selected: dict[str, CollectedHeartbeatEvent] = {}
+    duplicates_discarded = sum(result.duplicates_discarded for result in relay_results)
+    invalid_events = sum(result.invalid_events for result in relay_results)
+    stale_events = sum(result.stale_events for result in relay_results)
+    notices: list[str] = []
+
+    for result in relay_results:
+        notices.extend(result.notices)
+        for event in result.events:
+            identity = event.parsed.metadata.parameterized_identifier
+            existing = selected.get(identity)
+            if existing is None:
+                selected[identity] = event
+            else:
+                duplicates_discarded += 1
+                if _prefer_candidate(existing, event):
+                    selected[identity] = event
+
+    ordered_events = tuple(
+        sorted(
+            selected.values(),
+            key=lambda event: (
+                event.parsed.metadata.worker_id,
+                event.parsed.event.created_at,
+                event.event_id,
+            ),
+        )
+    )
+    return MultiRelayHeartbeatCollectionResult(
+        relay_urls=relay_urls,
+        run_name=run_name,
+        target_round=target_round,
+        events=ordered_events,
+        duplicates_discarded=duplicates_discarded,
+        invalid_events=invalid_events,
+        stale_events=stale_events,
+        notices=tuple(notices),
+        failed_relays=tuple(failed_relays),
+        relay_results=tuple(relay_results),
+    )
+
+
+async def collect_heartbeat_events_across_relays(
+    relay_urls: Sequence[str],
+    *,
+    run_name: str,
+    target_round: int | None = None,
+    idle_timeout: float = 2.0,
+    open_timeout: float = 10.0,
+    since: int | None = None,
+    reference_time: int | None = None,
+    max_missed_heartbeats: int = 3,
+) -> MultiRelayHeartbeatCollectionResult:
+    normalized_relays = _normalize_relay_urls(relay_urls)
+    results = await asyncio.gather(
+        *[
+            collect_heartbeat_events(
+                relay_url,
+                run_name=run_name,
+                target_round=target_round,
+                idle_timeout=idle_timeout,
+                open_timeout=open_timeout,
+                since=since,
+                reference_time=reference_time,
+                max_missed_heartbeats=max_missed_heartbeats,
+            )
+            for relay_url in normalized_relays
+        ],
+        return_exceptions=True,
+    )
+
+    relay_results: list[HeartbeatCollectionResult] = []
+    failed_relays: list[RelayOperationError] = []
+    for relay_url, result in zip(normalized_relays, results):
+        if isinstance(result, Exception):
+            failed_relays.append(
+                RelayOperationError(
+                    relay_url=relay_url,
+                    operation="collect-heartbeats",
+                    message=f"{type(result).__name__}: {result}",
+                )
+            )
+            continue
+        relay_results.append(result)
+
+    return _merge_heartbeat_results(
+        normalized_relays,
+        run_name=run_name,
+        target_round=target_round,
+        relay_results=relay_results,
+        failed_relays=failed_relays,
     )
 
 
@@ -635,4 +948,162 @@ async def collect_gradient_events(
         known_workers=known_workers,
         sync_strategy=strategy,
         completion_reason=completion_reason,
+    )
+
+
+def _merge_gradient_results(
+    relay_urls: tuple[str, ...],
+    *,
+    run_name: str,
+    round_index: int,
+    max_events: int | None,
+    strategy: str,
+    relay_results: Sequence[RelayCollectionResult],
+    known_workers: tuple[str, ...],
+    failed_relays: Sequence[RelayOperationError],
+    notices: Sequence[str],
+) -> MultiRelayCollectionResult:
+    selected: dict[str, CollectedGradientEvent] = {}
+    duplicates_discarded = sum(result.duplicates_discarded for result in relay_results)
+    invalid_events = sum(result.invalid_events for result in relay_results)
+    merged_notices = list(notices)
+
+    for result in relay_results:
+        merged_notices.extend(result.notices)
+        for event in result.events:
+            identity = event.parsed.metadata.parameterized_identifier
+            existing = selected.get(identity)
+            if existing is None:
+                selected[identity] = event
+            else:
+                duplicates_discarded += 1
+                if _prefer_candidate(existing, event):
+                    selected[identity] = event
+
+    ordered_events = tuple(
+        sorted(
+            selected.values(),
+            key=lambda event: (
+                event.parsed.metadata.worker_id,
+                event.parsed.event.created_at,
+                event.event_id,
+            ),
+        )
+    )
+    completion_reason = _completion_reason(
+        selected_count=len(ordered_events),
+        max_events=max_events,
+        strategy=strategy,
+        known_workers=known_workers,
+        saw_eose=(
+            strategy == "async"
+            and bool(relay_results)
+            and all(result.completion_reason == "async" for result in relay_results)
+        ),
+    )
+    if completion_reason is None:
+        if relay_results and all(result.completion_reason == "relay-closed" for result in relay_results):
+            completion_reason = "relay-closed"
+        else:
+            completion_reason = "idle-timeout"
+
+    return MultiRelayCollectionResult(
+        relay_urls=relay_urls,
+        run_name=run_name,
+        round_index=round_index,
+        events=ordered_events,
+        duplicates_discarded=duplicates_discarded,
+        invalid_events=invalid_events,
+        notices=tuple(merged_notices),
+        known_workers=known_workers,
+        sync_strategy=strategy,
+        completion_reason=completion_reason,
+        failed_relays=tuple(failed_relays),
+        relay_results=tuple(relay_results),
+    )
+
+
+async def collect_gradient_events_across_relays(
+    relay_urls: Sequence[str],
+    *,
+    run_name: str,
+    round_index: int,
+    max_events: int | None = None,
+    idle_timeout: float = 2.0,
+    open_timeout: float = 10.0,
+    since: int | None = None,
+    strategy: str = "timeout",
+    discover_workers: bool = False,
+    heartbeat_idle_timeout: float | None = None,
+    heartbeat_since: int | None = None,
+    reference_time: int | None = None,
+    max_missed_heartbeats: int = 3,
+) -> MultiRelayCollectionResult:
+    normalized_relays = _normalize_relay_urls(relay_urls)
+    strategy = _validate_sync_strategy(strategy)
+
+    known_workers: tuple[str, ...] = ()
+    notices: list[str] = []
+    failed_relays: list[RelayOperationError] = []
+    if discover_workers or strategy in {"strict", "quorum"}:
+        heartbeat_results = await collect_heartbeat_events_across_relays(
+            normalized_relays,
+            run_name=run_name,
+            target_round=round_index,
+            idle_timeout=heartbeat_idle_timeout or idle_timeout,
+            open_timeout=open_timeout,
+            since=heartbeat_since if heartbeat_since is not None else since,
+            reference_time=reference_time,
+            max_missed_heartbeats=max_missed_heartbeats,
+        )
+        known_workers = heartbeat_results.worker_ids
+        notices.extend(heartbeat_results.notices)
+        failed_relays.extend(heartbeat_results.failed_relays)
+
+    per_relay_strategy = strategy if len(normalized_relays) == 1 else ("async" if strategy == "async" else "timeout")
+    results = await asyncio.gather(
+        *[
+            collect_gradient_events(
+                relay_url,
+                run_name=run_name,
+                round_index=round_index,
+                max_events=max_events,
+                idle_timeout=idle_timeout,
+                open_timeout=open_timeout,
+                since=since,
+                strategy=per_relay_strategy,
+                discover_workers=False,
+                heartbeat_idle_timeout=heartbeat_idle_timeout,
+                heartbeat_since=heartbeat_since,
+                reference_time=reference_time,
+                max_missed_heartbeats=max_missed_heartbeats,
+            )
+            for relay_url in normalized_relays
+        ],
+        return_exceptions=True,
+    )
+
+    relay_results: list[RelayCollectionResult] = []
+    for relay_url, result in zip(normalized_relays, results):
+        if isinstance(result, Exception):
+            failed_relays.append(
+                RelayOperationError(
+                    relay_url=relay_url,
+                    operation="collect-gradients",
+                    message=f"{type(result).__name__}: {result}",
+                )
+            )
+            continue
+        relay_results.append(result)
+
+    return _merge_gradient_results(
+        normalized_relays,
+        run_name=run_name,
+        round_index=round_index,
+        max_events=max_events,
+        strategy=strategy,
+        relay_results=relay_results,
+        known_workers=known_workers,
+        failed_relays=failed_relays,
+        notices=notices,
     )

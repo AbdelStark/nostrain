@@ -2,11 +2,11 @@
 
 Distributed ML training over Nostr relays.
 
-The project vision is still the same: no coordinator, no central server, just workers exchanging sparse pseudo-gradients through Nostr. The repository now ships the protocol/payload toolkit, a signed relay transport slice, and a first end-to-end training runner: model snapshots, DiLoCo-style deltas, sparse transport payloads, NIP-01-compatible nostrain gradient and heartbeat events, relay collection with active-worker discovery, plus a built-in linear-regression worker loop that can train locally and synchronize through a relay.
+The project vision is still the same: no coordinator, no central server, just workers exchanging sparse pseudo-gradients through Nostr. The repository now ships the protocol/payload toolkit, a signed relay transport slice, and a resilient end-to-end training runner: model snapshots, DiLoCo-style deltas, sparse transport payloads, NIP-01-compatible nostrain gradient and heartbeat events, relay collection with active-worker discovery, cross-relay deduplication, resumable checkpoints, plus a built-in linear-regression worker loop that can train locally and synchronize through one or more relays.
 
 ## Current status
 
-`nostrain` v0.5.0 is a protocol, relay, and training toolchain. It implements:
+`nostrain` v0.6.0 is a protocol, relay, and training toolchain. It implements:
 
 - canonical model-state JSON loading and hashing
 - pseudo-gradient computation (`current - initial`)
@@ -19,14 +19,16 @@ The project vision is still the same: no coordinator, no central server, just wo
 - websocket relay publish/subscribe for gradient events
 - active worker discovery with stale-heartbeat filtering
 - replay-safe event collection and round aggregation over a relay
+- cross-relay publish redundancy and replay-safe collection deduplication
 - round sync strategies (`timeout`, `strict`, `quorum`, `async`) driven by discovered workers
 - a deterministic JSON dataset format for built-in linear-regression workloads
 - pure-Python local SGD inner-loop training for linear regression
-- a relay-backed training runner that publishes heartbeats and gradients, tolerates missing peer updates on timeout, and applies the outer step locally
-- per-round training artifacts and machine-readable session summaries
+- a relay-backed training runner that publishes heartbeats and gradients to one or more relays, tolerates partial relay outages, and applies the outer step locally
+- resumable training checkpoints carrying model state, momentum state, and prior round history
+- per-round training artifacts and machine-readable session summaries/checkpoints
 - a CLI for encoding, decoding, applying, publishing, collecting, and inspecting payloads
 
-It does **not** yet implement multi-relay redundancy, checkpoint recovery, or richer runtimes such as PyTorch/MLX. The signed transport path now targets public NIP-01 relays as well as local/mock websocket endpoints, and the built-in runner is intentionally scoped to linear regression so the end-to-end training loop stays dependency-light and testable.
+It does **not** yet implement checkpoint advertisement/distribution, late-gradient reconciliation after a worker advances rounds, or richer runtimes such as PyTorch/MLX. The signed transport path now targets public NIP-01 relays as well as local/mock websocket endpoints, and the built-in runner is intentionally scoped to linear regression so the end-to-end training loop stays dependency-light and testable.
 
 ## Install
 
@@ -190,6 +192,15 @@ Publish the event to a relay-compatible websocket endpoint:
 nostrain publish-event event.json --relay ws://127.0.0.1:8765 --json
 ```
 
+Publish the same event redundantly to multiple relays:
+
+```bash
+nostrain publish-event event.json \
+  --relay ws://127.0.0.1:8765 \
+  --relay wss://relay.example.com \
+  --json
+```
+
 Collect and validate one round from a relay:
 
 ```bash
@@ -216,11 +227,12 @@ nostrain aggregate-round \
   -o aggregated.json
 ```
 
-Run an end-to-end worker session over a relay:
+Run an end-to-end worker session over multiple relays with checkpoint output:
 
 ```bash
 nostrain run-training linear-initial.json worker-a-dataset.json \
   --relay ws://127.0.0.1:8765 \
+  --relay wss://relay.example.com \
   --run linear-demo \
   --sec-key 0000000000000000000000000000000000000000000000000000000000000003 \
   --inner-steps 50 \
@@ -231,8 +243,23 @@ nostrain run-training linear-initial.json worker-a-dataset.json \
   --momentum 0.0 \
   --round-timeout 2.0 \
   --artifact-dir artifacts/worker-a \
+  --checkpoint-out worker-a-checkpoint.json \
   --summary-out session-summary.json \
   -o final-state.json
+```
+
+Resume a worker from its last saved checkpoint:
+
+```bash
+nostrain run-training linear-initial.json worker-a-dataset.json \
+  --relay ws://127.0.0.1:8765 \
+  --relay wss://relay.example.com \
+  --run linear-demo \
+  --sec-key 0000000000000000000000000000000000000000000000000000000000000003 \
+  --resume-from worker-a-checkpoint.json \
+  --rounds 2 \
+  --summary-out resumed-session-summary.json \
+  -o resumed-final-state.json
 ```
 
 List active workers advertising a given run/round:
@@ -306,6 +333,8 @@ Heartbeat content is intentionally empty; worker capabilities and relay hints li
 - [x] Event signing for public relays
 - [x] Worker discovery and heartbeat events
 - [x] Built-in linear-regression training runner with relay-backed DiLoCo-style rounds
-- [ ] Multi-relay redundancy
-- [ ] Checkpoint distribution and recovery
+- [x] Multi-relay redundancy
+- [x] Local checkpoint recovery for resumed workers
+- [ ] Checkpoint advertisement/distribution
+- [ ] Late-gradient reconciliation across advanced rounds
 - [ ] Live monitoring dashboard

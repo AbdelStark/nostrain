@@ -74,16 +74,29 @@ Delivered in the current repository state:
 
 This moves the project from protocol-first tooling to an executable distributed-training prototype that can actually perform local work, publish updates, and converge across workers through a relay.
 
-## Next milestone: multi-relay resilience + checkpoint recovery
+## Completed milestone: multi-relay resilience + local checkpoint recovery
 
-Goal: keep workers converged when relays or workers disappear mid-run.
+Delivered in the current repository state:
+
+- redundant heartbeat/gradient publication to multiple relays
+- cross-relay worker discovery and gradient collection with replay-safe deduplication
+- partial-relay failure tolerance for `run-training`, `publish-event`, `discover-workers`, `collect-events`, and `aggregate-round`
+- resumable training checkpoints containing model state, momentum state, relay list, and completed round summaries
+- CLI support for repeated `--relay`, `--checkpoint-out`, and `--resume-from`
+- integration tests covering cross-relay deduplication, relay failover, and resumed-vs-uninterrupted training equivalence
+
+This moves the project from a single-relay prototype to a more fault-tolerant training system that can survive relay loss and resume worker progress without manual state reconstruction.
+
+## Next milestone: late-gradient handling + checkpoint distribution
+
+Goal: keep workers coordinated when network timing gets messy and workers need shared recovery points.
 
 Deliverables:
 
-- publish every round to multiple relays and deduplicate collections across them
-- persist and advertise resumable checkpoints for crashed/rejoining workers
-- retry/failover logic for relay outages
 - explicit handling for late gradients that arrive after a worker has advanced to the next round
+- checkpoint advertisement/distribution semantics so rejoining workers can discover the latest recoverable state
+- retention/pruning rules for checkpoint artifacts and relay history
+- compatibility story for richer runtimes such as PyTorch/MLX on top of the resilient transport layer
 
 ## Deferred polish
 

@@ -25,7 +25,11 @@ from nostrain.protocol import (
     parse_nostrain_event,
     parse_gradient_event,
 )
-from nostrain.relay import collect_gradient_events, collect_heartbeat_events
+from nostrain.relay import (
+    collect_gradient_events,
+    collect_gradient_events_across_relays,
+    collect_heartbeat_events,
+)
 from tests.helpers import assert_model_state_almost_equal, assert_state_json_almost_equal
 
 
@@ -891,6 +895,215 @@ class RelayTransportTests(unittest.TestCase):
             self.assertEqual(
                 sorted(summary_json_b["rounds"][0]["collected_workers"]),
                 ["worker-a", "worker-b"],
+            )
+
+    def test_collect_gradient_events_across_relays_deduplicates_replays(self) -> None:
+        worker_a_event = _build_event(
+            worker_id="worker-a",
+            current_fixture="current_state.json",
+            created_at=1700000000,
+        )
+        worker_b_event = _build_event(
+            worker_id="worker-b",
+            current_fixture="current_state_peer.json",
+            created_at=1700000001,
+        )
+
+        with MockRelay([worker_a_event]) as relay_a, MockRelay([worker_a_event, worker_b_event]) as relay_b:
+            collection = asyncio.run(
+                collect_gradient_events_across_relays(
+                    (relay_a.url, relay_b.url),
+                    run_name="demo-run",
+                    round_index=7,
+                    idle_timeout=0.2,
+                    open_timeout=1.0,
+                )
+            )
+
+        self.assertEqual(sorted(collection.worker_ids), ["worker-a", "worker-b"])
+        self.assertEqual(collection.duplicates_discarded, 1)
+        self.assertEqual(
+            sorted(collection.successful_relays),
+            sorted([relay_a.url, relay_b.url]),
+        )
+        self.assertEqual(collection.aggregate_delta().parameter_count, 3)
+
+    def test_cli_run_training_survives_partial_relay_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory, MockRelay() as relay:
+            tempdir = Path(temporary_directory)
+            final_state = tempdir / "final-state.json"
+            summary = tempdir / "summary.json"
+            unreachable_relay = "ws://127.0.0.1:65534"
+
+            self._run(
+                "run-training",
+                str(FIXTURES / "linear_initial_state.json"),
+                str(FIXTURES / "linear_dataset_worker_a.json"),
+                "--relay",
+                relay.url,
+                "--relay",
+                unreachable_relay,
+                "--run",
+                "resilient-run",
+                "--worker",
+                "worker-a",
+                "--sec-key",
+                WORKER_SECRET_KEYS["worker-a"],
+                "--rounds",
+                "1",
+                "--inner-steps",
+                "20",
+                "--local-learning-rate",
+                "0.05",
+                "--batch-size",
+                "2",
+                "--outer-learning-rate",
+                "1.0",
+                "--momentum",
+                "0.0",
+                "--round-timeout",
+                "0.2",
+                "--timeout",
+                "0.2",
+                "--summary-out",
+                str(summary),
+                "-o",
+                str(final_state),
+            )
+
+            summary_json = json.loads(summary.read_text(encoding="utf-8"))
+            self.assertIn("parameters", json.loads(final_state.read_text(encoding="utf-8")))
+            self.assertEqual(summary_json["relays"], [relay.url, unreachable_relay])
+            self.assertEqual(summary_json["rounds_completed"], 1)
+            self.assertEqual(summary_json["rounds"][0]["configured_relays"], [relay.url, unreachable_relay])
+            self.assertEqual(summary_json["rounds"][0]["published_gradient_relays"], [relay.url])
+            self.assertEqual(summary_json["rounds"][0]["collected_from_relays"], [relay.url])
+            self.assertIn(unreachable_relay, summary_json["rounds"][0]["failed_relays"])
+
+    def test_cli_run_training_resume_from_checkpoint_matches_uninterrupted_run(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as temporary_directory,
+            MockRelay() as resume_relay,
+            MockRelay() as uninterrupted_relay,
+        ):
+            tempdir = Path(temporary_directory)
+            checkpoint = tempdir / "checkpoint.json"
+            resumed_state_path = tempdir / "resumed-state.json"
+            resumed_summary = tempdir / "resumed-summary.json"
+            uninterrupted_state_path = tempdir / "full-state.json"
+            uninterrupted_summary = tempdir / "full-summary.json"
+
+            self._run(
+                "run-training",
+                str(FIXTURES / "linear_initial_state.json"),
+                str(FIXTURES / "linear_dataset_worker_a.json"),
+                "--relay",
+                resume_relay.url,
+                "--run",
+                "checkpoint-run",
+                "--worker",
+                "worker-a",
+                "--sec-key",
+                WORKER_SECRET_KEYS["worker-a"],
+                "--rounds",
+                "1",
+                "--inner-steps",
+                "30",
+                "--local-learning-rate",
+                "0.05",
+                "--batch-size",
+                "2",
+                "--outer-learning-rate",
+                "1.0",
+                "--momentum",
+                "0.5",
+                "--round-timeout",
+                "0.2",
+                "--checkpoint-out",
+                str(checkpoint),
+                "-o",
+                str(tempdir / "partial-state.json"),
+            )
+
+            checkpoint_json = json.loads(checkpoint.read_text(encoding="utf-8"))
+            self.assertEqual(checkpoint_json["next_round"], 1)
+            self.assertEqual(checkpoint_json["rounds_completed"], 1)
+
+            self._run(
+                "run-training",
+                str(FIXTURES / "linear_initial_state.json"),
+                str(FIXTURES / "linear_dataset_worker_a.json"),
+                "--relay",
+                resume_relay.url,
+                "--run",
+                "checkpoint-run",
+                "--worker",
+                "worker-a",
+                "--sec-key",
+                WORKER_SECRET_KEYS["worker-a"],
+                "--rounds",
+                "1",
+                "--inner-steps",
+                "30",
+                "--local-learning-rate",
+                "0.05",
+                "--batch-size",
+                "2",
+                "--outer-learning-rate",
+                "1.0",
+                "--momentum",
+                "0.5",
+                "--round-timeout",
+                "0.2",
+                "--resume-from",
+                str(checkpoint),
+                "--summary-out",
+                str(resumed_summary),
+                "-o",
+                str(resumed_state_path),
+            )
+
+            self._run(
+                "run-training",
+                str(FIXTURES / "linear_initial_state.json"),
+                str(FIXTURES / "linear_dataset_worker_a.json"),
+                "--relay",
+                uninterrupted_relay.url,
+                "--run",
+                "checkpoint-run-full",
+                "--worker",
+                "worker-a",
+                "--sec-key",
+                WORKER_SECRET_KEYS["worker-a"],
+                "--rounds",
+                "2",
+                "--inner-steps",
+                "30",
+                "--local-learning-rate",
+                "0.05",
+                "--batch-size",
+                "2",
+                "--outer-learning-rate",
+                "1.0",
+                "--momentum",
+                "0.5",
+                "--round-timeout",
+                "0.2",
+                "--summary-out",
+                str(uninterrupted_summary),
+                "-o",
+                str(uninterrupted_state_path),
+            )
+
+            resumed_state = ModelState.from_path(resumed_state_path)
+            uninterrupted_state = ModelState.from_path(uninterrupted_state_path)
+            resumed_summary_json = json.loads(resumed_summary.read_text(encoding="utf-8"))
+
+            assert_model_state_almost_equal(self, resumed_state, uninterrupted_state, places=8)
+            self.assertEqual(resumed_summary_json["rounds_completed"], 2)
+            self.assertEqual(
+                [round_summary["round"] for round_summary in resumed_summary_json["rounds"]],
+                [0, 1],
             )
 
 

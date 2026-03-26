@@ -15,7 +15,7 @@ from .protocol import (
     build_gradient_event,
     build_heartbeat_event,
 )
-from .relay import collect_gradient_events, publish_nostrain_event
+from .relay import collect_gradient_events_across_relays, publish_nostrain_events
 
 LINEAR_WEIGHT_PARAMETER = "linear.weight"
 LINEAR_BIAS_PARAMETER = "linear.bias"
@@ -291,7 +291,7 @@ def train_linear_regression(
 @dataclass(frozen=True)
 class TrainingWorkerConfig:
     run_name: str
-    relay_url: str
+    relay_urls: tuple[str, ...]
     worker_id: str
     secret_key_hex: str
     rounds: int = 1
@@ -312,8 +312,6 @@ class TrainingWorkerConfig:
     def __post_init__(self) -> None:
         if not self.run_name:
             raise ValueError("run name cannot be empty")
-        if not self.relay_url:
-            raise ValueError("relay URL cannot be empty")
         if not self.worker_id:
             raise ValueError("worker id cannot be empty")
         if not self.secret_key_hex:
@@ -342,11 +340,21 @@ class TrainingWorkerConfig:
             raise ValueError("heartbeat interval must be positive")
         if self.max_missed_heartbeats <= 0:
             raise ValueError("max missed heartbeats must be positive")
+        normalized_relays = tuple(
+            dict.fromkeys(str(relay).strip() for relay in self.relay_urls if str(relay).strip())
+        )
+        if not normalized_relays:
+            raise ValueError("at least one relay URL is required")
+        object.__setattr__(self, "relay_urls", normalized_relays)
         object.__setattr__(
             self,
             "advertised_relays",
             tuple(dict.fromkeys(str(relay).strip() for relay in self.advertised_relays if str(relay).strip())),
         )
+
+    @property
+    def relay_url(self) -> str:
+        return self.relay_urls[0]
 
 
 @dataclass(frozen=True)
@@ -363,6 +371,11 @@ class TrainingRoundSummary:
     completion_reason: str
     published_gradient_event_id: str
     published_heartbeat_event_id: str
+    configured_relays: tuple[str, ...]
+    published_heartbeat_relays: tuple[str, ...]
+    published_gradient_relays: tuple[str, ...]
+    collected_from_relays: tuple[str, ...]
+    failed_relays: tuple[str, ...]
 
     @property
     def missing_workers(self) -> tuple[str, ...]:
@@ -383,13 +396,49 @@ class TrainingRoundSummary:
             "completion_reason": self.completion_reason,
             "published_gradient_event_id": self.published_gradient_event_id,
             "published_heartbeat_event_id": self.published_heartbeat_event_id,
+            "configured_relays": list(self.configured_relays),
+            "published_heartbeat_relays": list(self.published_heartbeat_relays),
+            "published_gradient_relays": list(self.published_gradient_relays),
+            "collected_from_relays": list(self.collected_from_relays),
+            "failed_relays": list(self.failed_relays),
         }
+
+    @classmethod
+    def from_json_obj(cls, data: Any) -> "TrainingRoundSummary":
+        if not isinstance(data, dict):
+            raise ValueError("training round summary JSON must be an object")
+        return cls(
+            round_index=int(data["round"]),
+            model_hash_before=str(data["model_hash_before"]),
+            model_hash_after=str(data["model_hash_after"]),
+            local_loss_before=float(data["local_loss_before"]),
+            local_loss_after_inner=float(data["local_loss_after_inner"]),
+            local_loss_after_outer=float(data["local_loss_after_outer"]),
+            collected_event_count=int(data["collected_event_count"]),
+            known_workers=tuple(str(worker) for worker in data.get("known_workers", [])),
+            collected_workers=tuple(str(worker) for worker in data.get("collected_workers", [])),
+            completion_reason=str(data["completion_reason"]),
+            published_gradient_event_id=str(data["published_gradient_event_id"]),
+            published_heartbeat_event_id=str(data["published_heartbeat_event_id"]),
+            configured_relays=tuple(str(relay) for relay in data.get("configured_relays", [])),
+            published_heartbeat_relays=tuple(
+                str(relay) for relay in data.get("published_heartbeat_relays", [])
+            ),
+            published_gradient_relays=tuple(
+                str(relay) for relay in data.get("published_gradient_relays", [])
+            ),
+            collected_from_relays=tuple(
+                str(relay) for relay in data.get("collected_from_relays", [])
+            ),
+            failed_relays=tuple(str(relay) for relay in data.get("failed_relays", [])),
+        )
 
 
 @dataclass(frozen=True)
 class TrainingSessionResult:
     run_name: str
     worker_id: str
+    relay_urls: tuple[str, ...]
     start_round: int
     rounds_completed: int
     final_state: ModelState
@@ -410,6 +459,7 @@ class TrainingSessionResult:
         data: dict[str, Any] = {
             "run": self.run_name,
             "worker": self.worker_id,
+            "relays": list(self.relay_urls),
             "start_round": self.start_round,
             "rounds_completed": self.rounds_completed,
             "final_model_hash": self.final_model_hash,
@@ -423,6 +473,73 @@ class TrainingSessionResult:
         return data
 
 
+@dataclass(frozen=True)
+class TrainingCheckpoint:
+    run_name: str
+    worker_id: str
+    relay_urls: tuple[str, ...]
+    next_round: int
+    current_state: ModelState
+    momentum_state: ModelState | None
+    rounds: tuple[TrainingRoundSummary, ...]
+    updated_at: int
+
+    @property
+    def rounds_completed(self) -> int:
+        return len(self.rounds)
+
+    @property
+    def start_round(self) -> int:
+        if self.rounds:
+            return self.rounds[0].round_index
+        return self.next_round
+
+    def to_json_obj(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "format": "nostrain-training-checkpoint",
+            "version": 1,
+            "run": self.run_name,
+            "worker": self.worker_id,
+            "relays": list(self.relay_urls),
+            "next_round": self.next_round,
+            "rounds_completed": self.rounds_completed,
+            "updated_at": self.updated_at,
+            "current_model_hash": state_digest(self.current_state),
+            "current_state": self.current_state.to_json_obj(),
+            "rounds": [round_summary.to_json_obj() for round_summary in self.rounds],
+        }
+        if self.momentum_state is not None:
+            data["momentum_state"] = self.momentum_state.to_json_obj()
+        return data
+
+    @classmethod
+    def from_json_obj(cls, data: Any) -> "TrainingCheckpoint":
+        if not isinstance(data, dict):
+            raise ValueError("training checkpoint JSON must be an object")
+        if str(data.get("format", "")).strip() != "nostrain-training-checkpoint":
+            raise ValueError("unsupported training checkpoint format")
+        current_state = ModelState.from_json_obj(data["current_state"])
+        raw_momentum = data.get("momentum_state")
+        momentum_state = ModelState.from_json_obj(raw_momentum) if raw_momentum is not None else None
+        return cls(
+            run_name=str(data["run"]),
+            worker_id=str(data["worker"]),
+            relay_urls=tuple(str(relay) for relay in data.get("relays", [])),
+            next_round=int(data["next_round"]),
+            current_state=current_state,
+            momentum_state=momentum_state,
+            rounds=tuple(
+                TrainingRoundSummary.from_json_obj(round_data)
+                for round_data in data.get("rounds", [])
+            ),
+            updated_at=int(data.get("updated_at", 0)),
+        )
+
+    @classmethod
+    def from_path(cls, path: str | Path) -> "TrainingCheckpoint":
+        return cls.from_json_obj(json.loads(Path(path).read_text(encoding="utf-8")))
+
+
 def _write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2, sort_keys=False) + "\n", encoding="utf-8")
@@ -433,6 +550,15 @@ def _write_model_state(path: Path, state: ModelState) -> None:
     state.write_json(path)
 
 
+def _format_failed_relays(failed_relays: tuple[Any, ...]) -> str:
+    if not failed_relays:
+        return "no relay failures recorded"
+    return "; ".join(
+        f"{failure.relay_url} ({failure.operation}): {failure.message}"
+        for failure in failed_relays
+    )
+
+
 async def run_training_session(
     initial_state: ModelState,
     dataset: LinearRegressionDataset,
@@ -441,11 +567,13 @@ async def run_training_session(
     adapter: LinearModelAdapter | None = None,
     previous_momentum: ModelState | None = None,
     artifact_dir: str | Path | None = None,
+    prior_rounds: tuple[TrainingRoundSummary, ...] = (),
+    checkpoint_out: str | Path | None = None,
 ) -> TrainingSessionResult:
     adapter = adapter or LinearModelAdapter()
     current_state = initial_state
     current_momentum = previous_momentum
-    round_summaries: list[TrainingRoundSummary] = []
+    round_summaries: list[TrainingRoundSummary] = list(prior_rounds)
     artifact_root = Path(artifact_dir) if artifact_dir is not None else None
 
     for round_offset in range(config.rounds):
@@ -459,19 +587,22 @@ async def run_training_session(
                 current_round=round_index,
                 heartbeat_interval=config.heartbeat_interval,
                 capabilities=("gradient-event", "linear-regression"),
-                advertised_relays=config.advertised_relays or (config.relay_url,),
+                advertised_relays=config.advertised_relays or config.relay_urls,
                 created_at=round_start,
             ),
             secret_key_hex=config.secret_key_hex,
         )
-        heartbeat_publish = await publish_nostrain_event(
-            config.relay_url,
+        heartbeat_publish = await publish_nostrain_events(
+            config.relay_urls,
             heartbeat_event,
             open_timeout=config.open_timeout,
             reply_timeout=config.open_timeout,
         )
         if not heartbeat_publish.accepted:
-            raise RuntimeError(f"relay rejected heartbeat publication: {heartbeat_publish.message}")
+            raise RuntimeError(
+                "failed to publish heartbeat to any relay: "
+                + _format_failed_relays(heartbeat_publish.failed_relays)
+            )
 
         local_training = train_linear_regression(
             current_state,
@@ -497,17 +628,20 @@ async def run_training_session(
             payload,
             secret_key_hex=config.secret_key_hex,
         )
-        gradient_publish = await publish_nostrain_event(
-            config.relay_url,
+        gradient_publish = await publish_nostrain_events(
+            config.relay_urls,
             gradient_event,
             open_timeout=config.open_timeout,
             reply_timeout=config.open_timeout,
         )
         if not gradient_publish.accepted:
-            raise RuntimeError(f"relay rejected gradient publication: {gradient_publish.message}")
+            raise RuntimeError(
+                "failed to publish gradient to any relay: "
+                + _format_failed_relays(gradient_publish.failed_relays)
+            )
 
-        collection = await collect_gradient_events(
-            config.relay_url,
+        collection = await collect_gradient_events_across_relays(
+            config.relay_urls,
             run_name=config.run_name,
             round_index=round_index,
             idle_timeout=config.round_timeout,
@@ -521,7 +655,8 @@ async def run_training_session(
         )
         if not collection.events:
             raise RuntimeError(
-                f"round {round_index} completed without any collected gradient events; relay state is inconsistent"
+                f"round {round_index} completed without any collected gradient events across relays; "
+                + _format_failed_relays(collection.failed_relays)
             )
 
         outer_result = nesterov_outer_step(
@@ -553,6 +688,15 @@ async def run_training_session(
             _write_model_state(round_dir / "momentum-state.json", outer_result.momentum_state)
             _write_json(round_dir / "local-training.json", local_training.to_json_obj())
 
+        failed_relay_urls = {
+            failure.relay_url
+            for failure in (
+                *heartbeat_publish.failed_relays,
+                *gradient_publish.failed_relays,
+                *collection.failed_relays,
+            )
+        }
+
         round_summaries.append(
             TrainingRoundSummary(
                 round_index=round_index,
@@ -567,16 +711,40 @@ async def run_training_session(
                 completion_reason=collection.completion_reason,
                 published_gradient_event_id=gradient_publish.event_id,
                 published_heartbeat_event_id=heartbeat_publish.event_id,
+                configured_relays=config.relay_urls,
+                published_heartbeat_relays=heartbeat_publish.accepted_relays,
+                published_gradient_relays=gradient_publish.accepted_relays,
+                collected_from_relays=collection.successful_relays,
+                failed_relays=tuple(
+                    relay_url for relay_url in config.relay_urls if relay_url in failed_relay_urls
+                ),
             )
         )
 
         current_state = outer_result.next_state
         current_momentum = outer_result.momentum_state
 
+        checkpoint = TrainingCheckpoint(
+            run_name=config.run_name,
+            worker_id=config.worker_id,
+            relay_urls=config.relay_urls,
+            next_round=round_index + 1,
+            current_state=current_state,
+            momentum_state=current_momentum,
+            rounds=tuple(round_summaries),
+            updated_at=int(time.time()),
+        )
+        if artifact_root is not None:
+            _write_json(artifact_root / "checkpoint.json", checkpoint.to_json_obj())
+            _write_json(round_dir / "checkpoint.json", checkpoint.to_json_obj())
+        if checkpoint_out is not None:
+            _write_json(Path(checkpoint_out), checkpoint.to_json_obj())
+
     return TrainingSessionResult(
         run_name=config.run_name,
         worker_id=config.worker_id,
-        start_round=config.start_round,
+        relay_urls=config.relay_urls,
+        start_round=prior_rounds[0].round_index if prior_rounds else config.start_round,
         rounds_completed=len(round_summaries),
         final_state=current_state,
         final_momentum_state=current_momentum,

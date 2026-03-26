@@ -21,12 +21,16 @@ from .protocol import (
 )
 from .relay import (
     collect_gradient_events,
+    collect_gradient_events_across_relays,
     collect_heartbeat_events,
+    collect_heartbeat_events_across_relays,
+    publish_nostrain_events,
     publish_nostrain_event,
 )
 from .training import (
     LinearRegressionDataset,
     LocalTrainingConfig,
+    TrainingCheckpoint,
     TrainingWorkerConfig,
     run_training_session,
     train_linear_regression,
@@ -61,6 +65,17 @@ def _resolve_worker_id(args: argparse.Namespace) -> str:
     if worker_id is None:
         raise ValueError("--worker is required unless --sec-key or --pubkey is provided")
     return worker_id
+
+
+def _resolve_relay_urls(relay_args: str | list[str]) -> tuple[str, ...]:
+    if isinstance(relay_args, str):
+        raw_relays = [relay_args]
+    else:
+        raw_relays = list(relay_args or [])
+    relay_urls = tuple(dict.fromkeys(str(relay).strip() for relay in raw_relays if str(relay).strip()))
+    if not relay_urls:
+        raise ValueError("at least one --relay is required")
+    return relay_urls
 
 
 def _load_payload_string(path: str | Path) -> str:
@@ -159,22 +174,46 @@ def _handle_build_heartbeat(args: argparse.Namespace) -> int:
 
 def _handle_publish_event(args: argparse.Namespace) -> int:
     event = _load_json(args.event)
+    relay_urls = _resolve_relay_urls(args.relay)
+    if len(relay_urls) == 1:
+        result = asyncio.run(
+            publish_nostrain_event(
+                relay_urls[0],
+                event,
+                open_timeout=args.timeout,
+                reply_timeout=args.timeout,
+            )
+        )
+        if not result.accepted:
+            raise RuntimeError(f"relay rejected event publication: {result.message}")
+        if args.json:
+            _write_json(args.output, result.to_json_obj())
+        else:
+            _write_text(
+                args.output,
+                f"published {result.event_id} to {result.relay_url}",
+            )
+        return 0
+
     result = asyncio.run(
-        publish_nostrain_event(
-            args.relay,
+        publish_nostrain_events(
+            relay_urls,
             event,
             open_timeout=args.timeout,
             reply_timeout=args.timeout,
         )
     )
     if not result.accepted:
-        raise RuntimeError(f"relay rejected event publication: {result.message}")
+        failures = "; ".join(
+            f"{failure.relay_url}: {failure.message}" for failure in result.failed_relays
+        )
+        raise RuntimeError(f"event publication failed on every relay: {failures}")
     if args.json:
         _write_json(args.output, result.to_json_obj())
     else:
         _write_text(
             args.output,
-            f"published {result.event_id} to {result.relay_url}",
+            f"published {result.event_id} to {len(result.accepted_relays)}/{len(relay_urls)} relays",
         )
     return 0
 
@@ -251,22 +290,43 @@ def _handle_train_local(args: argparse.Namespace) -> int:
 
 
 def _handle_run_training(args: argparse.Namespace) -> int:
-    initial_state = ModelState.from_path(args.state)
     dataset = LinearRegressionDataset.from_path(args.dataset)
-    previous_momentum = (
-        ModelState.from_path(args.momentum_state) if args.momentum_state else None
-    )
+    relay_urls = _resolve_relay_urls(args.relay)
+    worker_id = _resolve_worker_id(args)
+    checkpoint = TrainingCheckpoint.from_path(args.resume_from) if args.resume_from else None
+    if checkpoint is not None:
+        if checkpoint.run_name != args.run:
+            raise ValueError(
+                f"checkpoint run {checkpoint.run_name!r} does not match --run {args.run!r}"
+            )
+        if checkpoint.worker_id != worker_id:
+            raise ValueError(
+                f"checkpoint worker {checkpoint.worker_id!r} does not match worker {worker_id!r}"
+            )
+        initial_state = checkpoint.current_state
+        previous_momentum = checkpoint.momentum_state
+        start_round = checkpoint.next_round
+        prior_rounds = checkpoint.rounds
+    else:
+        initial_state = ModelState.from_path(args.state)
+        previous_momentum = (
+            ModelState.from_path(args.momentum_state) if args.momentum_state else None
+        )
+        start_round = args.start_round
+        prior_rounds = ()
+    if args.resume_from and args.momentum_state:
+        raise ValueError("--momentum-state cannot be combined with --resume-from")
     session = asyncio.run(
         run_training_session(
             initial_state,
             dataset,
             config=TrainingWorkerConfig(
                 run_name=args.run,
-                relay_url=args.relay,
-                worker_id=_resolve_worker_id(args),
+                relay_urls=relay_urls,
+                worker_id=worker_id,
                 secret_key_hex=args.sec_key,
                 rounds=args.rounds,
-                start_round=args.start_round,
+                start_round=start_round,
                 inner_steps=args.inner_steps,
                 local_learning_rate=args.local_learning_rate,
                 batch_size=args.batch_size,
@@ -282,6 +342,8 @@ def _handle_run_training(args: argparse.Namespace) -> int:
             ),
             previous_momentum=previous_momentum,
             artifact_dir=args.artifact_dir,
+            prior_rounds=prior_rounds,
+            checkpoint_out=args.checkpoint_out,
         )
     )
     _write_json(args.output, session.final_state.to_json_obj())
@@ -293,11 +355,13 @@ def _handle_run_training(args: argparse.Namespace) -> int:
 
 
 def _collection_summary(collection: Any) -> str:
+    relays = getattr(collection, "relay_urls", (collection.relay_url,))
+    relay_label = ", ".join(relays)
     workers = ", ".join(collection.worker_ids) if collection.worker_ids else "-"
     known_workers = ", ".join(collection.known_workers) if collection.known_workers else "-"
     return "\n".join(
         [
-            f"relay: {collection.relay_url}",
+            f"relays: {relay_label}",
             f"run: {collection.run_name}",
             f"round: {collection.round_index}",
             f"events: {len(collection.events)}",
@@ -312,10 +376,12 @@ def _collection_summary(collection: Any) -> str:
 
 
 def _heartbeat_collection_summary(collection: Any) -> str:
+    relays = getattr(collection, "relay_urls", (collection.relay_url,))
+    relay_label = ", ".join(relays)
     workers = ", ".join(collection.worker_ids) if collection.worker_ids else "-"
     return "\n".join(
         [
-            f"relay: {collection.relay_url}",
+            f"relays: {relay_label}",
             f"run: {collection.run_name}",
             f"target_round: {collection.target_round if collection.target_round is not None else '-'}",
             f"events: {len(collection.events)}",
@@ -328,17 +394,31 @@ def _heartbeat_collection_summary(collection: Any) -> str:
 
 
 def _handle_discover_workers(args: argparse.Namespace) -> int:
-    collection = asyncio.run(
-        collect_heartbeat_events(
-            args.relay,
-            run_name=args.run,
-            target_round=args.round,
-            idle_timeout=args.idle_timeout,
-            open_timeout=args.timeout,
-            since=args.since,
-            max_missed_heartbeats=args.max_missed_heartbeats,
+    relay_urls = _resolve_relay_urls(args.relay)
+    if len(relay_urls) == 1:
+        collection = asyncio.run(
+            collect_heartbeat_events(
+                relay_urls[0],
+                run_name=args.run,
+                target_round=args.round,
+                idle_timeout=args.idle_timeout,
+                open_timeout=args.timeout,
+                since=args.since,
+                max_missed_heartbeats=args.max_missed_heartbeats,
+            )
         )
-    )
+    else:
+        collection = asyncio.run(
+            collect_heartbeat_events_across_relays(
+                relay_urls,
+                run_name=args.run,
+                target_round=args.round,
+                idle_timeout=args.idle_timeout,
+                open_timeout=args.timeout,
+                since=args.since,
+                max_missed_heartbeats=args.max_missed_heartbeats,
+            )
+        )
     if args.json:
         _write_json(args.output, collection.to_json_obj())
     else:
@@ -347,22 +427,41 @@ def _handle_discover_workers(args: argparse.Namespace) -> int:
 
 
 def _handle_collect_events(args: argparse.Namespace) -> int:
-    collection = asyncio.run(
-        collect_gradient_events(
-            args.relay,
-            run_name=args.run,
-            round_index=args.round,
-            max_events=args.limit,
-            idle_timeout=args.idle_timeout,
-            open_timeout=args.timeout,
-            since=args.since,
-            strategy=args.sync,
-            discover_workers=args.discover_workers,
-            heartbeat_idle_timeout=args.heartbeat_idle_timeout,
-            heartbeat_since=args.heartbeat_since,
-            max_missed_heartbeats=args.max_missed_heartbeats,
+    relay_urls = _resolve_relay_urls(args.relay)
+    if len(relay_urls) == 1:
+        collection = asyncio.run(
+            collect_gradient_events(
+                relay_urls[0],
+                run_name=args.run,
+                round_index=args.round,
+                max_events=args.limit,
+                idle_timeout=args.idle_timeout,
+                open_timeout=args.timeout,
+                since=args.since,
+                strategy=args.sync,
+                discover_workers=args.discover_workers,
+                heartbeat_idle_timeout=args.heartbeat_idle_timeout,
+                heartbeat_since=args.heartbeat_since,
+                max_missed_heartbeats=args.max_missed_heartbeats,
+            )
         )
-    )
+    else:
+        collection = asyncio.run(
+            collect_gradient_events_across_relays(
+                relay_urls,
+                run_name=args.run,
+                round_index=args.round,
+                max_events=args.limit,
+                idle_timeout=args.idle_timeout,
+                open_timeout=args.timeout,
+                since=args.since,
+                strategy=args.sync,
+                discover_workers=args.discover_workers,
+                heartbeat_idle_timeout=args.heartbeat_idle_timeout,
+                heartbeat_since=args.heartbeat_since,
+                max_missed_heartbeats=args.max_missed_heartbeats,
+            )
+        )
     if args.json:
         _write_json(args.output, collection.to_json_obj())
     else:
@@ -371,22 +470,41 @@ def _handle_collect_events(args: argparse.Namespace) -> int:
 
 
 def _handle_aggregate_round(args: argparse.Namespace) -> int:
-    collection = asyncio.run(
-        collect_gradient_events(
-            args.relay,
-            run_name=args.run,
-            round_index=args.round,
-            max_events=args.limit,
-            idle_timeout=args.idle_timeout,
-            open_timeout=args.timeout,
-            since=args.since,
-            strategy=args.sync,
-            discover_workers=args.discover_workers,
-            heartbeat_idle_timeout=args.heartbeat_idle_timeout,
-            heartbeat_since=args.heartbeat_since,
-            max_missed_heartbeats=args.max_missed_heartbeats,
+    relay_urls = _resolve_relay_urls(args.relay)
+    if len(relay_urls) == 1:
+        collection = asyncio.run(
+            collect_gradient_events(
+                relay_urls[0],
+                run_name=args.run,
+                round_index=args.round,
+                max_events=args.limit,
+                idle_timeout=args.idle_timeout,
+                open_timeout=args.timeout,
+                since=args.since,
+                strategy=args.sync,
+                discover_workers=args.discover_workers,
+                heartbeat_idle_timeout=args.heartbeat_idle_timeout,
+                heartbeat_since=args.heartbeat_since,
+                max_missed_heartbeats=args.max_missed_heartbeats,
+            )
         )
-    )
+    else:
+        collection = asyncio.run(
+            collect_gradient_events_across_relays(
+                relay_urls,
+                run_name=args.run,
+                round_index=args.round,
+                max_events=args.limit,
+                idle_timeout=args.idle_timeout,
+                open_timeout=args.timeout,
+                since=args.since,
+                strategy=args.sync,
+                discover_workers=args.discover_workers,
+                heartbeat_idle_timeout=args.heartbeat_idle_timeout,
+                heartbeat_since=args.heartbeat_since,
+                max_missed_heartbeats=args.max_missed_heartbeats,
+            )
+        )
     aggregated = collection.aggregate_delta()
     _write_json(args.output, aggregated.to_json_obj())
     if args.summary_out:
@@ -657,7 +775,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Publish a nostrain gradient or heartbeat event JSON file to a websocket relay.",
     )
     publish_event.add_argument("event", help="Path to a nostrain event JSON file.")
-    publish_event.add_argument("--relay", required=True, help="Websocket relay URL.")
+    publish_event.add_argument(
+        "--relay",
+        action="append",
+        required=True,
+        help="Websocket relay URL. Can be provided multiple times for redundant publication.",
+    )
     publish_event.add_argument(
         "--timeout",
         type=float,
@@ -672,7 +795,12 @@ def build_parser() -> argparse.ArgumentParser:
         "discover-workers",
         help="Collect active worker heartbeats for a run and optional target round.",
     )
-    discover_workers.add_argument("--relay", required=True, help="Websocket relay URL.")
+    discover_workers.add_argument(
+        "--relay",
+        action="append",
+        required=True,
+        help="Websocket relay URL. Can be provided multiple times for cross-relay discovery.",
+    )
     discover_workers.add_argument("--run", required=True, help="Training run name.")
     discover_workers.add_argument(
         "--round",
@@ -775,11 +903,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_training = subparsers.add_parser(
         "run-training",
-        help="Run local training rounds, publish updates to a relay, and apply timeout-based outer aggregation.",
+        help="Run local training rounds, publish updates to one or more relays, and apply relay-aggregated outer steps.",
     )
     run_training.add_argument("state", help="Path to the initial global model state JSON.")
     run_training.add_argument("dataset", help="Path to a linear regression dataset JSON file.")
-    run_training.add_argument("--relay", required=True, help="Websocket relay URL.")
+    run_training.add_argument(
+        "--relay",
+        action="append",
+        required=True,
+        help="Websocket relay URL. Can be provided multiple times for redundant publish/collect.",
+    )
     run_training.add_argument("--run", required=True, help="Training run name.")
     run_training.add_argument(
         "--worker",
@@ -850,8 +983,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional prior momentum state JSON file.",
     )
     run_training.add_argument(
+        "--resume-from",
+        help="Optional training checkpoint JSON file written by a prior run-training session.",
+    )
+    run_training.add_argument(
         "--momentum-out",
         help="Optional path to write the final momentum state JSON.",
+    )
+    run_training.add_argument(
+        "--checkpoint-out",
+        help="Optional path to write a resumable training checkpoint after each completed round.",
     )
     run_training.add_argument(
         "--round-timeout",
@@ -897,7 +1038,12 @@ def build_parser() -> argparse.ArgumentParser:
         "collect-events",
         help="Subscribe to relay events for one nostrain run/round, validate them, and deduplicate replays.",
     )
-    collect_events.add_argument("--relay", required=True, help="Websocket relay URL.")
+    collect_events.add_argument(
+        "--relay",
+        action="append",
+        required=True,
+        help="Websocket relay URL. Can be provided multiple times for cross-relay collection.",
+    )
     collect_events.add_argument("--run", required=True, help="Training run name.")
     collect_events.add_argument("--round", type=int, required=True, help="Outer round number.")
     collect_events.add_argument(
@@ -957,7 +1103,12 @@ def build_parser() -> argparse.ArgumentParser:
         "aggregate-round",
         help="Collect one run/round from a relay and aggregate the embedded worker deltas.",
     )
-    aggregate_round.add_argument("--relay", required=True, help="Websocket relay URL.")
+    aggregate_round.add_argument(
+        "--relay",
+        action="append",
+        required=True,
+        help="Websocket relay URL. Can be provided multiple times for cross-relay aggregation.",
+    )
     aggregate_round.add_argument("--run", required=True, help="Training run name.")
     aggregate_round.add_argument("--round", type=int, required=True, help="Outer round number.")
     aggregate_round.add_argument(
