@@ -1,10 +1,8 @@
-# nostrain: Specification v0.4.0
+# nostrain: Specification v0.5.0
 
 ## Overview
 
-nostrain is a protocol for distributed ML training over Nostr relays. The implemented repository milestone now covers the payload layer plus a signed transport slice: deterministic model snapshots, pseudo-gradient generation, sparse quantized wire encoding, NIP-01-compatible gradient and heartbeat event envelopes, and websocket discovery/collection for one round.
-
-Live training orchestration remains out of scope for this version.
+nostrain is a protocol for distributed ML training over Nostr relays. The implemented repository milestone now covers the payload layer, a signed transport slice, and a first end-to-end runner: deterministic model snapshots, pseudo-gradient generation, sparse quantized wire encoding, NIP-01-compatible gradient and heartbeat event envelopes, websocket discovery/collection for one round, and a built-in linear-regression worker loop that trains locally and synchronizes through a relay.
 
 ## Implemented core
 
@@ -25,6 +23,11 @@ Live training orchestration remains out of scope for this version.
 15. Build and validate signed worker heartbeat discovery events (kind `33334`)
 16. Discover active workers from relay heartbeats while discarding stale workers
 17. Stop round collection via `timeout`, `strict`, `quorum`, or `async` strategies using discovered workers
+18. Load deterministic JSON datasets for built-in linear-regression workloads
+19. Import/export linear-regression weights through the shared `ModelState` schema
+20. Run configurable local SGD inner loops over JSON datasets
+21. Publish heartbeat + gradient events for each round and apply the aggregated outer step locally
+22. Persist machine-readable per-round/session artifacts for relay-backed training runs
 
 ## Model state schema
 
@@ -45,6 +48,34 @@ Rules:
 - parameters are canonically ordered by name when loaded
 - `len(values)` must equal the product of `shape`
 - model digests are SHA-256 over the canonical parameter stream
+
+Built-in runner state:
+
+- `linear.weight`: shape `[1, feature_count]`
+- `linear.bias`: shape `[1]`
+
+The protocol remains generic, but the built-in training runtime currently targets this linear schema so the full loop stays dependency-light and deterministic.
+
+## Linear regression dataset schema
+
+```json
+{
+  "task": "linear-regression",
+  "examples": [
+    {
+      "inputs": [1.0, 0.0],
+      "target": 2.5
+    }
+  ]
+}
+```
+
+Rules:
+
+- `task` must be `linear-regression`
+- `examples` must be non-empty
+- every example must provide the same number of input features
+- targets are scalar floating-point regression values
 
 ## Gradient event schema
 
@@ -166,6 +197,8 @@ nostrain publish-event <event.json> --relay <ws://...>
 nostrain discover-workers --relay <ws://...> --run <name> [--round <n>]
 nostrain collect-events --relay <ws://...> --run <name> --round <n> [--sync timeout|strict|quorum|async] [--discover-workers]
 nostrain aggregate-round --relay <ws://...> --run <name> --round <n> [--sync timeout|strict|quorum|async] [--discover-workers]
+nostrain train-local <state.json> <dataset.json> [--steps 500] [--learning-rate 0.01] [--batch-size 1]
+nostrain run-training <state.json> <dataset.json> --relay <ws://...> --run <name> --sec-key <hex> [--rounds 1]
 nostrain inspect-event <event.json> [--json]
 ```
 
@@ -182,8 +215,27 @@ Given worker deltas `d_1 ... d_n`:
 
 This treats the aggregated pseudo-gradient as an update direction inferred from local training drift rather than as a raw loss gradient.
 
-## Deferred from v0.4.0
+## Training runner semantics
+
+The built-in runner executes the following loop for each round:
+
+1. snapshot the current global model state
+2. publish a signed worker heartbeat for the target round
+3. run local SGD for `H` inner steps on the worker's JSON dataset
+4. compute `theta_local - theta_base`, compress it, and publish it as a signed gradient event
+5. collect same-round worker updates from the relay until the timeout path goes idle
+6. average the collected deltas and apply the configured outer Nesterov step
+7. persist round/session artifacts when output paths are configured
+
+Fault-tolerance boundary:
+
+- missing peer gradients are tolerated when at least one valid gradient event is collected before timeout
+- stale or invalid events are discarded by the existing transport validators
+- total relay failure or zero collected gradients still aborts the round to avoid silent model divergence
+
+## Deferred from v0.5.0
 
 - multi-relay deduplication
+- checkpoint distribution and recovery
 - DiLoCo training loop integration with PyTorch or MLX
 - live dashboarding

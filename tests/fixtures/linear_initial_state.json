@@ -1,0 +1,12 @@
+{
+  "parameters": {
+    "linear.bias": {
+      "shape": [1],
+      "values": [0.0]
+    },
+    "linear.weight": {
+      "shape": [1, 2],
+      "values": [0.0, 0.0]
+    }
+  }
+}

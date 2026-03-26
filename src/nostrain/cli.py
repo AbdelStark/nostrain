@@ -24,6 +24,13 @@ from .relay import (
     collect_heartbeat_events,
     publish_nostrain_event,
 )
+from .training import (
+    LinearRegressionDataset,
+    LocalTrainingConfig,
+    TrainingWorkerConfig,
+    run_training_session,
+    train_linear_regression,
+)
 
 
 def _load_json(path: str | Path) -> Any:
@@ -222,6 +229,66 @@ def _handle_outer_step(args: argparse.Namespace) -> int:
                 "aggregated_values": result.aggregated_delta.total_values,
             },
         )
+    return 0
+
+
+def _handle_train_local(args: argparse.Namespace) -> int:
+    initial_state = ModelState.from_path(args.state)
+    dataset = LinearRegressionDataset.from_path(args.dataset)
+    result = train_linear_regression(
+        initial_state,
+        dataset,
+        config=LocalTrainingConfig(
+            steps=args.steps,
+            learning_rate=args.learning_rate,
+            batch_size=args.batch_size,
+        ),
+    )
+    _write_json(args.output, result.trained_state.to_json_obj())
+    if args.metrics_out:
+        _write_json(args.metrics_out, result.to_json_obj())
+    return 0
+
+
+def _handle_run_training(args: argparse.Namespace) -> int:
+    initial_state = ModelState.from_path(args.state)
+    dataset = LinearRegressionDataset.from_path(args.dataset)
+    previous_momentum = (
+        ModelState.from_path(args.momentum_state) if args.momentum_state else None
+    )
+    session = asyncio.run(
+        run_training_session(
+            initial_state,
+            dataset,
+            config=TrainingWorkerConfig(
+                run_name=args.run,
+                relay_url=args.relay,
+                worker_id=_resolve_worker_id(args),
+                secret_key_hex=args.sec_key,
+                rounds=args.rounds,
+                start_round=args.start_round,
+                inner_steps=args.inner_steps,
+                local_learning_rate=args.local_learning_rate,
+                batch_size=args.batch_size,
+                topk_ratio=args.topk,
+                codec=args.codec,
+                outer_learning_rate=args.outer_learning_rate,
+                outer_momentum=args.momentum,
+                round_timeout=args.round_timeout,
+                open_timeout=args.timeout,
+                heartbeat_interval=args.heartbeat_interval,
+                max_missed_heartbeats=args.max_missed_heartbeats,
+                advertised_relays=tuple(args.advertise_relay or ()),
+            ),
+            previous_momentum=previous_momentum,
+            artifact_dir=args.artifact_dir,
+        )
+    )
+    _write_json(args.output, session.final_state.to_json_obj())
+    if args.momentum_out and session.final_momentum_state is not None:
+        _write_json(args.momentum_out, session.final_momentum_state.to_json_obj())
+    if args.summary_out:
+        _write_json(args.summary_out, session.to_json_obj())
     return 0
 
 
@@ -674,6 +741,157 @@ def build_parser() -> argparse.ArgumentParser:
     )
     outer_step.add_argument("-o", "--output", help="Optional output path.")
     outer_step.set_defaults(handler=_handle_outer_step)
+
+    train_local = subparsers.add_parser(
+        "train-local",
+        help="Run a pure-Python linear-regression inner loop against a model state and dataset JSON.",
+    )
+    train_local.add_argument("state", help="Path to the initial linear model state JSON.")
+    train_local.add_argument("dataset", help="Path to a linear regression dataset JSON file.")
+    train_local.add_argument(
+        "--steps",
+        type=int,
+        default=500,
+        help="Number of local SGD steps to run (default: 500).",
+    )
+    train_local.add_argument(
+        "--learning-rate",
+        type=float,
+        default=0.01,
+        help="Inner learning rate (default: 0.01).",
+    )
+    train_local.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Mini-batch size for local SGD (default: 1).",
+    )
+    train_local.add_argument(
+        "--metrics-out",
+        help="Optional path to write a JSON summary of the local training run.",
+    )
+    train_local.add_argument("-o", "--output", help="Optional output path.")
+    train_local.set_defaults(handler=_handle_train_local)
+
+    run_training = subparsers.add_parser(
+        "run-training",
+        help="Run local training rounds, publish updates to a relay, and apply timeout-based outer aggregation.",
+    )
+    run_training.add_argument("state", help="Path to the initial global model state JSON.")
+    run_training.add_argument("dataset", help="Path to a linear regression dataset JSON file.")
+    run_training.add_argument("--relay", required=True, help="Websocket relay URL.")
+    run_training.add_argument("--run", required=True, help="Training run name.")
+    run_training.add_argument(
+        "--worker",
+        help="Worker identity tag. Defaults to the derived pubkey from --sec-key.",
+    )
+    run_training.add_argument(
+        "--sec-key",
+        required=True,
+        help="Lowercase hex-encoded 32-byte secret key used to sign heartbeat and gradient events.",
+    )
+    run_training.add_argument(
+        "--rounds",
+        type=int,
+        default=1,
+        help="Number of outer rounds to execute (default: 1).",
+    )
+    run_training.add_argument(
+        "--start-round",
+        type=int,
+        default=0,
+        help="Round index assigned to the first executed round (default: 0).",
+    )
+    run_training.add_argument(
+        "--inner-steps",
+        type=int,
+        default=500,
+        help="Number of local inner-loop steps per round (default: 500).",
+    )
+    run_training.add_argument(
+        "--local-learning-rate",
+        type=float,
+        default=0.01,
+        help="Local inner-loop learning rate (default: 0.01).",
+    )
+    run_training.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Mini-batch size for local SGD (default: 1).",
+    )
+    run_training.add_argument(
+        "--topk",
+        type=float,
+        default=1.0,
+        help="Fraction of local delta values to retain in the published payload (default: 1.0).",
+    )
+    run_training.add_argument(
+        "--codec",
+        type=CompressionCodec,
+        choices=list(CompressionCodec),
+        default=CompressionCodec.ZLIB,
+        help="Wire codec to use for published payloads.",
+    )
+    run_training.add_argument(
+        "--outer-learning-rate",
+        type=float,
+        default=0.7,
+        help="Outer learning rate applied after relay aggregation (default: 0.7).",
+    )
+    run_training.add_argument(
+        "--momentum",
+        type=float,
+        default=0.9,
+        help="Outer Nesterov momentum coefficient (default: 0.9).",
+    )
+    run_training.add_argument(
+        "--momentum-state",
+        help="Optional prior momentum state JSON file.",
+    )
+    run_training.add_argument(
+        "--momentum-out",
+        help="Optional path to write the final momentum state JSON.",
+    )
+    run_training.add_argument(
+        "--round-timeout",
+        type=float,
+        default=2.0,
+        help="Stop waiting for peer gradients after this many idle seconds (default: 2).",
+    )
+    run_training.add_argument(
+        "--timeout",
+        type=float,
+        default=10.0,
+        help="Relay connection timeout in seconds (default: 10).",
+    )
+    run_training.add_argument(
+        "--heartbeat-interval",
+        type=int,
+        default=60,
+        help="Advertised heartbeat interval in seconds (default: 60).",
+    )
+    run_training.add_argument(
+        "--max-missed-heartbeats",
+        type=int,
+        default=3,
+        help="Discard discovered workers missing more than this many heartbeats (default: 3).",
+    )
+    run_training.add_argument(
+        "--advertise-relay",
+        action="append",
+        help="Advertise an additional relay URL hint. Can be provided multiple times.",
+    )
+    run_training.add_argument(
+        "--artifact-dir",
+        help="Optional directory for per-round artifacts such as events, payloads, and summaries.",
+    )
+    run_training.add_argument(
+        "--summary-out",
+        help="Optional path to write a JSON session summary.",
+    )
+    run_training.add_argument("-o", "--output", help="Optional output path.")
+    run_training.set_defaults(handler=_handle_run_training)
 
     collect_events = subparsers.add_parser(
         "collect-events",

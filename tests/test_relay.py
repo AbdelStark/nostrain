@@ -26,7 +26,7 @@ from nostrain.protocol import (
     parse_gradient_event,
 )
 from nostrain.relay import collect_gradient_events, collect_heartbeat_events
-from tests.helpers import assert_state_json_almost_equal
+from tests.helpers import assert_model_state_almost_equal, assert_state_json_almost_equal
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -696,6 +696,202 @@ class RelayTransportTests(unittest.TestCase):
                     "--relay",
                     relay.url,
                 )
+
+    def test_cli_run_training_completes_after_timeout_with_missing_peer(self) -> None:
+        seeded_peer_heartbeat = _build_heartbeat(
+            worker_id="worker-b",
+            created_at=int(time.time()) + 10,
+            current_round=0,
+            run_name="training-run",
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory, MockRelay([seeded_peer_heartbeat]) as relay:
+            tempdir = Path(temporary_directory)
+            final_state = tempdir / "final-state.json"
+            summary = tempdir / "summary.json"
+            momentum = tempdir / "momentum.json"
+            artifact_dir = tempdir / "artifacts"
+
+            self._run(
+                "run-training",
+                str(FIXTURES / "linear_initial_state.json"),
+                str(FIXTURES / "linear_dataset_worker_a.json"),
+                "--relay",
+                relay.url,
+                "--run",
+                "training-run",
+                "--worker",
+                "worker-a",
+                "--sec-key",
+                WORKER_SECRET_KEYS["worker-a"],
+                "--rounds",
+                "2",
+                "--inner-steps",
+                "30",
+                "--local-learning-rate",
+                "0.05",
+                "--batch-size",
+                "2",
+                "--outer-learning-rate",
+                "1.0",
+                "--momentum",
+                "0.5",
+                "--round-timeout",
+                "0.2",
+                "--artifact-dir",
+                str(artifact_dir),
+                "--momentum-out",
+                str(momentum),
+                "--summary-out",
+                str(summary),
+                "-o",
+                str(final_state),
+            )
+
+            final_state_json = json.loads(final_state.read_text(encoding="utf-8"))
+            summary_json = json.loads(summary.read_text(encoding="utf-8"))
+
+            self.assertIn("parameters", final_state_json)
+            self.assertTrue(momentum.exists())
+            self.assertEqual(summary_json["rounds_completed"], 2)
+            self.assertEqual(len(summary_json["rounds"]), 2)
+            self.assertEqual(summary_json["rounds"][0]["collected_event_count"], 1)
+            self.assertEqual(summary_json["rounds"][0]["missing_workers"], ["worker-b"])
+            self.assertEqual(summary_json["rounds"][0]["completion_reason"], "idle-timeout")
+            self.assertTrue((artifact_dir / "round-0000" / "collection.json").exists())
+            self.assertTrue((artifact_dir / "round-0001" / "next-state.json").exists())
+
+    def test_cli_run_training_two_workers_converge_via_relay(self) -> None:
+        seeded_heartbeats = [
+            _build_heartbeat(
+                worker_id="worker-a",
+                created_at=int(time.time()) + 10,
+                current_round=0,
+                run_name="shared-run",
+            ),
+            _build_heartbeat(
+                worker_id="worker-b",
+                created_at=int(time.time()) + 11,
+                current_round=0,
+                run_name="shared-run",
+            ),
+        ]
+
+        with tempfile.TemporaryDirectory() as temporary_directory, MockRelay(seeded_heartbeats) as relay:
+            tempdir = Path(temporary_directory)
+            state_a = tempdir / "state-a.json"
+            state_b = tempdir / "state-b.json"
+            summary_a = tempdir / "summary-a.json"
+            summary_b = tempdir / "summary-b.json"
+
+            env = os.environ.copy()
+            existing_pythonpath = env.get("PYTHONPATH")
+            src_path = str(ROOT / "src")
+            env["PYTHONPATH"] = src_path if not existing_pythonpath else f"{src_path}:{existing_pythonpath}"
+
+            process_a = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "nostrain",
+                    "run-training",
+                    str(FIXTURES / "linear_initial_state.json"),
+                    str(FIXTURES / "linear_dataset_worker_a.json"),
+                    "--relay",
+                    relay.url,
+                    "--run",
+                    "shared-run",
+                    "--worker",
+                    "worker-a",
+                    "--sec-key",
+                    WORKER_SECRET_KEYS["worker-a"],
+                    "--inner-steps",
+                    "30",
+                    "--local-learning-rate",
+                    "0.05",
+                    "--batch-size",
+                    "2",
+                    "--outer-learning-rate",
+                    "1.0",
+                    "--momentum",
+                    "0.0",
+                    "--round-timeout",
+                    "0.4",
+                    "--summary-out",
+                    str(summary_a),
+                    "-o",
+                    str(state_a),
+                ],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            process_b = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "nostrain",
+                    "run-training",
+                    str(FIXTURES / "linear_initial_state.json"),
+                    str(FIXTURES / "linear_dataset_worker_b.json"),
+                    "--relay",
+                    relay.url,
+                    "--run",
+                    "shared-run",
+                    "--worker",
+                    "worker-b",
+                    "--sec-key",
+                    WORKER_SECRET_KEYS["worker-b"],
+                    "--inner-steps",
+                    "30",
+                    "--local-learning-rate",
+                    "0.05",
+                    "--batch-size",
+                    "2",
+                    "--outer-learning-rate",
+                    "1.0",
+                    "--momentum",
+                    "0.0",
+                    "--round-timeout",
+                    "0.4",
+                    "--summary-out",
+                    str(summary_b),
+                    "-o",
+                    str(state_b),
+                ],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+            stdout_a, stderr_a = process_a.communicate(timeout=20)
+            stdout_b, stderr_b = process_b.communicate(timeout=20)
+
+            if process_a.returncode != 0:
+                self.fail(f"worker-a failed: {stderr_a or stdout_a}")
+            if process_b.returncode != 0:
+                self.fail(f"worker-b failed: {stderr_b or stdout_b}")
+
+            final_state_a = ModelState.from_path(state_a)
+            final_state_b = ModelState.from_path(state_b)
+            summary_json_a = json.loads(summary_a.read_text(encoding="utf-8"))
+            summary_json_b = json.loads(summary_b.read_text(encoding="utf-8"))
+
+            assert_model_state_almost_equal(self, final_state_a, final_state_b, places=8)
+            self.assertEqual(summary_json_a["rounds"][0]["collected_event_count"], 2)
+            self.assertEqual(summary_json_b["rounds"][0]["collected_event_count"], 2)
+            self.assertEqual(
+                sorted(summary_json_a["rounds"][0]["known_workers"]),
+                ["worker-a", "worker-b"],
+            )
+            self.assertEqual(
+                sorted(summary_json_b["rounds"][0]["collected_workers"]),
+                ["worker-a", "worker-b"],
+            )
 
 
 if __name__ == "__main__":

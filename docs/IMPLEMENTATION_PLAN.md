@@ -60,21 +60,32 @@ Delivered in the current repository state:
 
 This moves the project from blind relay collection to relay-aware coordination with an explicit picture of which workers are currently alive for a round.
 
-## Next milestone: training runner
+## Completed milestone: training runner
 
-Goal: connect the protocol layer to an actual DiLoCo inner/outer training loop.
+Delivered in the current repository state:
+
+- deterministic JSON datasets for a built-in linear-regression workload
+- linear-model import/export through the shared `ModelState` schema
+- configurable local SGD inner loops via `train-local`
+- relay-backed worker orchestration via `run-training`
+- timeout-based round completion with partial gradient aggregation
+- per-round artifacts plus session/momentum outputs for inspection and continuation
+- tests covering local training, missing-peer timeouts, and two-worker relay convergence
+
+This moves the project from protocol-first tooling to an executable distributed-training prototype that can actually perform local work, publish updates, and converge across workers through a relay.
+
+## Next milestone: multi-relay resilience + checkpoint recovery
+
+Goal: keep workers converged when relays or workers disappear mid-run.
 
 Deliverables:
 
-- adapter for exporting/importing model state from a training runtime
-- configurable inner step count
-- outer aggregation and update application wired to live worker traffic
-- timeout-based round completion
-- fault-tolerant handling of missing gradients
+- publish every round to multiple relays and deduplicate collections across them
+- persist and advertise resumable checkpoints for crashed/rejoining workers
+- retry/failover logic for relay outages
+- explicit handling for late gradients that arrive after a worker has advanced to the next round
 
 ## Deferred polish
 
 - rich terminal UX
-- multi-relay redundancy
-- checkpoint publishing
 - visualization/dashboard
