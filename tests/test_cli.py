@@ -40,7 +40,9 @@ class CliWorkflowTests(unittest.TestCase):
             reconstructed_path = tempdir / "reconstructed.json"
             aggregated_path = tempdir / "aggregated.json"
             event_path = tempdir / "event.json"
+            heartbeat_path = tempdir / "heartbeat.json"
             summary_path = tempdir / "summary.json"
+            heartbeat_summary_path = tempdir / "heartbeat-summary.json"
             next_state_path = tempdir / "next-state.json"
             momentum_path = tempdir / "momentum.json"
 
@@ -158,6 +160,45 @@ class CliWorkflowTests(unittest.TestCase):
             self.assertEqual(summary["signing_state"], "signed")
             self.assertEqual(summary["pubkey"], TEST_PUBLIC_KEY)
             self.assertEqual(len(summary["event_id"]), 64)
+
+            self._run(
+                "build-heartbeat",
+                "--run",
+                "demo-run",
+                "--round",
+                "7",
+                "--worker",
+                "worker-pubkey",
+                "--capability",
+                "gradient-event",
+                "--advertise-relay",
+                "ws://127.0.0.1:8765",
+                "--created-at",
+                "1700000001",
+                "--sec-key",
+                TEST_SECRET_KEY,
+                "-o",
+                str(heartbeat_path),
+            )
+            self._run(
+                "inspect-event",
+                str(heartbeat_path),
+                "--json",
+                "-o",
+                str(heartbeat_summary_path),
+            )
+            heartbeat_summary = json.loads(heartbeat_summary_path.read_text(encoding="utf-8"))
+            self.assertEqual(heartbeat_summary["type"], "heartbeat")
+            self.assertEqual(heartbeat_summary["run"], "demo-run")
+            self.assertEqual(heartbeat_summary["round"], 7)
+            self.assertEqual(heartbeat_summary["worker"], "worker-pubkey")
+            self.assertEqual(heartbeat_summary["heartbeat_interval"], 60)
+            self.assertEqual(heartbeat_summary["capabilities"], ["gradient-event"])
+            self.assertEqual(
+                heartbeat_summary["advertised_relays"],
+                ["ws://127.0.0.1:8765"],
+            )
+            self.assertTrue(heartbeat_summary["signed"])
 
 
 if __name__ == "__main__":

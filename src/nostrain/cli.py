@@ -10,8 +10,20 @@ from .aggregation import aggregate_deltas, nesterov_outer_step
 from .compression import CompressionCodec, compress_delta, decompress_payload, inspect_payload
 from .crypto import secret_key_to_public_key
 from .model import ModelState, apply_delta, compute_delta, state_digest
-from .protocol import GradientEventMetadata, build_gradient_event, parse_gradient_event
-from .relay import collect_gradient_events, publish_gradient_event
+from .protocol import (
+    GradientEventMetadata,
+    HeartbeatEventMetadata,
+    ParsedGradientEvent,
+    build_gradient_event,
+    build_heartbeat_event,
+    parse_gradient_event,
+    parse_nostrain_event,
+)
+from .relay import (
+    collect_gradient_events,
+    collect_heartbeat_events,
+    publish_nostrain_event,
+)
 
 
 def _load_json(path: str | Path) -> Any:
@@ -31,6 +43,17 @@ def _write_text(path: str | Path | None, data: str) -> None:
         print(data)
         return
     Path(path).write_text(data + "\n", encoding="utf-8")
+
+
+def _resolve_worker_id(args: argparse.Namespace) -> str:
+    worker_id = getattr(args, "worker", None)
+    if worker_id is None and getattr(args, "sec_key", None):
+        worker_id = secret_key_to_public_key(args.sec_key)
+    if worker_id is None and getattr(args, "pubkey", None):
+        worker_id = args.pubkey.strip().lower()
+    if worker_id is None:
+        raise ValueError("--worker is required unless --sec-key or --pubkey is provided")
+    return worker_id
 
 
 def _load_payload_string(path: str | Path) -> str:
@@ -86,18 +109,10 @@ def _handle_apply_payload(args: argparse.Namespace) -> int:
 
 def _handle_build_event(args: argparse.Namespace) -> int:
     payload = _load_payload_string(args.payload)
-    worker_id = args.worker
-    if worker_id is None and args.sec_key:
-        worker_id = secret_key_to_public_key(args.sec_key)
-    if worker_id is None and args.pubkey:
-        worker_id = args.pubkey.strip().lower()
-    if worker_id is None:
-        raise ValueError("--worker is required unless --sec-key or --pubkey is provided")
-
     metadata = GradientEventMetadata(
         run_name=args.run,
         round_index=args.round,
-        worker_id=worker_id,
+        worker_id=_resolve_worker_id(args),
         model_hash=args.model,
         inner_steps=args.steps,
         created_at=args.created_at,
@@ -114,10 +129,31 @@ def _handle_build_event(args: argparse.Namespace) -> int:
     return 0
 
 
+def _handle_build_heartbeat(args: argparse.Namespace) -> int:
+    metadata = HeartbeatEventMetadata(
+        run_name=args.run,
+        worker_id=_resolve_worker_id(args),
+        current_round=args.round,
+        heartbeat_interval=args.heartbeat_interval,
+        capabilities=tuple(args.capability or ("gradient-event",)),
+        advertised_relays=tuple(args.advertise_relay or ()),
+        created_at=args.created_at,
+    )
+    event = build_heartbeat_event(
+        metadata,
+        secret_key_hex=args.sec_key,
+        public_key_hex=args.pubkey,
+        signature_hex=args.sig,
+        event_id=args.event_id,
+    )
+    _write_json(args.output, event.to_json_obj())
+    return 0
+
+
 def _handle_publish_event(args: argparse.Namespace) -> int:
     event = _load_json(args.event)
     result = asyncio.run(
-        publish_gradient_event(
+        publish_nostrain_event(
             args.relay,
             event,
             open_timeout=args.timeout,
@@ -191,6 +227,7 @@ def _handle_outer_step(args: argparse.Namespace) -> int:
 
 def _collection_summary(collection: Any) -> str:
     workers = ", ".join(collection.worker_ids) if collection.worker_ids else "-"
+    known_workers = ", ".join(collection.known_workers) if collection.known_workers else "-"
     return "\n".join(
         [
             f"relay: {collection.relay_url}",
@@ -198,10 +235,48 @@ def _collection_summary(collection: Any) -> str:
             f"round: {collection.round_index}",
             f"events: {len(collection.events)}",
             f"workers: {workers}",
+            f"known_workers: {known_workers}",
             f"duplicates_discarded: {collection.duplicates_discarded}",
             f"invalid_events: {collection.invalid_events}",
+            f"sync_strategy: {collection.sync_strategy}",
+            f"completion_reason: {collection.completion_reason}",
         ]
     )
+
+
+def _heartbeat_collection_summary(collection: Any) -> str:
+    workers = ", ".join(collection.worker_ids) if collection.worker_ids else "-"
+    return "\n".join(
+        [
+            f"relay: {collection.relay_url}",
+            f"run: {collection.run_name}",
+            f"target_round: {collection.target_round if collection.target_round is not None else '-'}",
+            f"events: {len(collection.events)}",
+            f"workers: {workers}",
+            f"duplicates_discarded: {collection.duplicates_discarded}",
+            f"invalid_events: {collection.invalid_events}",
+            f"stale_events: {collection.stale_events}",
+        ]
+    )
+
+
+def _handle_discover_workers(args: argparse.Namespace) -> int:
+    collection = asyncio.run(
+        collect_heartbeat_events(
+            args.relay,
+            run_name=args.run,
+            target_round=args.round,
+            idle_timeout=args.idle_timeout,
+            open_timeout=args.timeout,
+            since=args.since,
+            max_missed_heartbeats=args.max_missed_heartbeats,
+        )
+    )
+    if args.json:
+        _write_json(args.output, collection.to_json_obj())
+    else:
+        _write_text(args.output, _heartbeat_collection_summary(collection))
+    return 0
 
 
 def _handle_collect_events(args: argparse.Namespace) -> int:
@@ -214,6 +289,11 @@ def _handle_collect_events(args: argparse.Namespace) -> int:
             idle_timeout=args.idle_timeout,
             open_timeout=args.timeout,
             since=args.since,
+            strategy=args.sync,
+            discover_workers=args.discover_workers,
+            heartbeat_idle_timeout=args.heartbeat_idle_timeout,
+            heartbeat_since=args.heartbeat_since,
+            max_missed_heartbeats=args.max_missed_heartbeats,
         )
     )
     if args.json:
@@ -233,6 +313,11 @@ def _handle_aggregate_round(args: argparse.Namespace) -> int:
             idle_timeout=args.idle_timeout,
             open_timeout=args.timeout,
             since=args.since,
+            strategy=args.sync,
+            discover_workers=args.discover_workers,
+            heartbeat_idle_timeout=args.heartbeat_idle_timeout,
+            heartbeat_since=args.heartbeat_since,
+            max_missed_heartbeats=args.max_missed_heartbeats,
         )
     )
     aggregated = collection.aggregate_delta()
@@ -244,27 +329,44 @@ def _handle_aggregate_round(args: argparse.Namespace) -> int:
 
 def _event_summary(path: str | Path) -> dict[str, Any]:
     event = _load_json(path)
-    parsed = parse_gradient_event(event)
-    return {
+    parsed = parse_nostrain_event(event)
+    summary = {
         "event_id": parsed.event.fingerprint(),
+        "type": "gradient" if isinstance(parsed, ParsedGradientEvent) else "heartbeat",
         "kind": parsed.event.kind,
         "created_at": parsed.event.created_at,
         "signed": parsed.event.is_signed,
         "signing_state": parsed.event.signing_state,
         "pubkey": parsed.event.pubkey,
-        "run": parsed.metadata.run_name,
-        "round": parsed.metadata.round_index,
         "worker": parsed.metadata.worker_id,
-        "model": parsed.metadata.model_hash,
-        "steps": parsed.metadata.inner_steps,
-        "compression": parsed.payload.compression_label,
-        "parameter_count": parsed.payload.parameter_count,
-        "total_values": parsed.payload.total_values,
-        "selected_values": parsed.payload.selected_values,
-        "density": parsed.payload.density,
-        "wire_bytes": parsed.payload.wire_bytes,
-        "compression_ratio": parsed.payload.compression_ratio,
     }
+    if isinstance(parsed, ParsedGradientEvent):
+        summary.update(
+            {
+                "run": parsed.metadata.run_name,
+                "round": parsed.metadata.round_index,
+                "model": parsed.metadata.model_hash,
+                "steps": parsed.metadata.inner_steps,
+                "compression": parsed.payload.compression_label,
+                "parameter_count": parsed.payload.parameter_count,
+                "total_values": parsed.payload.total_values,
+                "selected_values": parsed.payload.selected_values,
+                "density": parsed.payload.density,
+                "wire_bytes": parsed.payload.wire_bytes,
+                "compression_ratio": parsed.payload.compression_ratio,
+            }
+        )
+    else:
+        summary.update(
+            {
+                "run": parsed.metadata.run_name,
+                "round": parsed.metadata.current_round,
+                "heartbeat_interval": parsed.metadata.heartbeat_interval,
+                "capabilities": list(parsed.metadata.capabilities),
+                "advertised_relays": list(parsed.metadata.advertised_relays),
+            }
+        )
+    return summary
 
 
 def _handle_inspect_event(args: argparse.Namespace) -> int:
@@ -274,6 +376,7 @@ def _handle_inspect_event(args: argparse.Namespace) -> int:
         return 0
 
     lines = [
+        f"type: {summary['type']}",
         f"event_id: {summary['event_id']}",
         f"kind: {summary['kind']}",
         f"created_at: {summary['created_at']}",
@@ -283,15 +386,34 @@ def _handle_inspect_event(args: argparse.Namespace) -> int:
         f"run: {summary['run']}",
         f"round: {summary['round']}",
         f"worker: {summary['worker']}",
-        f"model: {summary['model']}",
-        f"steps: {summary['steps']}",
-        f"compression: {summary['compression']}",
-        f"parameter_count: {summary['parameter_count']}",
-        f"selected_values: {summary['selected_values']}/{summary['total_values']}",
-        f"density: {summary['density']:.4f}",
-        f"wire_bytes: {summary['wire_bytes']}",
-        f"compression_ratio: {summary['compression_ratio']:.2f}",
     ]
+    if summary["type"] == "gradient":
+        lines.extend(
+            [
+                f"model: {summary['model']}",
+                f"steps: {summary['steps']}",
+                f"compression: {summary['compression']}",
+                f"parameter_count: {summary['parameter_count']}",
+                f"selected_values: {summary['selected_values']}/{summary['total_values']}",
+                f"density: {summary['density']:.4f}",
+                f"wire_bytes: {summary['wire_bytes']}",
+                f"compression_ratio: {summary['compression_ratio']:.2f}",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                f"heartbeat_interval: {summary['heartbeat_interval']}",
+                "capabilities: "
+                + (", ".join(summary["capabilities"]) if summary["capabilities"] else "-"),
+                "advertised_relays: "
+                + (
+                    ", ".join(summary["advertised_relays"])
+                    if summary["advertised_relays"]
+                    else "-"
+                ),
+            ]
+        )
     _write_text(args.output, "\n".join(lines))
     return 0
 
@@ -413,9 +535,59 @@ def build_parser() -> argparse.ArgumentParser:
     build_event.add_argument("-o", "--output", help="Optional output path.")
     build_event.set_defaults(handler=_handle_build_event)
 
+    build_heartbeat = subparsers.add_parser(
+        "build-heartbeat",
+        help="Build a signed nostrain worker heartbeat event for relay-based discovery.",
+    )
+    build_heartbeat.add_argument("--run", required=True, help="Training run name.")
+    build_heartbeat.add_argument("--round", type=int, required=True, help="Current outer round number.")
+    build_heartbeat.add_argument(
+        "--worker",
+        help="Worker identity tag. Defaults to the derived/provided pubkey when signing inputs are supplied.",
+    )
+    build_heartbeat.add_argument(
+        "--heartbeat-interval",
+        type=int,
+        default=60,
+        help="Expected heartbeat cadence in seconds (default: 60).",
+    )
+    build_heartbeat.add_argument(
+        "--capability",
+        action="append",
+        help="Advertise a worker capability tag. Can be provided multiple times.",
+    )
+    build_heartbeat.add_argument(
+        "--advertise-relay",
+        action="append",
+        help="Advertise a relay URL hint. Can be provided multiple times.",
+    )
+    build_heartbeat.add_argument(
+        "--sec-key",
+        help="Lowercase hex-encoded 32-byte secret key used to sign the event locally.",
+    )
+    build_heartbeat.add_argument(
+        "--pubkey",
+        help="Lowercase hex-encoded x-only public key for delegated signing workflows.",
+    )
+    build_heartbeat.add_argument(
+        "--sig",
+        help="Lowercase hex-encoded Schnorr signature to attach to a delegated-signing event.",
+    )
+    build_heartbeat.add_argument(
+        "--event-id",
+        help="Optional explicit event id to verify against the canonical serialized event.",
+    )
+    build_heartbeat.add_argument(
+        "--created-at",
+        type=int,
+        help="Optional explicit Unix timestamp for the Nostr event.",
+    )
+    build_heartbeat.add_argument("-o", "--output", help="Optional output path.")
+    build_heartbeat.set_defaults(handler=_handle_build_heartbeat)
+
     publish_event = subparsers.add_parser(
         "publish-event",
-        help="Publish a nostrain event JSON file to a websocket relay.",
+        help="Publish a nostrain gradient or heartbeat event JSON file to a websocket relay.",
     )
     publish_event.add_argument("event", help="Path to a nostrain event JSON file.")
     publish_event.add_argument("--relay", required=True, help="Websocket relay URL.")
@@ -428,6 +600,44 @@ def build_parser() -> argparse.ArgumentParser:
     publish_event.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
     publish_event.add_argument("-o", "--output", help="Optional output path.")
     publish_event.set_defaults(handler=_handle_publish_event)
+
+    discover_workers = subparsers.add_parser(
+        "discover-workers",
+        help="Collect active worker heartbeats for a run and optional target round.",
+    )
+    discover_workers.add_argument("--relay", required=True, help="Websocket relay URL.")
+    discover_workers.add_argument("--run", required=True, help="Training run name.")
+    discover_workers.add_argument(
+        "--round",
+        type=int,
+        help="Only include workers advertising this round or later.",
+    )
+    discover_workers.add_argument(
+        "--since",
+        type=int,
+        help="Optional lower bound for heartbeat timestamps.",
+    )
+    discover_workers.add_argument(
+        "--max-missed-heartbeats",
+        type=int,
+        default=3,
+        help="Discard workers missing more than this many heartbeats (default: 3).",
+    )
+    discover_workers.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=2.0,
+        help="Stop after this many idle seconds without relay messages (default: 2).",
+    )
+    discover_workers.add_argument(
+        "--timeout",
+        type=float,
+        default=10.0,
+        help="Connection timeout in seconds (default: 10).",
+    )
+    discover_workers.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+    discover_workers.add_argument("-o", "--output", help="Optional output path.")
+    discover_workers.set_defaults(handler=_handle_discover_workers)
 
     outer_step = subparsers.add_parser(
         "outer-step",
@@ -483,6 +693,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional lower bound for event timestamps.",
     )
     collect_events.add_argument(
+        "--sync",
+        choices=("timeout", "strict", "quorum", "async"),
+        default="timeout",
+        help="Round stopping strategy (default: timeout).",
+    )
+    collect_events.add_argument(
+        "--discover-workers",
+        action="store_true",
+        help="Collect active heartbeat snapshots before subscribing for gradient events.",
+    )
+    collect_events.add_argument(
+        "--heartbeat-since",
+        type=int,
+        help="Optional lower bound for heartbeat timestamps used during discovery.",
+    )
+    collect_events.add_argument(
+        "--heartbeat-idle-timeout",
+        type=float,
+        help="Optional idle timeout override for heartbeat discovery.",
+    )
+    collect_events.add_argument(
+        "--max-missed-heartbeats",
+        type=int,
+        default=3,
+        help="Discard workers missing more than this many heartbeats (default: 3).",
+    )
+    collect_events.add_argument(
         "--idle-timeout",
         type=float,
         default=2.0,
@@ -516,6 +753,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional lower bound for event timestamps.",
     )
     aggregate_round.add_argument(
+        "--sync",
+        choices=("timeout", "strict", "quorum", "async"),
+        default="timeout",
+        help="Round stopping strategy (default: timeout).",
+    )
+    aggregate_round.add_argument(
+        "--discover-workers",
+        action="store_true",
+        help="Collect active heartbeat snapshots before subscribing for gradient events.",
+    )
+    aggregate_round.add_argument(
+        "--heartbeat-since",
+        type=int,
+        help="Optional lower bound for heartbeat timestamps used during discovery.",
+    )
+    aggregate_round.add_argument(
+        "--heartbeat-idle-timeout",
+        type=float,
+        help="Optional idle timeout override for heartbeat discovery.",
+    )
+    aggregate_round.add_argument(
+        "--max-missed-heartbeats",
+        type=int,
+        default=3,
+        help="Discard workers missing more than this many heartbeats (default: 3).",
+    )
+    aggregate_round.add_argument(
         "--idle-timeout",
         type=float,
         default=2.0,
@@ -536,7 +800,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     inspect_event = subparsers.add_parser(
         "inspect-event",
-        help="Validate a nostrain event JSON file and print a summary.",
+        help="Validate a nostrain gradient or heartbeat event JSON file and print a summary.",
     )
     inspect_event.add_argument("event", help="Path to a nostrain event JSON file.")
     inspect_event.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")

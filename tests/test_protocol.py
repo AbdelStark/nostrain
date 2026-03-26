@@ -6,7 +6,14 @@ import unittest
 from nostrain.compression import compress_delta
 from nostrain.crypto import secret_key_to_public_key
 from nostrain.model import ModelState, compute_delta, state_digest
-from nostrain.protocol import GradientEventMetadata, build_gradient_event, parse_gradient_event
+from nostrain.protocol import (
+    GradientEventMetadata,
+    HeartbeatEventMetadata,
+    build_gradient_event,
+    build_heartbeat_event,
+    parse_gradient_event,
+    parse_heartbeat_event,
+)
 
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -45,6 +52,37 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(parsed.event.tag_map()["compression"], payload.compression_label)
         self.assertEqual(parsed.event.event_id, parsed.event.fingerprint())
 
+    def test_signed_heartbeat_roundtrip_preserves_worker_metadata(self) -> None:
+        event = build_heartbeat_event(
+            HeartbeatEventMetadata(
+                run_name="demo-run",
+                worker_id="worker-pubkey",
+                current_round=7,
+                heartbeat_interval=45,
+                capabilities=("gradient-event", "signed-events"),
+                advertised_relays=("ws://127.0.0.1:8765",),
+                created_at=1_700_000_100,
+            ),
+            secret_key_hex=TEST_SECRET_KEY,
+        )
+        parsed = parse_heartbeat_event(event.to_json_obj())
+
+        self.assertTrue(parsed.event.is_signed)
+        self.assertEqual(parsed.event.pubkey, secret_key_to_public_key(TEST_SECRET_KEY))
+        self.assertEqual(parsed.metadata.run_name, "demo-run")
+        self.assertEqual(parsed.metadata.worker_id, "worker-pubkey")
+        self.assertEqual(parsed.metadata.current_round, 7)
+        self.assertEqual(parsed.metadata.heartbeat_interval, 45)
+        self.assertEqual(
+            parsed.metadata.capabilities,
+            ("gradient-event", "signed-events"),
+        )
+        self.assertEqual(
+            parsed.metadata.advertised_relays,
+            ("ws://127.0.0.1:8765",),
+        )
+        self.assertEqual(parsed.event.event_id, parsed.event.fingerprint())
+
     def test_parse_rejects_tampered_signed_event_content(self) -> None:
         initial = ModelState.from_path(FIXTURES / "initial_state.json")
         current = ModelState.from_path(FIXTURES / "current_state.json")
@@ -65,6 +103,21 @@ class ProtocolTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             parse_gradient_event(event)
+
+    def test_parse_rejects_heartbeat_with_non_empty_content(self) -> None:
+        event = build_heartbeat_event(
+            HeartbeatEventMetadata(
+                run_name="demo-run",
+                worker_id="worker-pubkey",
+                current_round=7,
+                created_at=1_700_000_100,
+            ),
+            secret_key_hex=TEST_SECRET_KEY,
+        ).to_json_obj()
+        event["content"] = "{}"
+
+        with self.assertRaises(ValueError):
+            parse_heartbeat_event(event)
 
 
 if __name__ == "__main__":

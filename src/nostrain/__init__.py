@@ -23,28 +23,42 @@ from .model import (
 )
 from .protocol import (
     GradientEventMetadata,
+    HeartbeatEventMetadata,
     NostrainEvent,
     ParsedGradientEvent,
+    ParsedHeartbeatEvent,
     build_gradient_event,
+    build_heartbeat_event,
+    parse_heartbeat_event,
     parse_gradient_event,
+    parse_nostrain_event,
 )
 from .relay import (
     CollectedGradientEvent,
+    CollectedHeartbeatEvent,
+    HeartbeatCollectionResult,
     RelayCollectionResult,
     RelayPublishResult,
+    collect_heartbeat_events,
     collect_gradient_events,
+    publish_heartbeat_event,
     publish_gradient_event,
+    publish_nostrain_event,
 )
 
 __all__ = [
     "CompressedGradientPayload",
     "CompressionCodec",
     "CollectedGradientEvent",
+    "CollectedHeartbeatEvent",
     "GradientEventMetadata",
+    "HeartbeatCollectionResult",
+    "HeartbeatEventMetadata",
     "ModelState",
     "NostrainEvent",
     "OuterStepResult",
     "ParsedGradientEvent",
+    "ParsedHeartbeatEvent",
     "RelayCollectionResult",
     "RelayPublishResult",
     "TensorLayout",
@@ -53,14 +67,20 @@ __all__ = [
     "aggregate_deltas",
     "apply_delta",
     "build_gradient_event",
+    "build_heartbeat_event",
     "compress_delta",
+    "collect_heartbeat_events",
     "collect_gradient_events",
     "compute_delta",
     "decompress_payload",
     "inspect_payload",
     "nesterov_outer_step",
+    "parse_heartbeat_event",
     "parse_gradient_event",
+    "parse_nostrain_event",
+    "publish_heartbeat_event",
     "publish_gradient_event",
+    "publish_nostrain_event",
     "scale_state",
     "schnorr_sign",
     "schnorr_verify",
@@ -70,4 +90,4 @@ __all__ = [
     "zeros_like",
 ]
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"

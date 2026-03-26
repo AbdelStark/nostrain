@@ -31,7 +31,7 @@ The payload also stores a tensor layout manifest so sparse values can be reconst
 
 Discovery: workers publish a "heartbeat" event (kind `33334`) every 60 seconds with worker metadata (pubkey, capabilities, current round). Other workers subscribe to heartbeats to know who is active. Round sync: configurable strategy. "strict" means wait for all known workers. "quorum" means wait for >50% of known workers. "async" means don't wait. "timeout" means wait up to `T` seconds, then proceed with whatever arrived. Default target remains timeout with `T=120s`.
 
-Implementation status: planned.
+Implementation status: heartbeat events, active-worker discovery, stale-worker filtering, and `strict`/`quorum`/`async`/`timeout` round collection are implemented.
 
 # RFC-005: Fault Tolerance
 
@@ -50,8 +50,10 @@ Implemented commands:
 - `apply-payload`
 - `outer-step`
 - `build-event`
+- `build-heartbeat`
 - `inspect-event`
 - `publish-event`
+- `discover-workers`
 - `collect-events`
 - `aggregate-round`
 

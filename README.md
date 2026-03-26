@@ -2,11 +2,11 @@
 
 Distributed ML training over Nostr relays.
 
-The project vision is still the same: no coordinator, no central server, just workers exchanging sparse pseudo-gradients through Nostr. The repository now ships the protocol/payload toolkit plus a signed relay transport slice: model snapshots, DiLoCo-style deltas, sparse transport payloads, NIP-01-compatible nostrain event envelopes, and relay collection for one round.
+The project vision is still the same: no coordinator, no central server, just workers exchanging sparse pseudo-gradients through Nostr. The repository now ships the protocol/payload toolkit plus a signed relay transport slice: model snapshots, DiLoCo-style deltas, sparse transport payloads, NIP-01-compatible nostrain gradient and heartbeat events, and relay collection with active-worker discovery for one round.
 
 ## Current status
 
-`nostrain` v0.3.0 is a protocol and relay toolchain. It implements:
+`nostrain` v0.4.0 is a protocol and relay toolchain. It implements:
 
 - canonical model-state JSON loading and hashing
 - pseudo-gradient computation (`current - initial`)
@@ -15,11 +15,14 @@ The project vision is still the same: no coordinator, no central server, just wo
 - momentum-backed local outer updates
 - deterministic NIP-01 event IDs plus BIP340 Schnorr signing/verification
 - nostrain gradient event construction and validation
+- signed worker heartbeat event construction and validation
 - websocket relay publish/subscribe for gradient events
+- active worker discovery with stale-heartbeat filtering
 - replay-safe event collection and round aggregation over a relay
+- round sync strategies (`timeout`, `strict`, `quorum`, `async`) driven by discovered workers
 - a CLI for encoding, decoding, applying, publishing, collecting, and inspecting payloads
 
-It does **not** yet implement worker discovery, multi-relay redundancy, or training-script orchestration. The signed transport path now targets public NIP-01 relays as well as local/mock websocket endpoints.
+It does **not** yet implement multi-relay redundancy or training-script orchestration. The signed transport path now targets public NIP-01 relays as well as local/mock websocket endpoints.
 
 ## Install
 
@@ -108,6 +111,19 @@ nostrain build-event payload.json \
   -o event.json
 ```
 
+Build a signed heartbeat for worker discovery:
+
+```bash
+nostrain build-heartbeat \
+  --run demo-run \
+  --round 7 \
+  --worker worker-pubkey \
+  --capability gradient-event \
+  --advertise-relay ws://127.0.0.1:8765 \
+  --sec-key 0000000000000000000000000000000000000000000000000000000000000003 \
+  -o heartbeat.json
+```
+
 Derive an x-only Nostr pubkey from a worker secret key:
 
 ```bash
@@ -127,6 +143,8 @@ nostrain collect-events \
   --relay ws://127.0.0.1:8765 \
   --run demo-run \
   --round 7 \
+  --discover-workers \
+  --sync quorum \
   --limit 2 \
   --json
 ```
@@ -138,8 +156,20 @@ nostrain aggregate-round \
   --relay ws://127.0.0.1:8765 \
   --run demo-run \
   --round 7 \
+  --discover-workers \
+  --sync strict \
   --limit 2 \
   -o aggregated.json
+```
+
+List active workers advertising a given run/round:
+
+```bash
+nostrain discover-workers \
+  --relay ws://127.0.0.1:8765 \
+  --run demo-run \
+  --round 7 \
+  --json
 ```
 
 Inspect and validate an event:
@@ -176,6 +206,19 @@ The event content is a base64 wire payload containing:
 
 Relay collection currently subscribes on `kind=33333` and `#t=["nostrain"]`, then narrows `run` and `round` client-side. This avoids relying on non-standard multi-character tag indexing at the relay layer while remaining compatible with NIP-01 relay indexing rules.
 
+Heartbeat discovery events target Nostr kind `33334`. They use:
+
+- `d`: `run:<run-name>:worker:<worker-id>`
+- `t`: `nostrain`
+- `run`
+- `worker`
+- `round`
+- `heartbeat`
+- repeated `capability` tags
+- repeated `relay` tags
+
+Heartbeat content is intentionally empty; worker capabilities and relay hints live in the tag set so relays and clients can index them directly. Discovery keeps only the newest heartbeat per worker and drops workers that have missed more than three advertised heartbeat intervals.
+
 ## Roadmap
 
 - [x] Canonical model-state format and hashing
@@ -188,7 +231,7 @@ Relay collection currently subscribes on `kind=33333` and `#t=["nostrain"]`, the
 - [x] Relay publish/subscribe transport
 - [x] Replay-safe relay round collection and aggregation
 - [x] Event signing for public relays
-- [ ] Worker discovery and heartbeat events
+- [x] Worker discovery and heartbeat events
 - [ ] Training-script integration with DiLoCo inner/outer loops
 - [ ] Multi-relay redundancy
 - [ ] Live monitoring dashboard

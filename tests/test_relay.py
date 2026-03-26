@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from typing import Any
 import unittest
 
@@ -17,11 +18,14 @@ from nostrain.compression import compress_delta
 from nostrain.model import ModelState, compute_delta, state_digest
 from nostrain.protocol import (
     GradientEventMetadata,
+    HeartbeatEventMetadata,
     NostrainEvent,
     build_gradient_event,
+    build_heartbeat_event,
+    parse_nostrain_event,
     parse_gradient_event,
 )
-from nostrain.relay import collect_gradient_events
+from nostrain.relay import collect_gradient_events, collect_heartbeat_events
 from tests.helpers import assert_state_json_almost_equal
 
 
@@ -60,6 +64,31 @@ def _build_event(
             created_at=created_at,
         ),
         payload,
+        secret_key_hex=WORKER_SECRET_KEYS[worker_id],
+    )
+    return event.to_json_obj()
+
+
+def _build_heartbeat(
+    *,
+    worker_id: str,
+    created_at: int,
+    current_round: int = 7,
+    run_name: str = "demo-run",
+    heartbeat_interval: int = 60,
+    capabilities: tuple[str, ...] = ("gradient-event",),
+    advertised_relays: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    event = build_heartbeat_event(
+        HeartbeatEventMetadata(
+            run_name=run_name,
+            worker_id=worker_id,
+            current_round=current_round,
+            heartbeat_interval=heartbeat_interval,
+            capabilities=capabilities,
+            advertised_relays=advertised_relays,
+            created_at=created_at,
+        ),
         secret_key_hex=WORKER_SECRET_KEYS[worker_id],
     )
     return event.to_json_obj()
@@ -131,7 +160,7 @@ class MockRelay:
         parsed_event_json: dict[str, Any] | None = None
         event_id = ""
         try:
-            parsed = parse_gradient_event(frame[1])
+            parsed = parse_nostrain_event(frame[1])
             if not parsed.event.is_signed:
                 raise ValueError("relay requires fully signed NIP-01 events")
             event_id = parsed.event.fingerprint()
@@ -278,6 +307,85 @@ class RelayTransportTests(unittest.TestCase):
         self.assertEqual(collection.events[0].parsed.event.created_at, 1_700_000_010)
         self.assertEqual(collection.worker_ids, ("worker-a",))
         self.assertTrue(collection.events[0].parsed.event.is_signed)
+
+    def test_collect_heartbeat_events_discards_stale_workers_and_replays(self) -> None:
+        older = _build_heartbeat(
+            worker_id="worker-a",
+            created_at=1_700_000_200,
+            advertised_relays=("ws://127.0.0.1:8765",),
+        )
+        newer = _build_heartbeat(
+            worker_id="worker-a",
+            created_at=1_700_000_250,
+            advertised_relays=("ws://127.0.0.1:9999",),
+        )
+        active_peer = _build_heartbeat(
+            worker_id="worker-b",
+            created_at=1_700_000_240,
+        )
+        stale = _build_heartbeat(
+            worker_id="worker-c",
+            created_at=1_700_000_000,
+        )
+        invalid = _build_heartbeat(
+            worker_id="worker-c",
+            created_at=1_700_000_260,
+        )
+        invalid["sig"] = "00" * 64
+
+        with MockRelay([older, stale, invalid, newer, active_peer]) as relay:
+            collection = asyncio.run(
+                collect_heartbeat_events(
+                    relay.url,
+                    run_name="demo-run",
+                    target_round=7,
+                    idle_timeout=0.2,
+                    reference_time=1_700_000_300,
+                )
+            )
+
+        self.assertEqual(collection.worker_ids, ("worker-a", "worker-b"))
+        self.assertEqual(collection.duplicates_discarded, 1)
+        self.assertEqual(collection.invalid_events, 1)
+        self.assertEqual(collection.stale_events, 1)
+        self.assertEqual(
+            collection.events[0].parsed.metadata.advertised_relays,
+            ("ws://127.0.0.1:9999",),
+        )
+
+    def test_collect_events_can_stop_after_quorum_of_discovered_workers(self) -> None:
+        heartbeat_a = _build_heartbeat(worker_id="worker-a", created_at=1_700_000_000)
+        heartbeat_b = _build_heartbeat(worker_id="worker-b", created_at=1_700_000_001)
+        heartbeat_c = _build_heartbeat(worker_id="worker-c", created_at=1_700_000_002)
+        event_a = _build_event(
+            worker_id="worker-a",
+            current_fixture="current_state.json",
+            created_at=1_700_000_010,
+        )
+        event_b = _build_event(
+            worker_id="worker-b",
+            current_fixture="current_state_peer.json",
+            created_at=1_700_000_011,
+        )
+
+        with MockRelay([heartbeat_a, heartbeat_b, heartbeat_c, event_a, event_b]) as relay:
+            collection = asyncio.run(
+                collect_gradient_events(
+                    relay.url,
+                    run_name="demo-run",
+                    round_index=7,
+                    idle_timeout=5.0,
+                    strategy="quorum",
+                    discover_workers=True,
+                    reference_time=1_700_000_020,
+                )
+            )
+
+        self.assertEqual(len(collection.events), 2)
+        self.assertEqual(collection.worker_ids, ("worker-a", "worker-b"))
+        self.assertEqual(collection.known_workers, ("worker-a", "worker-b", "worker-c"))
+        self.assertEqual(collection.sync_strategy, "quorum")
+        self.assertEqual(collection.completion_reason, "quorum")
 
     def test_cli_publish_collect_and_aggregate_roundtrip(self) -> None:
         expected_average = {
@@ -457,6 +565,96 @@ class RelayTransportTests(unittest.TestCase):
             aggregation_summary_json = json.loads(aggregation_summary.read_text(encoding="utf-8"))
             self.assertEqual(aggregation_summary_json["event_count"], 2)
             self.assertEqual(sorted(aggregation_summary_json["workers"]), ["worker-a", "worker-b"])
+            self.assertEqual(aggregation_summary_json["completion_reason"], "limit")
+            self.assertEqual(aggregation_summary_json["sync_strategy"], "timeout")
+
+    def test_cli_build_publish_and_discover_heartbeats(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory, MockRelay() as relay:
+            tempdir = Path(temporary_directory)
+            heartbeat_a = tempdir / "heartbeat-a.json"
+            heartbeat_b = tempdir / "heartbeat-b.json"
+            publish_a = tempdir / "publish-a.json"
+            discovered = tempdir / "workers.json"
+            current_timestamp = str(int(time.time()))
+            current_timestamp_peer = str(int(time.time()) + 1)
+
+            self._run(
+                "build-heartbeat",
+                "--run",
+                "demo-run",
+                "--round",
+                "7",
+                "--worker",
+                "worker-a",
+                "--capability",
+                "gradient-event",
+                "--advertise-relay",
+                relay.url,
+                "--created-at",
+                current_timestamp,
+                "--sec-key",
+                WORKER_SECRET_KEYS["worker-a"],
+                "-o",
+                str(heartbeat_a),
+            )
+            self._run(
+                "build-heartbeat",
+                "--run",
+                "demo-run",
+                "--round",
+                "7",
+                "--worker",
+                "worker-b",
+                "--capability",
+                "gradient-event",
+                "--created-at",
+                current_timestamp_peer,
+                "--sec-key",
+                WORKER_SECRET_KEYS["worker-b"],
+                "-o",
+                str(heartbeat_b),
+            )
+
+            self._run(
+                "publish-event",
+                str(heartbeat_a),
+                "--relay",
+                relay.url,
+                "--json",
+                "-o",
+                str(publish_a),
+            )
+            self._run(
+                "publish-event",
+                str(heartbeat_b),
+                "--relay",
+                relay.url,
+                "--json",
+            )
+
+            self._run(
+                "discover-workers",
+                "--relay",
+                relay.url,
+                "--run",
+                "demo-run",
+                "--round",
+                "7",
+                "--json",
+                "-o",
+                str(discovered),
+            )
+            discovered_json = json.loads(discovered.read_text(encoding="utf-8"))
+            publish_json = json.loads(publish_a.read_text(encoding="utf-8"))
+
+            self.assertTrue(publish_json["accepted"])
+            self.assertEqual(discovered_json["event_count"], 2)
+            self.assertEqual(sorted(discovered_json["workers"]), ["worker-a", "worker-b"])
+            self.assertEqual(discovered_json["stale_events"], 0)
+            self.assertEqual(
+                discovered_json["events"][0]["capabilities"],
+                ["gradient-event"],
+            )
 
     def test_cli_publish_rejects_unsigned_event_on_signed_relay(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory, MockRelay() as relay:

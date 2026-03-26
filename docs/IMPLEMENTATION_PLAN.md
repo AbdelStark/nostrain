@@ -48,6 +48,18 @@ Delivered in the current repository state:
 
 This moves the project from a permissive/unsigned relay prototype to a public-relay-compatible signed transport.
 
+## Completed milestone: worker heartbeat discovery + round sync
+
+Delivered in the current repository state:
+
+- signed worker heartbeat events (kind `33334`) with capability and relay-hint tags
+- relay heartbeat discovery with replay deduplication and stale-worker filtering
+- round collection strategies driven by discovered workers: `timeout`, `strict`, `quorum`, `async`
+- CLI support for `build-heartbeat`, `discover-workers`, and strategy-aware `collect-events` / `aggregate-round`
+- tests covering heartbeat parsing, discovery, and quorum-based collection
+
+This moves the project from blind relay collection to relay-aware coordination with an explicit picture of which workers are currently alive for a round.
+
 ## Next milestone: training runner
 
 Goal: connect the protocol layer to an actual DiLoCo inner/outer training loop.
@@ -64,6 +76,5 @@ Deliverables:
 
 - rich terminal UX
 - multi-relay redundancy
-- heartbeat discovery events
 - checkpoint publishing
 - visualization/dashboard

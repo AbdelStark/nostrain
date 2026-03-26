@@ -1,8 +1,8 @@
-# nostrain: Specification v0.3.0
+# nostrain: Specification v0.4.0
 
 ## Overview
 
-nostrain is a protocol for distributed ML training over Nostr relays. The implemented repository milestone now covers the payload layer plus a signed transport slice: deterministic model snapshots, pseudo-gradient generation, sparse quantized wire encoding, NIP-01-compatible event envelopes for those updates, and websocket collection/aggregation for one round.
+nostrain is a protocol for distributed ML training over Nostr relays. The implemented repository milestone now covers the payload layer plus a signed transport slice: deterministic model snapshots, pseudo-gradient generation, sparse quantized wire encoding, NIP-01-compatible gradient and heartbeat event envelopes, and websocket discovery/collection for one round.
 
 Live training orchestration remains out of scope for this version.
 
@@ -22,6 +22,9 @@ Live training orchestration remains out of scope for this version.
 12. Publish signed gradient events to a relay-compatible websocket endpoint
 13. Subscribe to one run/round, reject malformed events, and deduplicate replayed worker updates
 14. Aggregate collected relay events directly into a model delta
+15. Build and validate signed worker heartbeat discovery events (kind `33334`)
+16. Discover active workers from relay heartbeats while discarding stale workers
+17. Stop round collection via `timeout`, `strict`, `quorum`, or `async` strategies using discovered workers
 
 ## Model state schema
 
@@ -82,6 +85,42 @@ Transport note:
 - transport is validated against local/mock relay endpoints and public-relay-compatible signed publication flows
 - collection subscribes using `kinds=[33333]` and `#t=["nostrain"]`, then narrows `run` and `round` client-side because relay-side tag indexing is only standardized for single-letter tags in NIP-01
 
+## Heartbeat event schema
+
+Kind: `33334`
+
+Top-level NIP-01 fields:
+
+- `id`
+- `pubkey`
+- `created_at`
+- `kind`
+- `tags`
+- `content`
+- `sig`
+
+Tags:
+
+- `d`: `run:<run-name>:worker:<worker-id>`
+- `t`: `nostrain`
+- `run`
+- `worker`
+- `round`
+- `heartbeat`
+- repeated `capability`
+- repeated `relay`
+
+Content:
+
+- empty string
+
+Transport note:
+
+- heartbeats are signed with the same canonical NIP-01 serialization rules as gradient events
+- discovery keeps only the newest heartbeat per worker
+- workers are considered stale after missing more than three advertised heartbeat intervals
+- round collection can optionally snapshot current workers first, then stop when a `strict` or `quorum` target is satisfied
+
 ## Payload wire format
 
 ### Container
@@ -122,9 +161,11 @@ nostrain aggregate-payloads <payload-a.json> <payload-b.json> [...]
 nostrain apply-payload <base.json> <payload.json>
 nostrain outer-step <base.json> <aggregated.json> [--learning-rate 0.7] [--momentum 0.9]
 nostrain build-event <payload.json> --run <name> --round <n> --worker <id> --model <sha256> [--sec-key <hex> | --pubkey <hex> [--sig <hex>]]
+nostrain build-heartbeat --run <name> --round <n> --worker <id> [--capability gradient-event] [--advertise-relay ws://...]
 nostrain publish-event <event.json> --relay <ws://...>
-nostrain collect-events --relay <ws://...> --run <name> --round <n>
-nostrain aggregate-round --relay <ws://...> --run <name> --round <n>
+nostrain discover-workers --relay <ws://...> --run <name> [--round <n>]
+nostrain collect-events --relay <ws://...> --run <name> --round <n> [--sync timeout|strict|quorum|async] [--discover-workers]
+nostrain aggregate-round --relay <ws://...> --run <name> --round <n> [--sync timeout|strict|quorum|async] [--discover-workers]
 nostrain inspect-event <event.json> [--json]
 ```
 
@@ -141,9 +182,8 @@ Given worker deltas `d_1 ... d_n`:
 
 This treats the aggregated pseudo-gradient as an update direction inferred from local training drift rather than as a raw loss gradient.
 
-## Deferred from v0.3.0
+## Deferred from v0.4.0
 
-- worker discovery heartbeats
 - multi-relay deduplication
 - DiLoCo training loop integration with PyTorch or MLX
 - live dashboarding

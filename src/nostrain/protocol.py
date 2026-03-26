@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
 import hashlib
 import json
@@ -17,6 +18,7 @@ from .crypto import (
 )
 
 NOSTRAIN_GRADIENT_KIND = 33333
+NOSTRAIN_HEARTBEAT_KIND = 33334
 NOSTRAIN_MARKER = "nostrain"
 
 
@@ -46,6 +48,45 @@ class GradientEventMetadata:
         return (
             f"run:{self.run_name}:worker:{self.worker_id}:round:{self.round_index}"
         )
+
+    @property
+    def resolved_created_at(self) -> int:
+        return self.created_at if self.created_at is not None else int(time.time())
+
+
+@dataclass(frozen=True)
+class HeartbeatEventMetadata:
+    run_name: str
+    worker_id: str
+    current_round: int
+    heartbeat_interval: int = 60
+    capabilities: tuple[str, ...] = ()
+    advertised_relays: tuple[str, ...] = ()
+    created_at: int | None = None
+
+    def __post_init__(self) -> None:
+        if not self.run_name:
+            raise ValueError("run name cannot be empty")
+        if not self.worker_id:
+            raise ValueError("worker id cannot be empty")
+        if self.current_round < 0:
+            raise ValueError("current round must be non-negative")
+        if self.heartbeat_interval <= 0:
+            raise ValueError("heartbeat interval must be positive")
+        object.__setattr__(
+            self,
+            "capabilities",
+            _normalize_repeated_tag_values(self.capabilities, label="capability"),
+        )
+        object.__setattr__(
+            self,
+            "advertised_relays",
+            _normalize_repeated_tag_values(self.advertised_relays, label="relay"),
+        )
+
+    @property
+    def parameterized_identifier(self) -> str:
+        return f"run:{self.run_name}:worker:{self.worker_id}"
 
     @property
     def resolved_created_at(self) -> int:
@@ -87,6 +128,9 @@ class NostrainEvent:
             if len(tag) >= 2:
                 mapping[tag[0]] = tag[1]
         return mapping
+
+    def tag_values(self, name: str) -> tuple[str, ...]:
+        return tuple(tag[1] for tag in self.tags if len(tag) >= 2 and tag[0] == name)
 
     def serialize_for_event_id(self) -> str:
         if self.pubkey is None:
@@ -192,10 +236,36 @@ class ParsedGradientEvent:
     payload: CompressedGradientPayload
 
 
-def build_gradient_event(
-    metadata: GradientEventMetadata,
-    payload: str | CompressedGradientPayload,
+@dataclass(frozen=True)
+class ParsedHeartbeatEvent:
+    event: NostrainEvent
+    metadata: HeartbeatEventMetadata
+
+
+def _normalize_repeated_tag_values(
+    values: Iterable[str],
     *,
+    label: str,
+) -> tuple[str, ...]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_value in values:
+        value = str(raw_value).strip()
+        if not value:
+            raise ValueError(f"{label} values cannot be empty")
+        if value in seen:
+            continue
+        seen.add(value)
+        normalized.append(value)
+    return tuple(normalized)
+
+
+def _build_signable_event(
+    *,
+    kind: int,
+    created_at: int,
+    tags: tuple[NostrTag, ...],
+    content: str,
     secret_key_hex: str | None = None,
     public_key_hex: str | None = None,
     signature_hex: str | None = None,
@@ -211,20 +281,6 @@ def build_gradient_event(
     if event_id is not None and public_key_hex is None:
         raise ValueError("an explicit event id requires an explicit public key")
 
-    payload_metadata = payload if isinstance(payload, CompressedGradientPayload) else inspect_payload(payload)
-    tags: tuple[NostrTag, ...] = (
-        ("d", metadata.parameterized_identifier),
-        ("t", NOSTRAIN_MARKER),
-        ("run", metadata.run_name),
-        ("round", str(metadata.round_index)),
-        ("worker", metadata.worker_id),
-        ("model", metadata.model_hash),
-        ("steps", str(metadata.inner_steps)),
-        ("compression", payload_metadata.compression_label),
-        ("params", str(payload_metadata.parameter_count)),
-        ("values", str(payload_metadata.total_values)),
-        ("selected", str(payload_metadata.selected_values)),
-    )
     resolved_pubkey = (
         secret_key_to_public_key(secret_key_hex)
         if secret_key_hex is not None
@@ -235,13 +291,12 @@ def build_gradient_event(
         )
     )
     event = NostrainEvent(
-        kind=NOSTRAIN_GRADIENT_KIND,
-        created_at=metadata.resolved_created_at,
+        kind=kind,
+        created_at=created_at,
         tags=tags,
-        content=payload_metadata.payload,
+        content=content,
         pubkey=resolved_pubkey,
     )
-
     if resolved_pubkey is None:
         return event
 
@@ -262,6 +317,75 @@ def build_gradient_event(
         return signed_event
 
     return event
+
+
+def build_gradient_event(
+    metadata: GradientEventMetadata,
+    payload: str | CompressedGradientPayload,
+    *,
+    secret_key_hex: str | None = None,
+    public_key_hex: str | None = None,
+    signature_hex: str | None = None,
+    event_id: str | None = None,
+    aux_rand: bytes | None = None,
+) -> NostrainEvent:
+    payload_metadata = payload if isinstance(payload, CompressedGradientPayload) else inspect_payload(payload)
+    tags: tuple[NostrTag, ...] = (
+        ("d", metadata.parameterized_identifier),
+        ("t", NOSTRAIN_MARKER),
+        ("run", metadata.run_name),
+        ("round", str(metadata.round_index)),
+        ("worker", metadata.worker_id),
+        ("model", metadata.model_hash),
+        ("steps", str(metadata.inner_steps)),
+        ("compression", payload_metadata.compression_label),
+        ("params", str(payload_metadata.parameter_count)),
+        ("values", str(payload_metadata.total_values)),
+        ("selected", str(payload_metadata.selected_values)),
+    )
+    return _build_signable_event(
+        kind=NOSTRAIN_GRADIENT_KIND,
+        created_at=metadata.resolved_created_at,
+        tags=tags,
+        content=payload_metadata.payload,
+        secret_key_hex=secret_key_hex,
+        public_key_hex=public_key_hex,
+        signature_hex=signature_hex,
+        event_id=event_id,
+        aux_rand=aux_rand,
+    )
+
+
+def build_heartbeat_event(
+    metadata: HeartbeatEventMetadata,
+    *,
+    secret_key_hex: str | None = None,
+    public_key_hex: str | None = None,
+    signature_hex: str | None = None,
+    event_id: str | None = None,
+    aux_rand: bytes | None = None,
+) -> NostrainEvent:
+    tags: list[NostrTag] = [
+        ("d", metadata.parameterized_identifier),
+        ("t", NOSTRAIN_MARKER),
+        ("run", metadata.run_name),
+        ("worker", metadata.worker_id),
+        ("round", str(metadata.current_round)),
+        ("heartbeat", str(metadata.heartbeat_interval)),
+    ]
+    tags.extend(("capability", capability) for capability in metadata.capabilities)
+    tags.extend(("relay", relay_url) for relay_url in metadata.advertised_relays)
+    return _build_signable_event(
+        kind=NOSTRAIN_HEARTBEAT_KIND,
+        created_at=metadata.resolved_created_at,
+        tags=tuple(tags),
+        content="",
+        secret_key_hex=secret_key_hex,
+        public_key_hex=public_key_hex,
+        signature_hex=signature_hex,
+        event_id=event_id,
+        aux_rand=aux_rand,
+    )
 
 
 def parse_gradient_event(data: NostrainEvent | dict[str, Any]) -> ParsedGradientEvent:
@@ -315,6 +439,54 @@ def parse_gradient_event(data: NostrainEvent | dict[str, Any]) -> ParsedGradient
         raise ValueError("event d tag does not match the run/worker/round identity")
 
     return ParsedGradientEvent(event=event, metadata=metadata, payload=payload)
+
+
+def parse_heartbeat_event(data: NostrainEvent | dict[str, Any]) -> ParsedHeartbeatEvent:
+    event = data if isinstance(data, NostrainEvent) else NostrainEvent.from_json_obj(data)
+    if event.kind != NOSTRAIN_HEARTBEAT_KIND:
+        raise ValueError(
+            f"nostrain heartbeat events must use kind {NOSTRAIN_HEARTBEAT_KIND}, got {event.kind}"
+        )
+
+    _validate_signing_fields(event)
+
+    tags = event.tag_map()
+    required = ["d", "t", "run", "worker", "round", "heartbeat"]
+    missing = [tag for tag in required if tag not in tags]
+    if missing:
+        raise ValueError(f"event is missing required tags: {', '.join(missing)}")
+    if tags["t"] != NOSTRAIN_MARKER:
+        raise ValueError(f"event marker tag must be {NOSTRAIN_MARKER!r}")
+    if event.content != "":
+        raise ValueError("heartbeat events must use an empty content field")
+
+    metadata = HeartbeatEventMetadata(
+        run_name=tags["run"],
+        worker_id=tags["worker"],
+        current_round=int(tags["round"]),
+        heartbeat_interval=int(tags["heartbeat"]),
+        capabilities=event.tag_values("capability"),
+        advertised_relays=event.tag_values("relay"),
+        created_at=event.created_at,
+    )
+    if tags["d"] != metadata.parameterized_identifier:
+        raise ValueError("event d tag does not match the run/worker identity")
+
+    return ParsedHeartbeatEvent(event=event, metadata=metadata)
+
+
+def parse_nostrain_event(
+    data: NostrainEvent | dict[str, Any],
+) -> ParsedGradientEvent | ParsedHeartbeatEvent:
+    event = data if isinstance(data, NostrainEvent) else NostrainEvent.from_json_obj(data)
+    if event.kind == NOSTRAIN_GRADIENT_KIND:
+        return parse_gradient_event(event)
+    if event.kind == NOSTRAIN_HEARTBEAT_KIND:
+        return parse_heartbeat_event(event)
+    raise ValueError(
+        "unsupported nostrain event kind: "
+        f"expected {NOSTRAIN_GRADIENT_KIND} or {NOSTRAIN_HEARTBEAT_KIND}, got {event.kind}"
+    )
 
 
 def _validate_signing_fields(event: NostrainEvent) -> None:
