@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
 import time
 from typing import Any
 
@@ -54,6 +56,17 @@ class NostrainEvent:
         for tag_name, value in self.tags:
             mapping[tag_name] = value
         return mapping
+
+    def fingerprint(self) -> str:
+        digest = hashlib.sha256()
+        digest.update(
+            json.dumps(
+                [self.kind, self.created_at, list(self.tags), self.content],
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        )
+        return digest.hexdigest()
 
     def to_json_obj(self) -> dict[str, Any]:
         return {

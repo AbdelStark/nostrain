@@ -13,7 +13,7 @@ Kind `33333` (parameterized replaceable). Workers publish one event per outer ro
 - `run`, `round`, `worker`, `model`, `steps`
 - `compression`, `params`, `values`, `selected`
 
-Event content is a base64-encoded compressed pseudo-gradient payload. Workers will eventually subscribe with filter `kinds=[33333], #t=["nostrain"], #run=[run_name], #round=[current_round]`.
+Event content is a base64-encoded compressed pseudo-gradient payload. The current transport subscribes with relay filter `kinds=[33333], #t=["nostrain"]` and narrows `run` and `round` client-side, since NIP-01 standardizes relay indexing only for single-letter tags. Event signing is still pending, so public relays may reject these envelopes.
 
 # RFC-003: Compression Pipeline
 
@@ -51,6 +51,9 @@ Implemented commands:
 - `outer-step`
 - `build-event`
 - `inspect-event`
+- `publish-event`
+- `collect-events`
+- `aggregate-round`
 
 Deferred commands:
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,7 @@ from .aggregation import aggregate_deltas, nesterov_outer_step
 from .compression import CompressionCodec, compress_delta, decompress_payload, inspect_payload
 from .model import ModelState, apply_delta, compute_delta, state_digest
 from .protocol import GradientEventMetadata, build_gradient_event, parse_gradient_event
+from .relay import collect_gradient_events, publish_gradient_event
 
 
 def _load_json(path: str | Path) -> Any:
@@ -91,6 +93,28 @@ def _handle_build_event(args: argparse.Namespace) -> int:
     return 0
 
 
+def _handle_publish_event(args: argparse.Namespace) -> int:
+    event = _load_json(args.event)
+    result = asyncio.run(
+        publish_gradient_event(
+            args.relay,
+            event,
+            open_timeout=args.timeout,
+            reply_timeout=args.timeout,
+        )
+    )
+    if not result.accepted:
+        raise RuntimeError(f"relay rejected event publication: {result.message}")
+    if args.json:
+        _write_json(args.output, result.to_json_obj())
+    else:
+        _write_text(
+            args.output,
+            f"published {result.event_id} to {result.relay_url}",
+        )
+    return 0
+
+
 def _load_delta_input(path: str | Path) -> ModelState:
     raw_text = Path(path).read_text(encoding="utf-8").strip()
     if not raw_text:
@@ -101,6 +125,8 @@ def _load_delta_input(path: str | Path) -> ModelState:
             raise ValueError("delta input JSON must be an object")
         if "parameters" in data:
             return ModelState.from_json_obj(data)
+        if {"kind", "created_at", "tags", "content"} <= data.keys():
+            return decompress_payload(parse_gradient_event(data).payload)
         if "payload" in data:
             return decompress_payload(str(data["payload"]))
     return decompress_payload(raw_text)
@@ -139,6 +165,59 @@ def _handle_outer_step(args: argparse.Namespace) -> int:
                 "aggregated_values": result.aggregated_delta.total_values,
             },
         )
+    return 0
+
+
+def _collection_summary(collection: Any) -> str:
+    workers = ", ".join(collection.worker_ids) if collection.worker_ids else "-"
+    return "\n".join(
+        [
+            f"relay: {collection.relay_url}",
+            f"run: {collection.run_name}",
+            f"round: {collection.round_index}",
+            f"events: {len(collection.events)}",
+            f"workers: {workers}",
+            f"duplicates_discarded: {collection.duplicates_discarded}",
+            f"invalid_events: {collection.invalid_events}",
+        ]
+    )
+
+
+def _handle_collect_events(args: argparse.Namespace) -> int:
+    collection = asyncio.run(
+        collect_gradient_events(
+            args.relay,
+            run_name=args.run,
+            round_index=args.round,
+            max_events=args.limit,
+            idle_timeout=args.idle_timeout,
+            open_timeout=args.timeout,
+            since=args.since,
+        )
+    )
+    if args.json:
+        _write_json(args.output, collection.to_json_obj())
+    else:
+        _write_text(args.output, _collection_summary(collection))
+    return 0
+
+
+def _handle_aggregate_round(args: argparse.Namespace) -> int:
+    collection = asyncio.run(
+        collect_gradient_events(
+            args.relay,
+            run_name=args.run,
+            round_index=args.round,
+            max_events=args.limit,
+            idle_timeout=args.idle_timeout,
+            open_timeout=args.timeout,
+            since=args.since,
+        )
+    )
+    aggregated = collection.aggregate_delta()
+    _write_json(args.output, aggregated.to_json_obj())
+    if args.summary_out:
+        _write_json(args.summary_out, collection.to_json_obj(include_events=False))
     return 0
 
 
@@ -191,7 +270,7 @@ def _handle_inspect_event(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="nostrain",
-        description="Protocol and payload tooling for distributed training over Nostr relays.",
+        description="Protocol, payload, and relay tooling for distributed training over Nostr relays.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -278,6 +357,22 @@ def build_parser() -> argparse.ArgumentParser:
     build_event.add_argument("-o", "--output", help="Optional output path.")
     build_event.set_defaults(handler=_handle_build_event)
 
+    publish_event = subparsers.add_parser(
+        "publish-event",
+        help="Publish a nostrain event JSON file to a websocket relay.",
+    )
+    publish_event.add_argument("event", help="Path to a nostrain event JSON file.")
+    publish_event.add_argument("--relay", required=True, help="Websocket relay URL.")
+    publish_event.add_argument(
+        "--timeout",
+        type=float,
+        default=10.0,
+        help="Connection and relay reply timeout in seconds (default: 10).",
+    )
+    publish_event.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+    publish_event.add_argument("-o", "--output", help="Optional output path.")
+    publish_event.set_defaults(handler=_handle_publish_event)
+
     outer_step = subparsers.add_parser(
         "outer-step",
         help="Apply a local DiLoCo-style outer update using an aggregated delta and optional momentum state.",
@@ -313,6 +408,75 @@ def build_parser() -> argparse.ArgumentParser:
     )
     outer_step.add_argument("-o", "--output", help="Optional output path.")
     outer_step.set_defaults(handler=_handle_outer_step)
+
+    collect_events = subparsers.add_parser(
+        "collect-events",
+        help="Subscribe to relay events for one nostrain run/round, validate them, and deduplicate replays.",
+    )
+    collect_events.add_argument("--relay", required=True, help="Websocket relay URL.")
+    collect_events.add_argument("--run", required=True, help="Training run name.")
+    collect_events.add_argument("--round", type=int, required=True, help="Outer round number.")
+    collect_events.add_argument(
+        "--limit",
+        type=int,
+        help="Stop after collecting this many unique worker events.",
+    )
+    collect_events.add_argument(
+        "--since",
+        type=int,
+        help="Optional lower bound for event timestamps.",
+    )
+    collect_events.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=2.0,
+        help="Stop after this many idle seconds without new relay messages (default: 2).",
+    )
+    collect_events.add_argument(
+        "--timeout",
+        type=float,
+        default=10.0,
+        help="Connection timeout in seconds (default: 10).",
+    )
+    collect_events.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+    collect_events.add_argument("-o", "--output", help="Optional output path.")
+    collect_events.set_defaults(handler=_handle_collect_events)
+
+    aggregate_round = subparsers.add_parser(
+        "aggregate-round",
+        help="Collect one run/round from a relay and aggregate the embedded worker deltas.",
+    )
+    aggregate_round.add_argument("--relay", required=True, help="Websocket relay URL.")
+    aggregate_round.add_argument("--run", required=True, help="Training run name.")
+    aggregate_round.add_argument("--round", type=int, required=True, help="Outer round number.")
+    aggregate_round.add_argument(
+        "--limit",
+        type=int,
+        help="Stop after collecting this many unique worker events.",
+    )
+    aggregate_round.add_argument(
+        "--since",
+        type=int,
+        help="Optional lower bound for event timestamps.",
+    )
+    aggregate_round.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=2.0,
+        help="Stop after this many idle seconds without new relay messages (default: 2).",
+    )
+    aggregate_round.add_argument(
+        "--timeout",
+        type=float,
+        default=10.0,
+        help="Connection timeout in seconds (default: 10).",
+    )
+    aggregate_round.add_argument(
+        "--summary-out",
+        help="Optional path to write collection summary JSON.",
+    )
+    aggregate_round.add_argument("-o", "--output", help="Optional output path.")
+    aggregate_round.set_defaults(handler=_handle_aggregate_round)
 
     inspect_event = subparsers.add_parser(
         "inspect-event",

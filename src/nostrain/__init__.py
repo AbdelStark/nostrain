@@ -27,15 +27,25 @@ from .protocol import (
     build_gradient_event,
     parse_gradient_event,
 )
+from .relay import (
+    CollectedGradientEvent,
+    RelayCollectionResult,
+    RelayPublishResult,
+    collect_gradient_events,
+    publish_gradient_event,
+)
 
 __all__ = [
     "CompressedGradientPayload",
     "CompressionCodec",
+    "CollectedGradientEvent",
     "GradientEventMetadata",
     "ModelState",
     "NostrainEvent",
     "OuterStepResult",
     "ParsedGradientEvent",
+    "RelayCollectionResult",
+    "RelayPublishResult",
     "TensorLayout",
     "TensorState",
     "add_states",
@@ -43,15 +53,17 @@ __all__ = [
     "apply_delta",
     "build_gradient_event",
     "compress_delta",
+    "collect_gradient_events",
     "compute_delta",
     "decompress_payload",
     "inspect_payload",
     "nesterov_outer_step",
     "parse_gradient_event",
+    "publish_gradient_event",
     "scale_state",
     "state_digest",
     "subtract_states",
     "zeros_like",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

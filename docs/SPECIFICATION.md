@@ -1,10 +1,10 @@
-# nostrain: Specification v0.1.0
+# nostrain: Specification v0.2.0
 
 ## Overview
 
-nostrain is a protocol for distributed ML training over Nostr relays. The implemented repository milestone covers the payload layer: deterministic model snapshots, pseudo-gradient generation, sparse quantized wire encoding, and Nostr event envelopes for those updates.
+nostrain is a protocol for distributed ML training over Nostr relays. The implemented repository milestone now covers the payload layer plus a first relay transport slice: deterministic model snapshots, pseudo-gradient generation, sparse quantized wire encoding, event envelopes for those updates, and websocket collection/aggregation for one round.
 
-Relay I/O and live training orchestration are intentionally out of scope for this version.
+Nostr event signing and live training orchestration are intentionally out of scope for this version.
 
 ## Implemented core
 
@@ -18,6 +18,9 @@ Relay I/O and live training orchestration are intentionally out of scope for thi
 8. Average multiple worker deltas into one aggregated update
 9. Apply a local Nesterov-style outer update with persistent momentum state
 10. Build and validate nostrain gradient events (kind `33333`)
+11. Publish unsigned gradient events to a relay-compatible websocket endpoint
+12. Subscribe to one run/round, reject malformed events, and deduplicate replayed worker updates
+13. Aggregate collected relay events directly into a model delta
 
 ## Model state schema
 
@@ -61,6 +64,12 @@ Content:
 
 - base64 nostrain payload container
 
+Transport note:
+
+- current repository events are unsigned nostrain envelopes, not fully signed NIP-01 events
+- transport is validated against local/mock relay endpoints and permissive websocket relays
+- collection subscribes using `kinds=[33333]` and `#t=["nostrain"]`, then narrows `run` and `round` client-side because relay-side tag indexing is only standardized for single-letter tags in NIP-01
+
 ## Payload wire format
 
 ### Container
@@ -100,6 +109,9 @@ nostrain aggregate-payloads <payload-a.json> <payload-b.json> [...]
 nostrain apply-payload <base.json> <payload.json>
 nostrain outer-step <base.json> <aggregated.json> [--learning-rate 0.7] [--momentum 0.9]
 nostrain build-event <payload.json> --run <name> --round <n> --worker <id> --model <sha256>
+nostrain publish-event <event.json> --relay <ws://...>
+nostrain collect-events --relay <ws://...> --run <name> --round <n>
+nostrain aggregate-round --relay <ws://...> --run <name> --round <n>
 nostrain inspect-event <event.json> [--json]
 ```
 
@@ -116,10 +128,9 @@ Given worker deltas `d_1 ... d_n`:
 
 This treats the aggregated pseudo-gradient as an update direction inferred from local training drift rather than as a raw loss gradient.
 
-## Deferred from v0.1.0
+## Deferred from v0.2.0
 
-- Nostr relay publishing/subscribing
-- event signing
+- event signing for public relay interoperability
 - worker discovery heartbeats
 - multi-relay deduplication
 - DiLoCo training loop integration with PyTorch or MLX
