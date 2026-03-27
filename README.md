@@ -1,555 +1,226 @@
 # nostrain
 
-Distributed ML training over Nostr relays.
+Distributed ML training over [Nostr](https://nostr.com) relays. No coordinator, no central server — workers exchange compressed pseudo-gradients through public WebSocket relays using [DiLoCo](https://arxiv.org/abs/2311.08105)-style outer optimization.
 
-The project vision is still the same: no coordinator, no central server, just workers exchanging sparse pseudo-gradients through Nostr. The repository now ships the protocol/payload toolkit, a signed relay transport slice, and a resilient end-to-end training runner: model snapshots, DiLoCo-style deltas, sparse transport payloads, NIP-01-compatible nostrain gradient/heartbeat/checkpoint events, relay collection with active-worker discovery, cross-relay deduplication, resumable checkpoints, relay-visible checkpoint distribution, deferred late-gradient reconciliation, configurable relay retry/backoff, runtime-pluggable built-in workers for both linear and non-linear regression over one or more relays, plus NumPy and PyTorch-compatible edge-runtime paths for model-state interchange and local optimization.
+## How it works
 
-## Current status
+```
+Worker A                    Nostr Relays                   Worker B
+   |                      (public infra)                      |
+   |-- local SGD steps -->                                    |
+   |                                                          |
+   |   compress(topk + int8 + zlib)                           |
+   |   sign(BIP340 Schnorr)                                   |
+   |                                                          |
+   |-------- EVENT kind:33333 -------->                       |
+   |                           <-------- EVENT kind:33333 ----|
+   |                                                          |
+   |   verify + decompress                                    |
+   |   aggregate(mean)                                        |
+   |   outer_step(Nesterov momentum)                          |
+   |                                                          |
+   |-- next round ---------------------------------------->   |
+```
 
-`nostrain` v0.12.0 is a protocol, relay, and training toolchain. It implements:
-
-- canonical model-state JSON loading and hashing
-- pseudo-gradient computation (`current - initial`)
-- top-k sparsification + int8 quantization + wire compression
-- multi-worker delta aggregation
-- momentum-backed local outer updates
-- deterministic NIP-01 event IDs plus BIP340 Schnorr signing/verification
-- nostrain gradient event construction and validation
-- signed worker heartbeat event construction and validation
-- websocket relay publish/subscribe for gradient events
-- active worker discovery with stale-heartbeat filtering
-- replay-safe event collection and round aggregation over a relay
-- cross-relay publish redundancy and replay-safe collection deduplication
-- configurable relay retry/backoff across publish, discovery, and collection operations
-- idempotent duplicate-publish handling plus retry telemetry in CLI summaries and training artifacts
-- round sync strategies (`timeout`, `strict`, `quorum`, `async`) driven by discovered workers
-- a deterministic JSON dataset format for built-in regression workloads
-- pluggable built-in runtimes for `linear-regression` and `mlp-regression`
-- backend-selectable local SGD/evaluation paths (`python`, `numpy`, `torch`) for both runtimes
-- canonical model-state interchange between JSON, `numpy-npz`, PyTorch-compatible state-dict archives, and native `torch.save` checkpoints
-- PyTorch state-dict import normalization for direct-module, nested-module, and `module.*`-prefixed key layouts
-- native `.pt` / `.pth` checkpoint loading for bare state dicts and common wrapped `state_dict` / `model_state_dict` payloads
-- built-in `torch.nn.Module` materialization for the linear and MLP runtimes plus optional module-native `.pt` / `.pth` checkpoint writing
-- native checkpoint loading from raw built-in modules and common nested training bundles that carry model objects or state dicts
-- CLI state-format auto-detection plus `convert-state` for explicit format conversion
-- a relay-backed training runner that publishes heartbeats and gradients to one or more relays, tolerates partial relay outages, and applies the outer step locally
-- resumable training checkpoints carrying model state, momentum state, and prior round history
-- signed checkpoint distribution events carrying the latest recoverable training state
-- relay checkpoint discovery plus `run-training --resume-latest-checkpoint` for rejoining workers
-- rolling checkpoint-slot retention that bounds relay-visible checkpoint history per worker
-- checkpointed late-gradient payload tracking plus deferred reconciliation before the next round
-- configurable `run-training --late-gradient-strategy discard` accounting for record-only stale updates
-- bounded checkpoint artifacts plus optional per-round artifact pruning under `run-training`
-- deterministic `init-state` generation for supported built-in runtimes
-- a CLI for converting, encoding, decoding, applying, publishing, collecting, and inspecting payloads
-
-It now ships native `torch.save` state-dict and built-in-module checkpoint I/O plus an optional torch backend for the built-in runtimes, but it does **not** yet execute arbitrary user-defined PyTorch/MLX modules as training runtimes. The signed transport path now targets public NIP-01 relays as well as local/mock websocket endpoints, and the built-in runners stay dependency-light and testable while exercising real external runtime boundaries through NumPy interchange, PyTorch state-dict layouts, module-native checkpoints, and backend execution.
+Each worker trains locally, compresses the pseudo-gradient (`params - initial`), publishes it as a signed Nostr event, collects gradients from peers, and applies the aggregated update. Repeat.
 
 ## Install
 
 ```bash
-python3 -m pip install -e .
+pip install -e .
 ```
 
-Optional `zstd` support:
+With optional backends:
 
 ```bash
-python3 -m pip install -e ".[zstd]"
+pip install -e ".[numpy]"     # NumPy state interchange + backend
+pip install -e ".[torch]"     # PyTorch checkpoints + backend
+pip install -e ".[zstd]"      # zstd compression (default: zlib)
 ```
 
-Optional `numpy` support for `numpy-npz` state interchange and the NumPy training backend:
+Only hard dependency: `websockets`.
+
+## Quick start
+
+**Initialize a model and run a distributed training session:**
 
 ```bash
-python3 -m pip install -e ".[numpy]"
-```
-
-Optional `torch` support for native `.pt` / `.pth` checkpoints and the torch training backend:
-
-```bash
-python3 -m pip install -e ".[torch]"
-```
-
-## Model state format
-
-The current toolchain uses a deterministic JSON representation for model snapshots:
-
-```json
-{
-  "parameters": {
-    "encoder.weight": {
-      "shape": [2, 3],
-      "values": [0.1, -0.2, 0.3, 0.4, -0.5, 0.6]
-    },
-    "encoder.bias": {
-      "shape": [3],
-      "values": [0.01, -0.02, 0.03]
-    }
-  }
-}
-```
-
-This keeps the protocol testable today without depending on framework-specific serialization. Built-in runtimes, the current NumPy edge adapter, and future PyTorch/MLX adapters can export/import this structure at the edge.
-
-The built-in `linear-regression` runtime expects this minimal state:
-
-```json
-{
-  "parameters": {
-    "linear.bias": {
-      "shape": [1],
-      "values": [0.0]
-    },
-    "linear.weight": {
-      "shape": [1, 2],
-      "values": [0.0, 0.0]
-    }
-  }
-}
-```
-
-The built-in `mlp-regression` runtime uses a one-hidden-layer state:
-
-```json
-{
-  "parameters": {
-    "mlp.hidden.bias": {
-      "shape": [4],
-      "values": [0.0, 0.0, 0.0, 0.0]
-    },
-    "mlp.hidden.weight": {
-      "shape": [4, 2],
-      "values": [0.01, -0.02, 0.03, -0.04, 0.05, -0.06, 0.07, -0.08]
-    },
-    "mlp.output.bias": {
-      "shape": [1],
-      "values": [0.0]
-    },
-    "mlp.output.weight": {
-      "shape": [1, 4],
-      "values": [0.02, -0.01, 0.03, -0.02]
-    }
-  }
-}
-```
-
-## NumPy state interop
-
-`nostrain` can also read and write model states as `numpy-npz` archives. Each parameter is stored as a named array in a `.npz` file, with small metadata entries describing the nostrain schema and optional runtime.
-
-Convert a canonical JSON state into an archive:
-
-```bash
-nostrain convert-state linear-initial.json -o linear-initial.npz
-```
-
-Round-trip it back to JSON:
-
-```bash
-nostrain convert-state linear-initial.npz -o linear-initial-roundtrip.json
-```
-
-## PyTorch state-dict interop
-
-`nostrain` can also import and export PyTorch-compatible state dicts either as dependency-light archives (`.pt.npz` / `.pth.npz`) or as native `torch.save` checkpoints (`.pt` / `.pth`). Linear states are emitted as `weight` / `bias`; MLP states are emitted as `hidden.*` and `output.*`. On import, common wrapper prefixes such as `module.` or `model.` are stripped automatically before the state is normalized back into canonical nostrain parameter names, and wrapped checkpoints with `state_dict` / `model_state_dict` payloads are accepted.
-
-Convert a canonical JSON state into a PyTorch-style state dict archive:
-
-```bash
-nostrain convert-state linear-initial.json -o linear-initial.pt.npz
-```
-
-Round-trip it back to canonical JSON:
-
-```bash
-nostrain convert-state linear-initial.pt.npz -o linear-initial-from-pytorch.json
-```
-
-Write a native `torch.save` checkpoint instead:
-
-```bash
-nostrain convert-state linear-initial.json -o linear-initial.pt
-```
-
-Write a native checkpoint that stores a built-in `torch.nn.Module` instead of a raw state dict:
-
-```bash
-nostrain convert-state linear-initial.json \
-  --torch-checkpoint-payload module \
-  -o linear-module.pt
-```
-
-Load that native checkpoint into a PyTorch module:
-
-```python
-import torch
-
-state_dict = torch.load("linear-initial.pt", map_location="cpu")
-model.load_state_dict(state_dict)
-```
-
-## Dataset format
-
-The built-in worker loop consumes deterministic JSON regression datasets:
-
-```json
-{
-  "task": "linear-regression",
-  "examples": [
-    {
-      "inputs": [1.0, 0.0],
-      "target": 2.5
-    },
-    {
-      "inputs": [0.0, 1.0],
-      "target": -0.5
-    }
-  ]
-}
-```
-
-Each example must use the same input width. `task` currently supports `linear-regression` and `mlp-regression`, both with scalar regression targets.
-
-## CLI
-
-Initialize a deterministic built-in model state:
-
-```bash
-nostrain init-state --runtime linear-regression --features 2 -o linear-initial.json
-nostrain init-state --runtime mlp-regression --features 2 --hidden-size 4 -o mlp-initial.json
-nostrain init-state --runtime linear-regression --features 2 -o linear-initial.npz
-```
-
-Hash a model snapshot:
-
-```bash
-nostrain hash-state initial.json
-```
-
-Create a compressed pseudo-gradient payload:
-
-```bash
-nostrain encode-delta initial.json current.json --topk 0.25 -o payload.json
-```
-
-Decode the payload back to a sparse delta:
-
-```bash
-nostrain decode-payload payload.json
-```
-
-Apply a payload to reconstruct the updated model state:
-
-```bash
-nostrain apply-payload initial.json payload.json -o reconstructed.json
-```
-
-Average several worker payloads into one aggregated delta:
-
-```bash
-nostrain aggregate-payloads worker-a.json worker-b.json -o aggregated.json
-```
-
-Apply a local DiLoCo-style outer step:
-
-```bash
-nostrain outer-step initial.json aggregated.json \
-  --learning-rate 0.7 \
-  --momentum 0.9 \
-  --momentum-out next-momentum.json \
-  -o next-state.json
-```
-
-Run the built-in local training inner loop:
-
-```bash
-nostrain train-local linear-initial.json worker-a-dataset.json \
-  --steps 50 \
-  --learning-rate 0.05 \
-  --batch-size 2 \
-  --metrics-out local-training.json \
-  -o local-state.json
-```
-
-Run the same local training loop through the NumPy backend and emit `.npz` weights:
-
-```bash
-nostrain train-local linear-initial.npz worker-a-dataset.json \
-  --backend numpy \
-  --steps 50 \
-  --learning-rate 0.05 \
-  --batch-size 2 \
-  --metrics-out local-training.json \
-  -o local-state.npz
-```
-
-Run the same local training loop through the torch backend and emit a native `.pt` checkpoint:
-
-```bash
-nostrain train-local linear-initial.pt worker-a-dataset.json \
-  --backend torch \
-  --steps 50 \
-  --learning-rate 0.05 \
-  --batch-size 2 \
-  --metrics-out local-training.json \
-  -o local-state.pt
-```
-
-Run the non-linear MLP runtime against an `mlp-regression` dataset:
-
-```bash
-nostrain train-local mlp-initial.json worker-a-mlp-dataset.json \
-  --runtime mlp-regression \
-  --steps 40 \
-  --learning-rate 0.05 \
-  --batch-size 2 \
-  --metrics-out mlp-training.json \
-  -o mlp-state.json
-```
-
-Build a nostrain event envelope:
-
-```bash
-nostrain build-event payload.json \
-  --run demo-run \
-  --round 7 \
-  --worker worker-pubkey \
-  --model "$(nostrain hash-state initial.json)" \
-  --sec-key 0000000000000000000000000000000000000000000000000000000000000003 \
-  -o event.json
-```
-
-Build a signed heartbeat for worker discovery:
-
-```bash
-nostrain build-heartbeat \
-  --run demo-run \
-  --round 7 \
-  --worker worker-pubkey \
-  --capability gradient-event \
-  --advertise-relay ws://127.0.0.1:8765 \
-  --sec-key 0000000000000000000000000000000000000000000000000000000000000003 \
-  -o heartbeat.json
-```
-
-Derive an x-only Nostr pubkey from a worker secret key:
-
-```bash
-nostrain derive-pubkey 0000000000000000000000000000000000000000000000000000000000000003
-```
-
-Publish the event to a relay-compatible websocket endpoint:
-
-```bash
-nostrain publish-event event.json --relay ws://127.0.0.1:8765 --json
-```
-
-Publish the same event redundantly to multiple relays:
-
-```bash
-nostrain publish-event event.json \
-  --relay ws://127.0.0.1:8765 \
-  --relay wss://relay.example.com \
-  --json
-```
-
-Relay-facing commands can retry transient websocket failures with backoff:
-
-```bash
-nostrain collect-events \
-  --relay ws://127.0.0.1:8765 \
-  --run demo-run \
-  --round 7 \
-  --relay-retries 2 \
-  --relay-retry-backoff 0.25 \
-  --relay-retry-backoff-max 1.0 \
-  --json
-```
-
-The shared retry flags are available on `publish-event`, `discover-workers`, `discover-checkpoints`, `collect-events`, `aggregate-round`, and `run-training`. JSON outputs and training summaries include per-relay attempt counts, retry delays, and the relays that needed retries.
-
-Build a signed checkpoint event from a saved worker checkpoint:
-
-```bash
-nostrain build-checkpoint worker-a-checkpoint.json \
-  --history-slot 0 \
-  --sec-key 0000000000000000000000000000000000000000000000000000000000000003 \
-  -o checkpoint-event.json
-```
-
-Discover the latest recoverable checkpoint for a run:
-
-```bash
-nostrain discover-checkpoints \
-  --relay ws://127.0.0.1:8765 \
-  --run linear-demo \
-  --json
-```
-
-Collect and validate one round from a relay:
-
-```bash
-nostrain collect-events \
-  --relay ws://127.0.0.1:8765 \
-  --run demo-run \
-  --round 7 \
-  --discover-workers \
-  --sync quorum \
-  --limit 2 \
-  --json
-```
-
-Aggregate the collected worker updates directly from the relay:
-
-```bash
-nostrain aggregate-round \
-  --relay ws://127.0.0.1:8765 \
-  --run demo-run \
-  --round 7 \
-  --discover-workers \
-  --sync strict \
-  --limit 2 \
-  -o aggregated.json
-```
-
-Run an end-to-end worker session over multiple relays with checkpoint output:
-
-```bash
-nostrain run-training linear-initial.json worker-a-dataset.json \
-  --relay ws://127.0.0.1:8765 \
-  --relay wss://relay.example.com \
-  --run linear-demo \
-  --sec-key 0000000000000000000000000000000000000000000000000000000000000003 \
+# Generate initial model state
+nostrain init-state --runtime linear-regression --features 2 -o model.json
+
+# Run a worker — connects to relays, trains, exchanges gradients
+nostrain run-training model.json data.json \
+  --relay wss://relay.damus.io \
+  --relay wss://nos.lol \
+  --run my-experiment \
+  --sec-key $NOSTR_SECRET_KEY \
   --inner-steps 50 \
   --local-learning-rate 0.05 \
-  --batch-size 2 \
-  --topk 1.0 \
   --outer-learning-rate 1.0 \
-  --momentum 0.0 \
-  --round-timeout 2.0 \
-  --checkpoint-history 4 \
-  --artifact-dir artifacts/worker-a \
-  --artifact-retention-rounds 2 \
-  --checkpoint-out worker-a-checkpoint.json \
-  --summary-out session-summary.json \
-  -o final-state.json
+  --momentum 0.9 \
+  --sync quorum \
+  -o trained.json
 ```
 
-The same command also accepts `.npz` model states with `--backend numpy` and native `.pt` / `.pth` checkpoints with `--backend torch` while keeping checkpoints, payloads, and relay envelopes in the canonical nostrain formats.
+Run the same command on another machine with different data. Workers discover each other via heartbeats and sync gradients through the relays.
 
-Resume a worker from its last saved checkpoint:
-
-```bash
-nostrain run-training linear-initial.json worker-a-dataset.json \
-  --relay ws://127.0.0.1:8765 \
-  --relay wss://relay.example.com \
-  --run linear-demo \
-  --sec-key 0000000000000000000000000000000000000000000000000000000000000003 \
-  --resume-from worker-a-checkpoint.json \
-  --rounds 2 \
-  --summary-out resumed-session-summary.json \
-  -o resumed-final-state.json
-```
-
-Resume from the latest relay-distributed checkpoint instead of a local file:
+**Resume from a relay-distributed checkpoint:**
 
 ```bash
-nostrain run-training linear-initial.json worker-a-dataset.json \
-  --relay ws://127.0.0.1:8765 \
-  --run linear-demo \
-  --sec-key 0000000000000000000000000000000000000000000000000000000000000003 \
+nostrain run-training model.json data.json \
+  --relay wss://relay.damus.io \
+  --run my-experiment \
+  --sec-key $NOSTR_SECRET_KEY \
   --resume-latest-checkpoint \
-  --rounds 1 \
-  --summary-out relay-resume-summary.json \
-  -o relay-resume-state.json
+  -o resumed.json
 ```
 
-Keep late gradients for audit only instead of folding them into the next round:
+## Architecture
+
+```
+nostrain/
+  model.py          Tensor state, deltas, hashing
+  compression.py    Top-k sparsification, int8 quantization, wire format
+  aggregation.py    Mean aggregation, Nesterov outer step
+  crypto.py         BIP340 Schnorr signatures (pure Python, no native deps)
+  protocol.py       NIP-01 event builders/parsers (kind 33333/33334/33335)
+  relay.py          Async WebSocket transport, multi-relay, dedup, discovery
+  training.py       End-to-end training loop with checkpointing
+  runtime.py        Built-in runtimes (linear, MLP) with python/numpy/torch backends
+  stateio.py        State I/O: JSON, .npz, .pt.npz, .pt/.pth
+  pytorch.py        PyTorch state-dict bridge, nn.Module materialization
+  cli.py            Full CLI
+```
+
+## Compression pipeline
+
+```
+pseudo_gradient = current_params - initial_params
+    |
+    v
+top-k sparsification (keep k% of largest values)
+    |
+    v
+int8 quantization (scale to [-127, 127])
+    |
+    v
+binary wire format (NSTR magic + sparse layout)
+    |
+    v
+zlib/zstd compression
+    |
+    v
+base64 → Nostr event content
+```
+
+Typical compression: a 10k-parameter gradient with `topk=0.1` compresses to ~1KB.
+
+## Nostr protocol
+
+Three event kinds on the wire:
+
+| Kind | Purpose | Content |
+|------|---------|---------|
+| `33333` | Gradient | Compressed pseudo-gradient payload (base64) |
+| `33334` | Heartbeat | Empty — capabilities and relay hints in tags |
+| `33335` | Checkpoint | Serialized training state for recovery |
+
+All events are NIP-01 compliant and BIP340 Schnorr signed. Any Nostr relay that indexes on `kind` and `#t` tags works out of the box.
+
+## Sync strategies
+
+| Strategy | Behavior |
+|----------|----------|
+| `timeout` | Wait up to N seconds, aggregate whatever arrives |
+| `strict` | Wait for exactly N workers |
+| `quorum` | Wait for majority of discovered workers |
+| `async` | Fire and forget — apply local gradient immediately |
+
+## Fault tolerance
+
+- **Multi-relay redundancy** — publish to N relays, collect from all, deduplicate
+- **Retry with backoff** — configurable exponential backoff on relay failures
+- **Late gradient reconciliation** — gradients arriving after round close fold into the next round (or discard for audit)
+- **Checkpoint recovery** — resume from local file or discover latest checkpoint from relay
+- **Rolling checkpoint retention** — bounds relay-visible checkpoint history per worker
+
+## State formats
+
+Model state round-trips through any of these:
 
 ```bash
-nostrain run-training linear-initial.json worker-a-dataset.json \
-  --relay ws://127.0.0.1:8765 \
-  --run linear-demo \
-  --sec-key 0000000000000000000000000000000000000000000000000000000000000003 \
-  --resume-latest-checkpoint \
-  --late-gradient-strategy discard \
-  --summary-out relay-resume-summary.json \
-  -o relay-resume-state.json
+nostrain convert-state model.json -o model.npz       # NumPy archive
+nostrain convert-state model.json -o model.pt.npz     # PyTorch state-dict archive
+nostrain convert-state model.json -o model.pt         # Native torch.save
 ```
 
-List active workers advertising a given run/round:
+PyTorch import handles `module.*` prefixes, `state_dict`/`model_state_dict` wrappers, and nested checkpoint bundles automatically.
 
-```bash
-nostrain discover-workers \
-  --relay ws://127.0.0.1:8765 \
-  --run demo-run \
-  --round 7 \
-  --json
+## CLI reference
+
+```
+nostrain init-state          Initialize model state for a built-in runtime
+nostrain hash-state          Hash a model snapshot (deterministic)
+nostrain convert-state       Convert between state formats
+
+nostrain encode-delta        Compress a pseudo-gradient
+nostrain decode-payload      Decompress a payload
+nostrain apply-payload       Apply payload to reconstruct state
+nostrain aggregate-payloads  Average multiple worker payloads
+
+nostrain outer-step          Apply DiLoCo outer step with momentum
+nostrain train-local         Run inner SGD loop locally
+
+nostrain build-event         Build a signed gradient event
+nostrain build-heartbeat     Build a signed heartbeat event
+nostrain build-checkpoint    Build a signed checkpoint event
+nostrain inspect-event       Validate and inspect an event
+
+nostrain publish-event       Publish event to relay(s)
+nostrain collect-events      Collect round events from relay(s)
+nostrain aggregate-round     Collect + aggregate in one step
+nostrain discover-workers    List active workers on relay(s)
+nostrain discover-checkpoints  Find latest checkpoint on relay(s)
+nostrain derive-pubkey       Derive Nostr pubkey from secret key
+
+nostrain run-training        Full training session over relay(s)
 ```
 
-Inspect and validate an event:
+## Python API
 
-```bash
-nostrain inspect-event event.json --json
+```python
+from nostrain import (
+    ModelState, compute_delta, state_digest,
+    compress_delta, decompress_payload,
+    aggregate_deltas, nesterov_outer_step,
+    build_gradient_event, parse_gradient_event,
+    schnorr_sign, schnorr_verify,
+    run_training_session, TrainingWorkerConfig,
+)
+
+# Compute and compress a pseudo-gradient
+delta = compute_delta(initial_state, trained_state)
+payload = compress_delta(delta, topk_ratio=0.1)
+
+# Build a signed Nostr event
+event = build_gradient_event(
+    payload=payload,
+    run_name="experiment-1",
+    round_number=0,
+    worker_id=pubkey,
+    model_hash=state_digest(initial_state),
+    secret_key=secret_key,
+)
 ```
 
-## Protocol summary
+## Design choices
 
-Gradient events still target Nostr kind `33333`. The implemented envelope includes:
+**Why Nostr?** Public relay infrastructure already exists, handles WebSocket pub/sub at scale, and provides a standard event format with cryptographic signatures built in. No need to run your own coordination server.
 
-- NIP-01 top-level fields: `id`, `pubkey`, `created_at`, `kind`, `tags`, `content`, `sig`
+**Why pure-Python crypto?** The BIP340 Schnorr implementation uses only `hashlib`. No `libsecp256k1` binding, no compiled extensions. The library installs and runs everywhere Python does.
 
-- `d`: `run:<run-name>:worker:<worker-id>:round:<round>`
-- `t`: `nostrain`
-- `run`
-- `round`
-- `worker`
-- `model`
-- `steps`
-- `compression`
-- `params`
-- `values`
-- `selected`
+**Why framework-agnostic transport?** The wire protocol is just bytes. The transport layer never imports `torch` or `numpy`. Framework-specific code lives at the edges (`runtime.py`, `pytorch.py`, `stateio.py`) and is entirely optional.
 
-The event content is a base64 wire payload containing:
+## License
 
-1. a nostrain container header
-2. a sparse tensor layout manifest
-3. top-k indices
-4. int8 quantized values + scale
-5. compressed bytes (`zlib` now, optional `zstd` when installed)
-
-Relay collection currently subscribes on `kind=33333` and `#t=["nostrain"]`, then narrows `run` and `round` client-side. This avoids relying on non-standard multi-character tag indexing at the relay layer while remaining compatible with NIP-01 relay indexing rules.
-
-Heartbeat discovery events target Nostr kind `33334`. They use:
-
-- `d`: `run:<run-name>:worker:<worker-id>`
-- `t`: `nostrain`
-- `run`
-- `worker`
-- `round`
-- `heartbeat`
-- repeated `capability` tags
-- repeated `relay` tags
-
-Heartbeat content is intentionally empty; worker capabilities and relay hints live in the tag set so relays and clients can index them directly. Discovery keeps only the newest heartbeat per worker and drops workers that have missed more than three advertised heartbeat intervals.
-
-## Roadmap
-
-- [x] Canonical model-state format and hashing
-- [x] Pseudo-gradient delta computation
-- [x] Top-k + int8 compressed payload wire format
-- [x] Multi-worker delta aggregation
-- [x] Local outer-step simulation with momentum state
-- [x] nostrain gradient event builder and validator
-- [x] CLI for local encode/decode/apply/inspect workflows
-- [x] Relay publish/subscribe transport
-- [x] Replay-safe relay round collection and aggregation
-- [x] Event signing for public relays
-- [x] Worker discovery and heartbeat events
-- [x] Runtime-aware built-in training runners for `linear-regression` and `mlp-regression`
-- [x] Multi-relay redundancy
-- [x] Local checkpoint recovery for resumed workers
-- [x] Relay checkpoint advertisement/distribution
-- [x] Checkpoint retention/pruning policy
-- [x] Late-gradient reconciliation across advanced rounds
-- [ ] Live monitoring dashboard
+MIT
