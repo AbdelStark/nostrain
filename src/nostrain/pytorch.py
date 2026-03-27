@@ -416,6 +416,49 @@ def load_torch_checkpoint(
     raise ValueError(f"unsupported PyTorch checkpoint payload type: {type(payload).__name__}")
 
 
+def model_state_to_torch_tensors(
+    state: ModelState,
+    *,
+    dtype: Any = None,
+) -> dict[str, Any]:
+    """Convert any ModelState to a flat ``{name: Tensor}`` dict.
+
+    Unlike :func:`model_state_to_torch_state_dict_payload`, this function
+    does **not** remap parameter names through a built-in runtime export map.
+    It is therefore usable with arbitrary model architectures.
+    """
+    torch = _require_torch("generic state-dict conversion")
+    if dtype is None:
+        dtype = torch.float32
+    payload: dict[str, Any] = {}
+    for parameter in state.parameters:
+        if parameter.shape:
+            tensor = torch.tensor(parameter.values, dtype=dtype).reshape(*parameter.shape)
+        else:
+            tensor = torch.tensor(parameter.values[0], dtype=dtype)
+        payload[parameter.name] = tensor
+    return payload
+
+
+def model_state_from_module(module: Any) -> ModelState:
+    """Extract a :class:`ModelState` from any ``torch.nn.Module``.
+
+    Unlike :func:`model_state_from_torch_module`, this function preserves the
+    original state-dict key names without runtime-specific normalization.
+    """
+    if not hasattr(module, "state_dict") or not callable(module.state_dict):
+        raise ValueError(
+            f"object of type {type(module).__name__!r} does not expose state_dict()"
+        )
+    return model_state_from_torch_state_dict_payload(module.state_dict())
+
+
+def load_state_into_module(state: ModelState, module: Any, *, strict: bool = True) -> None:
+    """Load a :class:`ModelState` into an arbitrary ``torch.nn.Module``."""
+    sd = model_state_to_torch_tensors(state)
+    module.load_state_dict(sd, strict=strict)
+
+
 def model_state_to_torch_state_dict_payload(
     state: ModelState,
     *,
