@@ -8,3 +8,6 @@ uv.lock
 .claude/tsc-cache/
 .tldrignore
 .tldr
+.env
+demo/artifacts/
+demo/*.log

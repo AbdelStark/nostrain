@@ -58,7 +58,7 @@ nostrain run-training model.json data.json \
   --local-learning-rate 0.05 \
   --outer-learning-rate 1.0 \
   --momentum 0.9 \
-  --sync quorum \
+  --round-timeout 5.0 \
   -o trained.json
 ```
 
