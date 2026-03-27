@@ -100,13 +100,24 @@ Delivered in the current repository state:
 
 This moves the project from local-only checkpoint recovery to distributed checkpoint recovery with explicit stale-update handling when workers advance at different times.
 
-## Next milestone: retention policy + richer runtimes
+## Completed milestone: bounded checkpoint retention
 
-Goal: keep relay history bounded and prepare the transport/runtime boundary for larger models.
+Delivered in the current repository state:
+
+- rolling checkpoint-slot publication so each worker reuses a bounded set of parameterized checkpoint identities on relays
+- CLI support for `build-checkpoint --history-slot`, `run-training --checkpoint-history`, and `run-training --artifact-retention-rounds`
+- bounded checkpoint artifact snapshots under the worker artifact root plus a machine-readable retention manifest
+- optional pruning of old per-round artifact directories without affecting latest-checkpoint resume
+- protocol, relay, and runner tests covering slot replacement, bounded relay checkpoint history, and local artifact pruning
+
+This moves the project from unbounded checkpoint accumulation to a retention-aware training system that can keep distributed recovery state compact without losing resumability.
+
+## Next milestone: late-gradient reconciliation + richer runtimes
+
+Goal: finish the stale-update story and prepare the transport/runtime boundary for larger models.
 
 Deliverables:
 
-- retention/pruning rules for checkpoint artifacts and relay history
 - a clearer reconciliation story for discarded late gradients
 - compatibility story for richer runtimes such as PyTorch/MLX on top of the resilient transport layer
 

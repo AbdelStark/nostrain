@@ -27,11 +27,12 @@ The project vision is still the same: no coordinator, no central server, just wo
 - resumable training checkpoints carrying model state, momentum state, and prior round history
 - signed checkpoint distribution events carrying the latest recoverable training state
 - relay checkpoint discovery plus `run-training --resume-latest-checkpoint` for rejoining workers
+- rolling checkpoint-slot retention that bounds relay-visible checkpoint history per worker
 - explicit late-gradient scanning/discard reporting after a worker has already advanced rounds
-- per-round training artifacts and machine-readable session summaries/checkpoints
+- bounded checkpoint artifacts plus optional per-round artifact pruning under `run-training`
 - a CLI for encoding, decoding, applying, publishing, collecting, and inspecting payloads
 
-It does **not** yet implement retention/pruning policies for distributed checkpoints and relay history, full late-gradient reconciliation after discard, or richer runtimes such as PyTorch/MLX. The signed transport path now targets public NIP-01 relays as well as local/mock websocket endpoints, and the built-in runner is intentionally scoped to linear regression so the end-to-end training loop stays dependency-light and testable.
+It does **not** yet implement full late-gradient reconciliation after discard or richer runtimes such as PyTorch/MLX. The signed transport path now targets public NIP-01 relays as well as local/mock websocket endpoints, and the built-in runner is intentionally scoped to linear regression so the end-to-end training loop stays dependency-light and testable.
 
 ## Install
 
@@ -208,6 +209,7 @@ Build a signed checkpoint event from a saved worker checkpoint:
 
 ```bash
 nostrain build-checkpoint worker-a-checkpoint.json \
+  --history-slot 0 \
   --sec-key 0000000000000000000000000000000000000000000000000000000000000003 \
   -o checkpoint-event.json
 ```
@@ -262,7 +264,9 @@ nostrain run-training linear-initial.json worker-a-dataset.json \
   --outer-learning-rate 1.0 \
   --momentum 0.0 \
   --round-timeout 2.0 \
+  --checkpoint-history 4 \
   --artifact-dir artifacts/worker-a \
+  --artifact-retention-rounds 2 \
   --checkpoint-out worker-a-checkpoint.json \
   --summary-out session-summary.json \
   -o final-state.json
@@ -369,7 +373,7 @@ Heartbeat content is intentionally empty; worker capabilities and relay hints li
 - [x] Multi-relay redundancy
 - [x] Local checkpoint recovery for resumed workers
 - [x] Relay checkpoint advertisement/distribution
+- [x] Checkpoint retention/pruning policy
 - [x] Late-gradient discard tracking across advanced rounds
-- [ ] Checkpoint retention/pruning policy
 - [ ] Full late-gradient reconciliation across advanced rounds
 - [ ] Live monitoring dashboard

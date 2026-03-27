@@ -166,6 +166,7 @@ class ProtocolTests(unittest.TestCase):
                 next_round=1,
                 model_hash=state_digest(state),
                 rounds_completed=1,
+                history_slot=2,
                 created_at=1_700_000_250,
             ),
             checkpoint.to_json_obj(),
@@ -177,6 +178,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(parsed.metadata.run_name, "demo-run")
         self.assertEqual(parsed.metadata.worker_id, "worker-pubkey")
         self.assertEqual(parsed.metadata.round_index, 0)
+        self.assertEqual(parsed.metadata.history_slot, 2)
         self.assertEqual(parsed.metadata.next_round, 1)
         self.assertEqual(parsed.metadata.model_hash, state_digest(state))
         self.assertEqual(parsed.metadata.rounds_completed, 1)

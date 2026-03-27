@@ -110,6 +110,7 @@ def _build_checkpoint(
     run_name: str = "demo-run",
     round_index: int = 0,
     state_fixture: str = "linear_initial_state.json",
+    history_slot: int | None = None,
 ) -> dict[str, Any]:
     state = ModelState.from_path(FIXTURES / state_fixture)
     checkpoint = TrainingCheckpoint(
@@ -153,6 +154,7 @@ def _build_checkpoint(
             next_round=round_index + 1,
             model_hash=state_digest(state),
             rounds_completed=checkpoint.rounds_completed,
+            history_slot=history_slot,
             created_at=created_at,
         ),
         checkpoint.to_json_obj(),
@@ -728,16 +730,19 @@ class RelayTransportTests(unittest.TestCase):
             worker_id="worker-a",
             created_at=1_700_000_300,
             round_index=0,
+            history_slot=0,
         )
         newer = _build_checkpoint(
             worker_id="worker-a",
             created_at=1_700_000_320,
-            round_index=1,
+            round_index=2,
+            history_slot=0,
         )
         other_worker = _build_checkpoint(
             worker_id="worker-b",
             created_at=1_700_000_310,
-            round_index=0,
+            round_index=1,
+            history_slot=1,
         )
 
         with MockRelay([older, other_worker, newer]) as relay:
@@ -749,12 +754,15 @@ class RelayTransportTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(collection.events[0].parsed.metadata.round_index, 0)
-        self.assertEqual(collection.events[-1].parsed.metadata.round_index, 1)
+        self.assertEqual(len(collection.events), 2)
+        self.assertEqual(collection.duplicates_discarded, 1)
+        self.assertEqual(collection.events[0].parsed.metadata.round_index, 1)
+        self.assertEqual(collection.events[-1].parsed.metadata.round_index, 2)
         self.assertEqual(sorted(set(collection.worker_ids)), ["worker-a", "worker-b"])
-        self.assertEqual(collection.latest_event.parsed.metadata.round_index, 1)
-        self.assertEqual(collection.latest_event.parsed.metadata.next_round, 2)
+        self.assertEqual(collection.latest_event.parsed.metadata.round_index, 2)
+        self.assertEqual(collection.latest_event.parsed.metadata.next_round, 3)
         self.assertEqual(collection.latest_event.parsed.metadata.worker_id, "worker-a")
+        self.assertEqual(collection.latest_event.parsed.metadata.history_slot, 0)
 
     def test_cli_build_publish_and_discover_checkpoints(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory, MockRelay() as relay:
@@ -781,6 +789,8 @@ class RelayTransportTests(unittest.TestCase):
                 "worker-a",
                 "--sec-key",
                 WORKER_SECRET_KEYS["worker-a"],
+                "--history-slot",
+                "2",
                 "--created-at",
                 "1700000401",
                 "-o",
@@ -806,8 +816,97 @@ class RelayTransportTests(unittest.TestCase):
             discovered_json = json.loads(discovered.read_text(encoding="utf-8"))
             self.assertEqual(discovered_json["event_count"], 1)
             self.assertEqual(discovered_json["latest"]["round"], 0)
+            self.assertEqual(discovered_json["latest"]["history_slot"], 2)
             self.assertEqual(discovered_json["latest"]["next_round"], 1)
             self.assertEqual(discovered_json["workers"], ["worker-a"])
+
+    def test_cli_run_training_bounds_checkpoint_history_and_prunes_round_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory, MockRelay() as relay:
+            tempdir = Path(temporary_directory)
+            artifact_dir = tempdir / "artifacts"
+            summary = tempdir / "summary.json"
+            discovered = tempdir / "checkpoints.json"
+            final_state = tempdir / "final-state.json"
+
+            self._run(
+                "run-training",
+                str(FIXTURES / "linear_initial_state.json"),
+                str(FIXTURES / "linear_dataset_worker_a.json"),
+                "--relay",
+                relay.url,
+                "--run",
+                "retained-run",
+                "--worker",
+                "worker-a",
+                "--sec-key",
+                WORKER_SECRET_KEYS["worker-a"],
+                "--rounds",
+                "3",
+                "--inner-steps",
+                "20",
+                "--local-learning-rate",
+                "0.05",
+                "--batch-size",
+                "2",
+                "--outer-learning-rate",
+                "1.0",
+                "--momentum",
+                "0.0",
+                "--round-timeout",
+                "0.2",
+                "--checkpoint-history",
+                "2",
+                "--artifact-dir",
+                str(artifact_dir),
+                "--artifact-retention-rounds",
+                "1",
+                "--summary-out",
+                str(summary),
+                "-o",
+                str(final_state),
+            )
+
+            self._run(
+                "discover-checkpoints",
+                "--relay",
+                relay.url,
+                "--run",
+                "retained-run",
+                "--json",
+                "-o",
+                str(discovered),
+            )
+
+            summary_json = json.loads(summary.read_text(encoding="utf-8"))
+            discovered_json = json.loads(discovered.read_text(encoding="utf-8"))
+            retention_json = json.loads((artifact_dir / "retention.json").read_text(encoding="utf-8"))
+            slot_zero_event = parse_nostrain_event(
+                json.loads(
+                    (artifact_dir / "checkpoints" / "slot-0000-event.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+            )
+
+            self.assertIn("parameters", json.loads(final_state.read_text(encoding="utf-8")))
+            self.assertEqual(summary_json["checkpoint_history"], 2)
+            self.assertEqual(summary_json["artifact_retention_rounds"], 1)
+            self.assertEqual(discovered_json["event_count"], 2)
+            self.assertEqual(discovered_json["latest"]["round"], 2)
+            self.assertEqual(discovered_json["latest"]["history_slot"], 0)
+            self.assertFalse((artifact_dir / "round-0000").exists())
+            self.assertFalse((artifact_dir / "round-0001").exists())
+            self.assertTrue((artifact_dir / "round-0002").exists())
+            self.assertTrue((artifact_dir / "checkpoints" / "slot-0000.json").exists())
+            self.assertTrue((artifact_dir / "checkpoints" / "slot-0001.json").exists())
+            self.assertEqual(slot_zero_event.metadata.round_index, 2)
+            self.assertEqual(slot_zero_event.metadata.history_slot, 0)
+            self.assertEqual(retention_json["retained_rounds"], [2])
+            self.assertEqual(retention_json["latest_checkpoint_slot"], 0)
+            self.assertEqual(
+                [entry["round"] for entry in retention_json["checkpoint_slots"]],
+                [1, 2],
+            )
 
     def test_cli_publish_rejects_unsigned_event_on_signed_relay(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory, MockRelay() as relay:

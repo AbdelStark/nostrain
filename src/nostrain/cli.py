@@ -201,6 +201,7 @@ def _handle_build_checkpoint(args: argparse.Namespace) -> int:
             next_round=checkpoint.next_round,
             model_hash=state_digest(checkpoint.current_state),
             rounds_completed=checkpoint.rounds_completed,
+            history_slot=args.history_slot,
             created_at=args.created_at,
         ),
         checkpoint.to_json_obj(),
@@ -404,6 +405,8 @@ def _handle_run_training(args: argparse.Namespace) -> int:
                 max_missed_heartbeats=args.max_missed_heartbeats,
                 late_gradient_timeout=args.late_gradient_timeout,
                 advertised_relays=tuple(args.advertise_relay or ()),
+                checkpoint_history=args.checkpoint_history,
+                artifact_retention_rounds=args.artifact_retention_rounds,
             ),
             previous_momentum=previous_momentum,
             artifact_dir=args.artifact_dir,
@@ -466,7 +469,14 @@ def _checkpoint_collection_summary(collection: Any) -> str:
     workers = ", ".join(collection.worker_ids) if collection.worker_ids else "-"
     latest = collection.latest_event
     latest_label = (
-        f"round {latest.parsed.metadata.round_index} -> next {latest.parsed.metadata.next_round}"
+        "round "
+        f"{latest.parsed.metadata.round_index}"
+        + (
+            f" (slot {latest.parsed.metadata.history_slot})"
+            if latest is not None and latest.parsed.metadata.history_slot is not None
+            else ""
+        )
+        + f" -> next {latest.parsed.metadata.next_round}"
         if latest is not None
         else "-"
     )
@@ -675,6 +685,7 @@ def _event_summary(path: str | Path) -> dict[str, Any]:
             {
                 "run": parsed.metadata.run_name,
                 "round": parsed.metadata.round_index,
+                "history_slot": parsed.metadata.history_slot,
                 "next_round": parsed.metadata.next_round,
                 "model": parsed.metadata.model_hash,
                 "rounds_completed": parsed.metadata.rounds_completed,
@@ -728,6 +739,12 @@ def _handle_inspect_event(args: argparse.Namespace) -> int:
     elif summary["type"] == "checkpoint":
         lines.extend(
             [
+                "history_slot: "
+                + (
+                    str(summary["history_slot"])
+                    if summary["history_slot"] is not None
+                    else "-"
+                ),
                 f"next_round: {summary['next_round']}",
                 f"model: {summary['model']}",
                 f"rounds_completed: {summary['rounds_completed']}",
@@ -951,6 +968,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--created-at",
         type=int,
         help="Optional explicit Unix timestamp for the Nostr event.",
+    )
+    build_checkpoint.add_argument(
+        "--history-slot",
+        type=int,
+        help="Optional bounded checkpoint history slot used for parameterized replacement on relays.",
     )
     build_checkpoint.add_argument("-o", "--output", help="Optional output path.")
     build_checkpoint.set_defaults(handler=_handle_build_checkpoint)
@@ -1243,6 +1265,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional path to write a resumable training checkpoint after each completed round.",
     )
     run_training.add_argument(
+        "--checkpoint-history",
+        type=int,
+        default=4,
+        help="Number of rolling checkpoint slots to retain per worker on relays and in artifact checkpoints (default: 4).",
+    )
+    run_training.add_argument(
         "--round-timeout",
         type=float,
         default=2.0,
@@ -1280,6 +1308,11 @@ def build_parser() -> argparse.ArgumentParser:
     run_training.add_argument(
         "--artifact-dir",
         help="Optional directory for per-round artifacts such as events, payloads, and summaries.",
+    )
+    run_training.add_argument(
+        "--artifact-retention-rounds",
+        type=int,
+        help="Optional limit for how many per-round artifact directories to keep under --artifact-dir.",
     )
     run_training.add_argument(
         "--summary-out",

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import shutil
 import time
 from typing import Any
 
@@ -315,6 +316,8 @@ class TrainingWorkerConfig:
     max_missed_heartbeats: int = 3
     late_gradient_timeout: float = 0.2
     advertised_relays: tuple[str, ...] = ()
+    checkpoint_history: int = 4
+    artifact_retention_rounds: int | None = None
 
     def __post_init__(self) -> None:
         if not self.run_name:
@@ -349,6 +352,13 @@ class TrainingWorkerConfig:
             raise ValueError("max missed heartbeats must be positive")
         if self.late_gradient_timeout <= 0:
             raise ValueError("late gradient timeout must be positive")
+        if self.checkpoint_history <= 0:
+            raise ValueError("checkpoint history must be positive")
+        if (
+            self.artifact_retention_rounds is not None
+            and self.artifact_retention_rounds <= 0
+        ):
+            raise ValueError("artifact retention rounds must be positive when provided")
         normalized_relays = tuple(
             dict.fromkeys(str(relay).strip() for relay in self.relay_urls if str(relay).strip())
         )
@@ -491,6 +501,8 @@ class TrainingSessionResult:
     final_state: ModelState
     final_momentum_state: ModelState | None
     rounds: tuple[TrainingRoundSummary, ...]
+    checkpoint_history: int = 1
+    artifact_retention_rounds: int | None = None
     late_gradients: tuple[LateGradientRecord, ...] = ()
 
     @property
@@ -511,6 +523,8 @@ class TrainingSessionResult:
             "start_round": self.start_round,
             "rounds_completed": self.rounds_completed,
             "final_model_hash": self.final_model_hash,
+            "checkpoint_history": self.checkpoint_history,
+            "artifact_retention_rounds": self.artifact_retention_rounds,
             "late_gradient_count": len(self.late_gradients),
         }
         if include_rounds:
@@ -615,6 +629,87 @@ def _format_failed_relays(failed_relays: tuple[Any, ...]) -> str:
     return "; ".join(
         f"{failure.relay_url} ({failure.operation}): {failure.message}"
         for failure in failed_relays
+    )
+
+
+def _checkpoint_history_slot(round_index: int, checkpoint_history: int) -> int:
+    return round_index % checkpoint_history
+
+
+def _round_directory_index(path: Path) -> int | None:
+    if not path.is_dir() or not path.name.startswith("round-"):
+        return None
+    suffix = path.name.removeprefix("round-")
+    if not suffix.isdigit():
+        return None
+    return int(suffix)
+
+
+def _write_checkpoint_artifacts(
+    artifact_root: Path,
+    *,
+    checkpoint: TrainingCheckpoint,
+    checkpoint_event: Any,
+    checkpoint_publish: Any,
+    checkpoint_history: int,
+) -> int:
+    latest_round = checkpoint.next_round - 1
+    history_slot = _checkpoint_history_slot(latest_round, checkpoint_history)
+    checkpoints_dir = artifact_root / "checkpoints"
+    slot_label = f"slot-{history_slot:04d}"
+
+    _write_json(checkpoints_dir / "latest.json", checkpoint.to_json_obj())
+    _write_json(checkpoints_dir / "latest-event.json", checkpoint_event.to_json_obj())
+    _write_json(checkpoints_dir / "latest-publish.json", checkpoint_publish.to_json_obj())
+    _write_json(checkpoints_dir / f"{slot_label}.json", checkpoint.to_json_obj())
+    _write_json(checkpoints_dir / f"{slot_label}-event.json", checkpoint_event.to_json_obj())
+    _write_json(checkpoints_dir / f"{slot_label}-publish.json", checkpoint_publish.to_json_obj())
+    return history_slot
+
+
+def _apply_artifact_retention(
+    artifact_root: Path,
+    *,
+    checkpoint: TrainingCheckpoint,
+    checkpoint_history: int,
+    artifact_retention_rounds: int | None,
+    latest_checkpoint_slot: int,
+) -> None:
+    round_directories = sorted(
+        (
+            (round_index, path)
+            for path in artifact_root.iterdir()
+            if (round_index := _round_directory_index(path)) is not None
+        ),
+        key=lambda item: item[0],
+    )
+    pruned_rounds: list[int] = []
+    if artifact_retention_rounds is not None and len(round_directories) > artifact_retention_rounds:
+        for round_index, path in round_directories[:-artifact_retention_rounds]:
+            shutil.rmtree(path)
+            pruned_rounds.append(round_index)
+        round_directories = round_directories[-artifact_retention_rounds:]
+
+    active_checkpoint_rounds = checkpoint.rounds[-checkpoint_history:]
+    _write_json(
+        artifact_root / "retention.json",
+        {
+            "checkpoint_history": checkpoint_history,
+            "artifact_retention_rounds": artifact_retention_rounds,
+            "latest_round": checkpoint.next_round - 1,
+            "latest_checkpoint_slot": latest_checkpoint_slot,
+            "retained_rounds": [round_index for round_index, _ in round_directories],
+            "pruned_rounds": pruned_rounds,
+            "checkpoint_slots": [
+                {
+                    "slot": _checkpoint_history_slot(round_summary.round_index, checkpoint_history),
+                    "round": round_summary.round_index,
+                    "next_round": round_summary.round_index + 1,
+                    "model_hash_after": round_summary.model_hash_after,
+                }
+                for round_summary in active_checkpoint_rounds
+            ],
+        },
     )
 
 
@@ -820,6 +915,7 @@ async def run_training_session(
                 next_round=checkpoint.next_round,
                 model_hash=state_digest(checkpoint.current_state),
                 rounds_completed=checkpoint.rounds_completed,
+                history_slot=_checkpoint_history_slot(round_index, config.checkpoint_history),
                 created_at=checkpoint.updated_at,
             ),
             checkpoint.to_json_obj(),
@@ -875,6 +971,20 @@ async def run_training_session(
             _write_json(round_dir / "checkpoint.json", checkpoint.to_json_obj())
             _write_json(round_dir / "checkpoint-event.json", checkpoint_event.to_json_obj())
             _write_json(round_dir / "checkpoint-publish.json", checkpoint_publish.to_json_obj())
+            checkpoint_slot = _write_checkpoint_artifacts(
+                artifact_root,
+                checkpoint=checkpoint,
+                checkpoint_event=checkpoint_event,
+                checkpoint_publish=checkpoint_publish,
+                checkpoint_history=config.checkpoint_history,
+            )
+            _apply_artifact_retention(
+                artifact_root,
+                checkpoint=checkpoint,
+                checkpoint_history=config.checkpoint_history,
+                artifact_retention_rounds=config.artifact_retention_rounds,
+                latest_checkpoint_slot=checkpoint_slot,
+            )
         if checkpoint_out is not None:
             _write_json(Path(checkpoint_out), checkpoint.to_json_obj())
         late_scan_since = checkpoint.updated_at
@@ -888,5 +998,7 @@ async def run_training_session(
         final_state=current_state,
         final_momentum_state=current_momentum,
         rounds=tuple(round_summaries),
+        checkpoint_history=config.checkpoint_history,
+        artifact_retention_rounds=config.artifact_retention_rounds,
         late_gradients=tuple(late_gradients),
     )

@@ -215,6 +215,7 @@ class CollectedCheckpointEvent:
             "run": self.parsed.metadata.run_name,
             "worker": self.parsed.metadata.worker_id,
             "round": self.parsed.metadata.round_index,
+            "history_slot": self.parsed.metadata.history_slot,
             "next_round": self.parsed.metadata.next_round,
             "model": self.parsed.metadata.model_hash,
             "rounds_completed": self.parsed.metadata.rounds_completed,

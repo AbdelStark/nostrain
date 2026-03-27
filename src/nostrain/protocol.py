@@ -103,6 +103,7 @@ class CheckpointEventMetadata:
     next_round: int
     model_hash: str
     rounds_completed: int
+    history_slot: int | None = None
     created_at: int | None = None
 
     def __post_init__(self) -> None:
@@ -118,9 +119,15 @@ class CheckpointEventMetadata:
             raise ValueError("model hash cannot be empty")
         if self.rounds_completed <= 0:
             raise ValueError("rounds_completed must be positive")
+        if self.history_slot is not None and self.history_slot < 0:
+            raise ValueError("checkpoint history_slot must be non-negative")
 
     @property
     def parameterized_identifier(self) -> str:
+        if self.history_slot is not None:
+            return (
+                f"run:{self.run_name}:worker:{self.worker_id}:checkpoint:slot:{self.history_slot}"
+            )
         return f"run:{self.run_name}:worker:{self.worker_id}:checkpoint:round:{self.round_index}"
 
     @property
@@ -467,21 +474,27 @@ def build_checkpoint_event(
     if state_digest(ModelState.from_json_obj(checkpoint_data["current_state"])) != metadata.model_hash:
         raise ValueError("checkpoint model hash does not match checkpoint event metadata")
 
-    tags: tuple[NostrTag, ...] = (
+    tags: list[NostrTag] = [
         ("d", metadata.parameterized_identifier),
         ("t", NOSTRAIN_MARKER),
         ("run", metadata.run_name),
         ("worker", metadata.worker_id),
         ("round", str(metadata.round_index)),
-        ("next-round", str(metadata.next_round)),
-        ("model", metadata.model_hash),
-        ("rounds-completed", str(metadata.rounds_completed)),
-        ("checkpoint", checkpoint_hash),
+    ]
+    if metadata.history_slot is not None:
+        tags.append(("slot", str(metadata.history_slot)))
+    tags.extend(
+        [
+            ("next-round", str(metadata.next_round)),
+            ("model", metadata.model_hash),
+            ("rounds-completed", str(metadata.rounds_completed)),
+            ("checkpoint", checkpoint_hash),
+        ]
     )
     return _build_signable_event(
         kind=NOSTRAIN_CHECKPOINT_KIND,
         created_at=metadata.resolved_created_at,
-        tags=tags,
+        tags=tuple(tags),
         content=content,
         secret_key_hex=secret_key_hex,
         public_key_hex=public_key_hex,
@@ -619,6 +632,7 @@ def parse_checkpoint_event(data: NostrainEvent | dict[str, Any]) -> ParsedCheckp
         next_round=int(tags["next-round"]),
         model_hash=tags["model"],
         rounds_completed=int(tags["rounds-completed"]),
+        history_slot=int(tags["slot"]) if "slot" in tags else None,
         created_at=event.created_at,
     )
     if tags["d"] != metadata.parameterized_identifier:
