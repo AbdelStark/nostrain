@@ -136,14 +136,26 @@ Delivered in the current repository state:
 
 This moves the project from a linear-only training prototype to a runtime-aware training system that can exercise a non-linear model through the same resilient relay/checkpoint path.
 
-## Next milestone: relay retry and backoff
+## Completed milestone: relay retry and backoff
 
-Goal: make multi-relay collection/publication more production-tolerant under transient failures.
+Delivered in the current repository state:
+
+- configurable retry/backoff policy for publish, discovery, collection, and late-gradient scans
+- idempotent duplicate-publish handling for retry-safe event publication after dropped relay ACKs
+- CLI flags for retry attempts and backoff shape across relay-facing commands
+- retry telemetry in relay JSON outputs plus `run-training` round/session summaries
+- integration tests covering transient publish disconnects, transient collection disconnects, CLI retry flags, and retry-aware training summaries
+
+This moves the project from partial-relay fault tolerance to transport flows that can recover from transient websocket failures without hiding what happened.
+
+## Next milestone: external runtime adapters
+
+Goal: connect the current deterministic built-in training loop to real framework runtimes without losing the protocol guarantees.
 
 Deliverables:
 
-- configurable retry and backoff policy for publish/collect/discovery operations
-- richer retry telemetry in CLI summaries and artifacts
+- adapter boundary for importing/exporting framework weights through the shared `ModelState` schema
+- at least one concrete external runtime path with conformance tests against the built-in runner contracts
 
 ## Deferred polish
 

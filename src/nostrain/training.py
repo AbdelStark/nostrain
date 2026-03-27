@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 from pathlib import Path
 import shutil
@@ -29,6 +29,7 @@ from .relay import (
     collect_late_gradient_events_across_relays,
     publish_nostrain_events,
 )
+from .retry import RelayRetryPolicy
 from .runtime import (
     DEFAULT_TRAINING_RUNTIME,
     LINEAR_BIAS_PARAMETER,
@@ -93,6 +94,7 @@ class TrainingWorkerConfig:
     advertised_relays: tuple[str, ...] = ()
     checkpoint_history: int = 4
     artifact_retention_rounds: int | None = None
+    relay_retry_policy: RelayRetryPolicy = field(default_factory=RelayRetryPolicy)
 
     def __post_init__(self) -> None:
         if not self.run_name:
@@ -153,6 +155,8 @@ class TrainingWorkerConfig:
             and self.artifact_retention_rounds <= 0
         ):
             raise ValueError("artifact retention rounds must be positive when provided")
+        if not isinstance(self.relay_retry_policy, RelayRetryPolicy):
+            raise ValueError("relay_retry_policy must be a RelayRetryPolicy instance")
         normalized_relays = tuple(
             dict.fromkeys(str(relay).strip() for relay in self.relay_urls if str(relay).strip())
         )
@@ -329,6 +333,9 @@ class TrainingRoundSummary:
     published_checkpoint_relays: tuple[str, ...]
     collected_from_relays: tuple[str, ...]
     failed_relays: tuple[str, ...]
+    relay_retry_count: int = 0
+    max_relay_attempt_count: int = 1
+    retried_relays: tuple[str, ...] = ()
     reconciled_late_gradient_count: int = 0
     reconciled_late_workers: tuple[str, ...] = ()
     reconciled_late_rounds: tuple[int, ...] = ()
@@ -362,6 +369,9 @@ class TrainingRoundSummary:
             "published_checkpoint_relays": list(self.published_checkpoint_relays),
             "collected_from_relays": list(self.collected_from_relays),
             "failed_relays": list(self.failed_relays),
+            "relay_retry_count": self.relay_retry_count,
+            "max_relay_attempt_count": self.max_relay_attempt_count,
+            "retried_relays": list(self.retried_relays),
             "reconciled_late_gradient_count": self.reconciled_late_gradient_count,
             "reconciled_late_workers": list(self.reconciled_late_workers),
             "reconciled_late_rounds": list(self.reconciled_late_rounds),
@@ -402,6 +412,9 @@ class TrainingRoundSummary:
                 str(relay) for relay in data.get("collected_from_relays", [])
             ),
             failed_relays=tuple(str(relay) for relay in data.get("failed_relays", [])),
+            relay_retry_count=int(data.get("relay_retry_count", 0)),
+            max_relay_attempt_count=int(data.get("max_relay_attempt_count", 1)),
+            retried_relays=tuple(str(relay) for relay in data.get("retried_relays", [])),
             reconciled_late_gradient_count=int(data.get("reconciled_late_gradient_count", 0)),
             reconciled_late_workers=tuple(
                 str(worker) for worker in data.get("reconciled_late_workers", [])
@@ -451,6 +464,26 @@ class TrainingSessionResult:
     def late_gradient_error_count(self) -> int:
         return sum(1 for record in self.late_gradients if record.reconciliation_error is not None)
 
+    @property
+    def relay_retry_count(self) -> int:
+        return sum(round_summary.relay_retry_count for round_summary in self.rounds)
+
+    @property
+    def max_relay_attempt_count(self) -> int:
+        if not self.rounds:
+            return 1
+        return max(round_summary.max_relay_attempt_count for round_summary in self.rounds)
+
+    @property
+    def retried_relays(self) -> tuple[str, ...]:
+        return tuple(
+            dict.fromkeys(
+                relay
+                for round_summary in self.rounds
+                for relay in round_summary.retried_relays
+            )
+        )
+
     def to_json_obj(
         self,
         *,
@@ -472,6 +505,9 @@ class TrainingSessionResult:
             "reconciled_late_gradient_count": self.reconciled_late_gradient_count,
             "pending_late_gradient_count": self.pending_late_gradient_count,
             "late_gradient_error_count": self.late_gradient_error_count,
+            "relay_retry_count": self.relay_retry_count,
+            "max_relay_attempt_count": self.max_relay_attempt_count,
+            "retried_relays": list(self.retried_relays),
         }
         if include_rounds:
             data["rounds"] = [round_summary.to_json_obj() for round_summary in self.rounds]
@@ -593,9 +629,37 @@ def _format_failed_relays(failed_relays: tuple[Any, ...]) -> str:
     if not failed_relays:
         return "no relay failures recorded"
     return "; ".join(
-        f"{failure.relay_url} ({failure.operation}): {failure.message}"
+        f"{failure.relay_url} ({failure.operation}, attempts={getattr(failure, 'attempt_count', 1)}): {failure.message}"
         for failure in failed_relays
     )
+
+
+def _result_retry_count(result: Any) -> int:
+    return int(getattr(result, "retry_count", max(0, int(getattr(result, "attempt_count", 1)) - 1)))
+
+
+def _result_attempt_count(result: Any) -> int:
+    return int(getattr(result, "attempt_count", 1))
+
+
+def _retry_stats(*results: Any) -> tuple[int, int, tuple[str, ...]]:
+    retry_count = 0
+    max_attempt_count = 1
+    retried_relays: list[str] = []
+
+    for result in results:
+        if result is None:
+            continue
+        retry_count += int(getattr(result, "total_retry_count", _result_retry_count(result)))
+        max_attempt_count = max(
+            max_attempt_count,
+            int(getattr(result, "max_attempt_count", _result_attempt_count(result))),
+        )
+        for relay in getattr(result, "retried_relays", ()):
+            if relay not in retried_relays:
+                retried_relays.append(str(relay))
+
+    return retry_count, max_attempt_count, tuple(retried_relays)
 
 
 def _checkpoint_history_slot(round_index: int, checkpoint_history: int) -> int:
@@ -902,6 +966,7 @@ async def run_training_session(
                 idle_timeout=min(config.late_gradient_timeout, config.round_timeout),
                 open_timeout=config.open_timeout,
                 since=late_scan_since + 1,
+                retry_policy=config.relay_retry_policy,
             )
             late_gradients = _merge_late_gradient_records(
                 late_gradients,
@@ -956,6 +1021,7 @@ async def run_training_session(
             heartbeat_event,
             open_timeout=config.open_timeout,
             reply_timeout=config.open_timeout,
+            retry_policy=config.relay_retry_policy,
         )
         if not heartbeat_publish.accepted:
             raise RuntimeError(
@@ -993,6 +1059,7 @@ async def run_training_session(
             gradient_event,
             open_timeout=config.open_timeout,
             reply_timeout=config.open_timeout,
+            retry_policy=config.relay_retry_policy,
         )
         if not gradient_publish.accepted:
             raise RuntimeError(
@@ -1012,6 +1079,7 @@ async def run_training_session(
             heartbeat_idle_timeout=config.round_timeout,
             heartbeat_since=round_start - 1,
             max_missed_heartbeats=config.max_missed_heartbeats,
+            retry_policy=config.relay_retry_policy,
         )
         if not collection.events:
             raise RuntimeError(
@@ -1050,6 +1118,12 @@ async def run_training_session(
 
         current_state = outer_result.next_state
         current_momentum = outer_result.momentum_state
+        round_retry_count, round_max_attempt_count, round_retried_relays = _retry_stats(
+            heartbeat_publish,
+            gradient_publish,
+            collection,
+            late_collection,
+        )
 
         checkpoint_round_summary = TrainingRoundSummary(
             round_index=round_index,
@@ -1071,6 +1145,9 @@ async def run_training_session(
             published_checkpoint_relays=(),
             collected_from_relays=collection.successful_relays,
             failed_relays=(),
+            relay_retry_count=round_retry_count,
+            max_relay_attempt_count=round_max_attempt_count,
+            retried_relays=round_retried_relays,
             reconciled_late_gradient_count=(
                 late_reconciliation.summary.event_count
                 if late_reconciliation.summary is not None
@@ -1144,6 +1221,14 @@ async def run_training_session(
             checkpoint_event,
             open_timeout=config.open_timeout,
             reply_timeout=config.open_timeout,
+            retry_policy=config.relay_retry_policy,
+        )
+        final_round_retry_count, final_max_attempt_count, final_retried_relays = _retry_stats(
+            heartbeat_publish,
+            gradient_publish,
+            collection,
+            checkpoint_publish,
+            late_collection,
         )
 
         failed_relay_urls = {
@@ -1180,6 +1265,9 @@ async def run_training_session(
                 failed_relays=tuple(
                     relay_url for relay_url in config.relay_urls if relay_url in failed_relay_urls
                 ),
+                relay_retry_count=final_round_retry_count,
+                max_relay_attempt_count=final_max_attempt_count,
+                retried_relays=final_retried_relays,
                 reconciled_late_gradient_count=(
                     late_reconciliation.summary.event_count
                     if late_reconciliation.summary is not None

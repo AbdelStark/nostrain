@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import secrets
 import time
-from typing import Any, Sequence
+from typing import Any, Awaitable, Callable, Iterable, Sequence, TypeVar
 
 from .aggregation import aggregate_deltas
 from .compression import decompress_payload
@@ -24,6 +24,7 @@ from .protocol import (
     parse_heartbeat_event,
     parse_nostrain_event,
 )
+from .retry import RelayRetryPolicy
 
 try:
     import websockets
@@ -32,6 +33,9 @@ except ImportError as exc:  # pragma: no cover - exercised in environments witho
     _WEBSOCKETS_IMPORT_ERROR = exc
 else:  # pragma: no cover - exercised implicitly by integration tests
     _WEBSOCKETS_IMPORT_ERROR = None
+
+
+T = TypeVar("T")
 
 
 def _require_websocket_support() -> None:
@@ -72,6 +76,92 @@ def _validate_sync_strategy(strategy: str) -> str:
     return normalized
 
 
+def _retry_count(attempt_count: int) -> int:
+    return max(0, attempt_count - 1)
+
+
+def _retry_json_fields(
+    attempt_count: int,
+    retry_delays: tuple[float, ...],
+    *,
+    recovered_after_retry: bool | None = None,
+) -> dict[str, Any]:
+    data: dict[str, Any] = {
+        "attempt_count": attempt_count,
+        "retry_count": _retry_count(attempt_count),
+        "retry_delays": list(retry_delays),
+    }
+    if recovered_after_retry is not None:
+        data["recovered_after_retry"] = recovered_after_retry
+    return data
+
+
+def _unique_strings(values: Iterable[str]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(value for value in values if value))
+
+
+class _RelayOperationFailed(RuntimeError):
+    def __init__(
+        self,
+        *,
+        relay_url: str,
+        operation: str,
+        cause: Exception,
+        attempt_count: int,
+        retry_delays: tuple[float, ...],
+    ) -> None:
+        self.relay_url = relay_url
+        self.operation = operation
+        self.cause = cause
+        self.attempt_count = attempt_count
+        self.retry_delays = retry_delays
+        super().__init__(
+            f"{operation} failed on {relay_url} after {attempt_count} attempt(s): "
+            f"{type(cause).__name__}: {cause}"
+        )
+
+
+async def _run_with_retry(
+    relay_url: str,
+    operation: str,
+    operation_factory: Callable[[], Awaitable[T]],
+    *,
+    retry_policy: RelayRetryPolicy | None,
+) -> tuple[T, int, tuple[float, ...]]:
+    policy = retry_policy or RelayRetryPolicy()
+    retry_delays: list[float] = []
+
+    for attempt_count in range(1, policy.max_attempts + 1):
+        try:
+            result = await operation_factory()
+            return result, attempt_count, tuple(retry_delays)
+        except Exception as exc:
+            if attempt_count >= policy.max_attempts:
+                raise _RelayOperationFailed(
+                    relay_url=relay_url,
+                    operation=operation,
+                    cause=exc,
+                    attempt_count=attempt_count,
+                    retry_delays=tuple(retry_delays),
+                ) from exc
+            retry_delay = policy.delay_for_retry(attempt_count)
+            retry_delays.append(retry_delay)
+            if retry_delay > 0:
+                await asyncio.sleep(retry_delay)
+
+    raise AssertionError("retry loop exhausted without returning or raising")
+
+
+def _is_idempotent_publish_rejection(message: str) -> bool:
+    normalized = message.strip().lower()
+    if not normalized:
+        return False
+    return any(
+        token in normalized
+        for token in ("duplicate", "already have", "already exists", "already stored")
+    )
+
+
 def _quorum_threshold(worker_count: int) -> int:
     return (worker_count // 2) + 1
 
@@ -83,15 +173,29 @@ class RelayPublishResult:
     accepted: bool
     message: str
     notices: tuple[str, ...] = ()
+    attempt_count: int = 1
+    retry_delays: tuple[float, ...] = ()
+
+    @property
+    def retry_count(self) -> int:
+        return _retry_count(self.attempt_count)
 
     def to_json_obj(self) -> dict[str, Any]:
-        return {
+        data = {
             "relay": self.relay_url,
             "event_id": self.event_id,
             "accepted": self.accepted,
             "message": self.message,
             "notices": list(self.notices),
         }
+        data.update(
+            _retry_json_fields(
+                self.attempt_count,
+                self.retry_delays,
+                recovered_after_retry=self.accepted and self.attempt_count > 1,
+            )
+        )
+        return data
 
 
 @dataclass(frozen=True)
@@ -99,13 +203,74 @@ class RelayOperationError:
     relay_url: str
     operation: str
     message: str
+    attempt_count: int = 1
+    retry_delays: tuple[float, ...] = ()
+
+    @property
+    def retry_count(self) -> int:
+        return _retry_count(self.attempt_count)
 
     def to_json_obj(self) -> dict[str, Any]:
-        return {
+        data = {
             "relay": self.relay_url,
             "operation": self.operation,
             "message": self.message,
         }
+        data.update(_retry_json_fields(self.attempt_count, self.retry_delays))
+        return data
+
+
+def _relay_operation_error_from_exception(
+    relay_url: str,
+    operation: str,
+    exc: Exception,
+) -> RelayOperationError:
+    if isinstance(exc, _RelayOperationFailed):
+        return RelayOperationError(
+            relay_url=exc.relay_url,
+            operation=exc.operation,
+            message=f"{type(exc.cause).__name__}: {exc.cause}",
+            attempt_count=exc.attempt_count,
+            retry_delays=exc.retry_delays,
+        )
+    return RelayOperationError(
+        relay_url=relay_url,
+        operation=operation,
+        message=f"{type(exc).__name__}: {exc}",
+    )
+
+
+def _aggregate_retry_count(
+    relay_results: Sequence[Any],
+    failed_relays: Sequence[RelayOperationError],
+) -> int:
+    return sum(
+        _retry_count(int(getattr(item, "attempt_count", 1)))
+        for item in (*relay_results, *failed_relays)
+    )
+
+
+def _aggregate_max_attempt_count(
+    relay_results: Sequence[Any],
+    failed_relays: Sequence[RelayOperationError],
+) -> int:
+    attempt_counts = [
+        int(getattr(item, "attempt_count", 1)) for item in (*relay_results, *failed_relays)
+    ]
+    if not attempt_counts:
+        return 1
+    return max(attempt_counts)
+
+
+def _aggregate_retried_relays(
+    relay_results: Sequence[Any],
+    failed_relays: Sequence[RelayOperationError],
+) -> tuple[str, ...]:
+    return _unique_strings(
+        str(getattr(item, "relay_url", ""))
+        for item in (*relay_results, *failed_relays)
+        if int(getattr(item, "attempt_count", 1)) > 1
+    )
 
 
 @dataclass(frozen=True)
@@ -130,6 +295,18 @@ class MultiRelayPublishResult:
     def accepted_relays(self) -> tuple[str, ...]:
         return tuple(result.relay_url for result in self.accepted_results if result.accepted)
 
+    @property
+    def total_retry_count(self) -> int:
+        return _aggregate_retry_count(self.accepted_results, self.failed_relays)
+
+    @property
+    def max_attempt_count(self) -> int:
+        return _aggregate_max_attempt_count(self.accepted_results, self.failed_relays)
+
+    @property
+    def retried_relays(self) -> tuple[str, ...]:
+        return _aggregate_retried_relays(self.accepted_results, self.failed_relays)
+
     def to_json_obj(self) -> dict[str, Any]:
         return {
             "relays": list(self.relay_urls),
@@ -137,6 +314,9 @@ class MultiRelayPublishResult:
             "accepted": self.accepted,
             "accepted_relays": list(self.accepted_relays),
             "accepted_count": len(self.accepted_relays),
+            "retried_relays": list(self.retried_relays),
+            "total_retry_count": self.total_retry_count,
+            "max_attempt_count": self.max_attempt_count,
             "failed_relays": [failure.to_json_obj() for failure in self.failed_relays],
             "results": [result.to_json_obj() for result in self.accepted_results],
         }
@@ -239,10 +419,28 @@ class HeartbeatCollectionResult:
     invalid_events: int
     stale_events: int
     notices: tuple[str, ...] = ()
+    attempt_count: int = 1
+    retry_delays: tuple[float, ...] = ()
 
     @property
     def worker_ids(self) -> tuple[str, ...]:
         return tuple(event.parsed.metadata.worker_id for event in self.events)
+
+    @property
+    def retry_count(self) -> int:
+        return _retry_count(self.attempt_count)
+
+    @property
+    def total_retry_count(self) -> int:
+        return self.retry_count
+
+    @property
+    def max_attempt_count(self) -> int:
+        return self.attempt_count
+
+    @property
+    def retried_relays(self) -> tuple[str, ...]:
+        return (self.relay_url,) if self.retry_count else ()
 
     def to_json_obj(self, *, include_events: bool = True) -> dict[str, Any]:
         data = {
@@ -256,6 +454,13 @@ class HeartbeatCollectionResult:
             "stale_events": self.stale_events,
             "notices": list(self.notices),
         }
+        data.update(
+            _retry_json_fields(
+                self.attempt_count,
+                self.retry_delays,
+                recovered_after_retry=self.attempt_count > 1,
+            )
+        )
         if include_events:
             data["events"] = [event.to_json_obj() for event in self.events]
         return data
@@ -285,10 +490,28 @@ class CheckpointCollectionResult:
     duplicates_discarded: int
     invalid_events: int
     notices: tuple[str, ...] = ()
+    attempt_count: int = 1
+    retry_delays: tuple[float, ...] = ()
 
     @property
     def worker_ids(self) -> tuple[str, ...]:
         return tuple(event.parsed.metadata.worker_id for event in self.events)
+
+    @property
+    def retry_count(self) -> int:
+        return _retry_count(self.attempt_count)
+
+    @property
+    def total_retry_count(self) -> int:
+        return self.retry_count
+
+    @property
+    def max_attempt_count(self) -> int:
+        return self.attempt_count
+
+    @property
+    def retried_relays(self) -> tuple[str, ...]:
+        return (self.relay_url,) if self.retry_count else ()
 
     @property
     def latest_event(self) -> CollectedCheckpointEvent | None:
@@ -305,6 +528,13 @@ class CheckpointCollectionResult:
             "invalid_events": self.invalid_events,
             "notices": list(self.notices),
         }
+        data.update(
+            _retry_json_fields(
+                self.attempt_count,
+                self.retry_delays,
+                recovered_after_retry=self.attempt_count > 1,
+            )
+        )
         if latest_event is not None:
             data["latest"] = latest_event.to_summary_obj()
         if include_events:
@@ -332,6 +562,18 @@ class MultiRelayCheckpointCollectionResult:
         return tuple(result.relay_url for result in self.relay_results)
 
     @property
+    def total_retry_count(self) -> int:
+        return _aggregate_retry_count(self.relay_results, self.failed_relays)
+
+    @property
+    def max_attempt_count(self) -> int:
+        return _aggregate_max_attempt_count(self.relay_results, self.failed_relays)
+
+    @property
+    def retried_relays(self) -> tuple[str, ...]:
+        return _aggregate_retried_relays(self.relay_results, self.failed_relays)
+
+    @property
     def latest_event(self) -> CollectedCheckpointEvent | None:
         return _latest_checkpoint_event(self.events)
 
@@ -345,6 +587,9 @@ class MultiRelayCheckpointCollectionResult:
             "workers": list(self.worker_ids),
             "duplicates_discarded": self.duplicates_discarded,
             "invalid_events": self.invalid_events,
+            "retried_relays": list(self.retried_relays),
+            "total_retry_count": self.total_retry_count,
+            "max_attempt_count": self.max_attempt_count,
             "failed_relays": [failure.to_json_obj() for failure in self.failed_relays],
             "notices": list(self.notices),
             "relay_results": [
@@ -379,6 +624,18 @@ class MultiRelayHeartbeatCollectionResult:
     def successful_relays(self) -> tuple[str, ...]:
         return tuple(result.relay_url for result in self.relay_results)
 
+    @property
+    def total_retry_count(self) -> int:
+        return _aggregate_retry_count(self.relay_results, self.failed_relays)
+
+    @property
+    def max_attempt_count(self) -> int:
+        return _aggregate_max_attempt_count(self.relay_results, self.failed_relays)
+
+    @property
+    def retried_relays(self) -> tuple[str, ...]:
+        return _aggregate_retried_relays(self.relay_results, self.failed_relays)
+
     def to_json_obj(self, *, include_events: bool = True) -> dict[str, Any]:
         data = {
             "relays": list(self.relay_urls),
@@ -390,6 +647,9 @@ class MultiRelayHeartbeatCollectionResult:
             "duplicates_discarded": self.duplicates_discarded,
             "invalid_events": self.invalid_events,
             "stale_events": self.stale_events,
+            "retried_relays": list(self.retried_relays),
+            "total_retry_count": self.total_retry_count,
+            "max_attempt_count": self.max_attempt_count,
             "failed_relays": [failure.to_json_obj() for failure in self.failed_relays],
             "notices": list(self.notices),
             "relay_results": [
@@ -413,10 +673,45 @@ class RelayCollectionResult:
     known_workers: tuple[str, ...] = ()
     sync_strategy: str = "timeout"
     completion_reason: str = "idle-timeout"
+    heartbeat_collection: HeartbeatCollectionResult | None = None
+    attempt_count: int = 1
+    retry_delays: tuple[float, ...] = ()
 
     @property
     def worker_ids(self) -> tuple[str, ...]:
         return tuple(event.parsed.metadata.worker_id for event in self.events)
+
+    @property
+    def retry_count(self) -> int:
+        return _retry_count(self.attempt_count)
+
+    @property
+    def total_retry_count(self) -> int:
+        return self.retry_count + (
+            self.heartbeat_collection.total_retry_count if self.heartbeat_collection is not None else 0
+        )
+
+    @property
+    def max_attempt_count(self) -> int:
+        heartbeat_attempts = (
+            self.heartbeat_collection.max_attempt_count
+            if self.heartbeat_collection is not None
+            else 1
+        )
+        return max(self.attempt_count, heartbeat_attempts)
+
+    @property
+    def retried_relays(self) -> tuple[str, ...]:
+        return _unique_strings(
+            (
+                self.relay_url if self.retry_count else "",
+                *(
+                    self.heartbeat_collection.retried_relays
+                    if self.heartbeat_collection is not None
+                    else ()
+                ),
+            )
+        )
 
     def aggregate_delta(self) -> ModelState:
         if not self.events:
@@ -437,8 +732,20 @@ class RelayCollectionResult:
             "invalid_events": self.invalid_events,
             "sync_strategy": self.sync_strategy,
             "completion_reason": self.completion_reason,
+            "retried_relays": list(self.retried_relays),
+            "total_retry_count": self.total_retry_count,
+            "max_attempt_count": self.max_attempt_count,
             "notices": list(self.notices),
         }
+        data.update(
+            _retry_json_fields(
+                self.attempt_count,
+                self.retry_delays,
+                recovered_after_retry=self.attempt_count > 1,
+            )
+        )
+        if self.heartbeat_collection is not None:
+            data["heartbeat_discovery"] = self.heartbeat_collection.to_json_obj(include_events=False)
         if include_events:
             data["events"] = [event.to_json_obj() for event in self.events]
         return data
@@ -458,6 +765,7 @@ class MultiRelayCollectionResult:
     completion_reason: str = "idle-timeout"
     failed_relays: tuple[RelayOperationError, ...] = ()
     relay_results: tuple[RelayCollectionResult, ...] = ()
+    heartbeat_collection: MultiRelayHeartbeatCollectionResult | None = None
 
     @property
     def worker_ids(self) -> tuple[str, ...]:
@@ -466,6 +774,40 @@ class MultiRelayCollectionResult:
     @property
     def successful_relays(self) -> tuple[str, ...]:
         return tuple(result.relay_url for result in self.relay_results)
+
+    @property
+    def total_retry_count(self) -> int:
+        total = _aggregate_retry_count(self.relay_results, self.failed_relays)
+        if self.heartbeat_collection is not None:
+            total += sum(result.retry_count for result in self.heartbeat_collection.relay_results)
+        return total
+
+    @property
+    def max_attempt_count(self) -> int:
+        heartbeat_attempts = (
+            max(
+                (result.attempt_count for result in self.heartbeat_collection.relay_results),
+                default=1,
+            )
+            if self.heartbeat_collection is not None
+            else 1
+        )
+        return max(
+            _aggregate_max_attempt_count(self.relay_results, self.failed_relays),
+            heartbeat_attempts,
+        )
+
+    @property
+    def retried_relays(self) -> tuple[str, ...]:
+        heartbeat_relays = (
+            self.heartbeat_collection.retried_relays if self.heartbeat_collection is not None else ()
+        )
+        return _unique_strings(
+            (
+                *_aggregate_retried_relays(self.relay_results, self.failed_relays),
+                *heartbeat_relays,
+            )
+        )
 
     def aggregate_delta(self) -> ModelState:
         if not self.events:
@@ -487,12 +829,17 @@ class MultiRelayCollectionResult:
             "invalid_events": self.invalid_events,
             "sync_strategy": self.sync_strategy,
             "completion_reason": self.completion_reason,
+            "retried_relays": list(self.retried_relays),
+            "total_retry_count": self.total_retry_count,
+            "max_attempt_count": self.max_attempt_count,
             "failed_relays": [failure.to_json_obj() for failure in self.failed_relays],
             "notices": list(self.notices),
             "relay_results": [
                 result.to_json_obj(include_events=False) for result in self.relay_results
             ],
         }
+        if self.heartbeat_collection is not None:
+            data["heartbeat_discovery"] = self.heartbeat_collection.to_json_obj(include_events=False)
         if include_events:
             data["events"] = [event.to_json_obj() for event in self.events]
         return data
@@ -507,6 +854,8 @@ class LateGradientCollectionResult:
     duplicates_discarded: int
     invalid_events: int
     notices: tuple[str, ...] = ()
+    attempt_count: int = 1
+    retry_delays: tuple[float, ...] = ()
 
     @property
     def worker_ids(self) -> tuple[str, ...]:
@@ -515,6 +864,22 @@ class LateGradientCollectionResult:
     @property
     def round_indices(self) -> tuple[int, ...]:
         return tuple(dict.fromkeys(event.parsed.metadata.round_index for event in self.events))
+
+    @property
+    def retry_count(self) -> int:
+        return _retry_count(self.attempt_count)
+
+    @property
+    def total_retry_count(self) -> int:
+        return self.retry_count
+
+    @property
+    def max_attempt_count(self) -> int:
+        return self.attempt_count
+
+    @property
+    def retried_relays(self) -> tuple[str, ...]:
+        return (self.relay_url,) if self.retry_count else ()
 
     def to_json_obj(self, *, include_events: bool = True) -> dict[str, Any]:
         data = {
@@ -528,6 +893,13 @@ class LateGradientCollectionResult:
             "invalid_events": self.invalid_events,
             "notices": list(self.notices),
         }
+        data.update(
+            _retry_json_fields(
+                self.attempt_count,
+                self.retry_delays,
+                recovered_after_retry=self.attempt_count > 1,
+            )
+        )
         if include_events:
             data["events"] = [event.to_json_obj() for event in self.events]
         return data
@@ -557,6 +929,18 @@ class MultiRelayLateGradientCollectionResult:
     def successful_relays(self) -> tuple[str, ...]:
         return tuple(result.relay_url for result in self.relay_results)
 
+    @property
+    def total_retry_count(self) -> int:
+        return _aggregate_retry_count(self.relay_results, self.failed_relays)
+
+    @property
+    def max_attempt_count(self) -> int:
+        return _aggregate_max_attempt_count(self.relay_results, self.failed_relays)
+
+    @property
+    def retried_relays(self) -> tuple[str, ...]:
+        return _aggregate_retried_relays(self.relay_results, self.failed_relays)
+
     def to_json_obj(self, *, include_events: bool = True) -> dict[str, Any]:
         data = {
             "relays": list(self.relay_urls),
@@ -568,6 +952,9 @@ class MultiRelayLateGradientCollectionResult:
             "rounds": list(self.round_indices),
             "duplicates_discarded": self.duplicates_discarded,
             "invalid_events": self.invalid_events,
+            "retried_relays": list(self.retried_relays),
+            "total_retry_count": self.total_retry_count,
+            "max_attempt_count": self.max_attempt_count,
             "failed_relays": [failure.to_json_obj() for failure in self.failed_relays],
             "notices": list(self.notices),
             "relay_results": [
@@ -594,17 +981,24 @@ async def publish_gradient_event(
     *,
     open_timeout: float = 10.0,
     reply_timeout: float = 10.0,
+    retry_policy: RelayRetryPolicy | None = None,
 ) -> RelayPublishResult:
     _require_websocket_support()
 
     nostrain_event = event if isinstance(event, NostrainEvent) else NostrainEvent.from_json_obj(event)
     parse_gradient_event(nostrain_event)
-    return await _publish_validated_event(
+    result, attempt_count, retry_delays = await _run_with_retry(
         relay_url,
-        nostrain_event,
-        open_timeout=open_timeout,
-        reply_timeout=reply_timeout,
+        "publish",
+        lambda: _publish_validated_event_once(
+            relay_url,
+            nostrain_event,
+            open_timeout=open_timeout,
+            reply_timeout=reply_timeout,
+        ),
+        retry_policy=retry_policy,
     )
+    return replace(result, attempt_count=attempt_count, retry_delays=retry_delays)
 
 
 async def publish_heartbeat_event(
@@ -613,17 +1007,24 @@ async def publish_heartbeat_event(
     *,
     open_timeout: float = 10.0,
     reply_timeout: float = 10.0,
+    retry_policy: RelayRetryPolicy | None = None,
 ) -> RelayPublishResult:
     _require_websocket_support()
 
     nostrain_event = event if isinstance(event, NostrainEvent) else NostrainEvent.from_json_obj(event)
     parse_heartbeat_event(nostrain_event)
-    return await _publish_validated_event(
+    result, attempt_count, retry_delays = await _run_with_retry(
         relay_url,
-        nostrain_event,
-        open_timeout=open_timeout,
-        reply_timeout=reply_timeout,
+        "publish",
+        lambda: _publish_validated_event_once(
+            relay_url,
+            nostrain_event,
+            open_timeout=open_timeout,
+            reply_timeout=reply_timeout,
+        ),
+        retry_policy=retry_policy,
     )
+    return replace(result, attempt_count=attempt_count, retry_delays=retry_delays)
 
 
 async def publish_checkpoint_event(
@@ -632,17 +1033,24 @@ async def publish_checkpoint_event(
     *,
     open_timeout: float = 10.0,
     reply_timeout: float = 10.0,
+    retry_policy: RelayRetryPolicy | None = None,
 ) -> RelayPublishResult:
     _require_websocket_support()
 
     nostrain_event = event if isinstance(event, NostrainEvent) else NostrainEvent.from_json_obj(event)
     parse_checkpoint_event(nostrain_event)
-    return await _publish_validated_event(
+    result, attempt_count, retry_delays = await _run_with_retry(
         relay_url,
-        nostrain_event,
-        open_timeout=open_timeout,
-        reply_timeout=reply_timeout,
+        "publish",
+        lambda: _publish_validated_event_once(
+            relay_url,
+            nostrain_event,
+            open_timeout=open_timeout,
+            reply_timeout=reply_timeout,
+        ),
+        retry_policy=retry_policy,
     )
+    return replace(result, attempt_count=attempt_count, retry_delays=retry_delays)
 
 
 async def publish_nostrain_event(
@@ -651,17 +1059,24 @@ async def publish_nostrain_event(
     *,
     open_timeout: float = 10.0,
     reply_timeout: float = 10.0,
+    retry_policy: RelayRetryPolicy | None = None,
 ) -> RelayPublishResult:
     _require_websocket_support()
 
     nostrain_event = event if isinstance(event, NostrainEvent) else NostrainEvent.from_json_obj(event)
     parse_nostrain_event(nostrain_event)
-    return await _publish_validated_event(
+    result, attempt_count, retry_delays = await _run_with_retry(
         relay_url,
-        nostrain_event,
-        open_timeout=open_timeout,
-        reply_timeout=reply_timeout,
+        "publish",
+        lambda: _publish_validated_event_once(
+            relay_url,
+            nostrain_event,
+            open_timeout=open_timeout,
+            reply_timeout=reply_timeout,
+        ),
+        retry_policy=retry_policy,
     )
+    return replace(result, attempt_count=attempt_count, retry_delays=retry_delays)
 
 
 async def publish_nostrain_events(
@@ -671,6 +1086,7 @@ async def publish_nostrain_events(
     open_timeout: float = 10.0,
     reply_timeout: float = 10.0,
     require_all: bool = False,
+    retry_policy: RelayRetryPolicy | None = None,
 ) -> MultiRelayPublishResult:
     normalized_relays = _normalize_relay_urls(relay_urls)
     nostrain_event = event if isinstance(event, NostrainEvent) else NostrainEvent.from_json_obj(event)
@@ -683,6 +1099,7 @@ async def publish_nostrain_events(
                 nostrain_event,
                 open_timeout=open_timeout,
                 reply_timeout=reply_timeout,
+                retry_policy=retry_policy,
             )
             for relay_url in normalized_relays
         ],
@@ -693,13 +1110,7 @@ async def publish_nostrain_events(
     failed_relays: list[RelayOperationError] = []
     for relay_url, result in zip(normalized_relays, results):
         if isinstance(result, Exception):
-            failed_relays.append(
-                RelayOperationError(
-                    relay_url=relay_url,
-                    operation="publish",
-                    message=f"{type(result).__name__}: {result}",
-                )
-            )
+            failed_relays.append(_relay_operation_error_from_exception(relay_url, "publish", result))
             continue
         if not result.accepted:
             failed_relays.append(
@@ -707,6 +1118,8 @@ async def publish_nostrain_events(
                     relay_url=relay_url,
                     operation="publish",
                     message=result.message,
+                    attempt_count=result.attempt_count,
+                    retry_delays=result.retry_delays,
                 )
             )
             continue
@@ -721,7 +1134,7 @@ async def publish_nostrain_events(
     )
 
 
-async def _publish_validated_event(
+async def _publish_validated_event_once(
     relay_url: str,
     event: NostrainEvent,
     *,
@@ -747,11 +1160,15 @@ async def _publish_validated_event(
                 continue
             if message_type != "OK":
                 raise ValueError(f"unexpected relay response while publishing: {message_type!r}")
+            accepted = bool(frame[2]) if len(frame) > 2 else False
+            message = str(frame[3]) if len(frame) > 3 else ""
+            if not accepted and _is_idempotent_publish_rejection(message):
+                accepted = True
             return RelayPublishResult(
                 relay_url=relay_url,
                 event_id=str(frame[1]) if len(frame) > 1 else event_id,
-                accepted=bool(frame[2]) if len(frame) > 2 else False,
-                message=str(frame[3]) if len(frame) > 3 else "",
+                accepted=accepted,
+                message=message,
                 notices=tuple(notices),
             )
 
@@ -776,6 +1193,7 @@ async def collect_heartbeat_events(
     since: int | None = None,
     reference_time: int | None = None,
     max_missed_heartbeats: int = 3,
+    retry_policy: RelayRetryPolicy | None = None,
 ) -> HeartbeatCollectionResult:
     _require_websocket_support()
 
@@ -785,7 +1203,35 @@ async def collect_heartbeat_events(
         raise ValueError("idle_timeout must be positive")
     if max_missed_heartbeats <= 0:
         raise ValueError("max_missed_heartbeats must be positive")
+    result, attempt_count, retry_delays = await _run_with_retry(
+        relay_url,
+        "collect-heartbeats",
+        lambda: _collect_heartbeat_events_once(
+            relay_url,
+            run_name=run_name,
+            target_round=target_round,
+            idle_timeout=idle_timeout,
+            open_timeout=open_timeout,
+            since=since,
+            reference_time=reference_time,
+            max_missed_heartbeats=max_missed_heartbeats,
+        ),
+        retry_policy=retry_policy,
+    )
+    return replace(result, attempt_count=attempt_count, retry_delays=retry_delays)
 
+
+async def _collect_heartbeat_events_once(
+    relay_url: str,
+    *,
+    run_name: str,
+    target_round: int | None = None,
+    idle_timeout: float = 2.0,
+    open_timeout: float = 10.0,
+    since: int | None = None,
+    reference_time: int | None = None,
+    max_missed_heartbeats: int = 3,
+) -> HeartbeatCollectionResult:
     subscription_id = _subscription_id()
     relay_filter: dict[str, Any] = {
         "kinds": [NOSTRAIN_HEARTBEAT_KIND],
@@ -952,6 +1398,7 @@ async def collect_heartbeat_events_across_relays(
     since: int | None = None,
     reference_time: int | None = None,
     max_missed_heartbeats: int = 3,
+    retry_policy: RelayRetryPolicy | None = None,
 ) -> MultiRelayHeartbeatCollectionResult:
     normalized_relays = _normalize_relay_urls(relay_urls)
     results = await asyncio.gather(
@@ -965,6 +1412,7 @@ async def collect_heartbeat_events_across_relays(
                 since=since,
                 reference_time=reference_time,
                 max_missed_heartbeats=max_missed_heartbeats,
+                retry_policy=retry_policy,
             )
             for relay_url in normalized_relays
         ],
@@ -976,11 +1424,7 @@ async def collect_heartbeat_events_across_relays(
     for relay_url, result in zip(normalized_relays, results):
         if isinstance(result, Exception):
             failed_relays.append(
-                RelayOperationError(
-                    relay_url=relay_url,
-                    operation="collect-heartbeats",
-                    message=f"{type(result).__name__}: {result}",
-                )
+                _relay_operation_error_from_exception(relay_url, "collect-heartbeats", result)
             )
             continue
         relay_results.append(result)
@@ -1003,6 +1447,7 @@ async def collect_checkpoint_events(
     idle_timeout: float = 2.0,
     open_timeout: float = 10.0,
     since: int | None = None,
+    retry_policy: RelayRetryPolicy | None = None,
 ) -> CheckpointCollectionResult:
     _require_websocket_support()
 
@@ -1010,7 +1455,33 @@ async def collect_checkpoint_events(
         raise ValueError("min_round must be non-negative when provided")
     if idle_timeout <= 0:
         raise ValueError("idle_timeout must be positive")
+    result, attempt_count, retry_delays = await _run_with_retry(
+        relay_url,
+        "collect-checkpoints",
+        lambda: _collect_checkpoint_events_once(
+            relay_url,
+            run_name=run_name,
+            min_round=min_round,
+            worker_id=worker_id,
+            idle_timeout=idle_timeout,
+            open_timeout=open_timeout,
+            since=since,
+        ),
+        retry_policy=retry_policy,
+    )
+    return replace(result, attempt_count=attempt_count, retry_delays=retry_delays)
 
+
+async def _collect_checkpoint_events_once(
+    relay_url: str,
+    *,
+    run_name: str,
+    min_round: int | None = None,
+    worker_id: str | None = None,
+    idle_timeout: float = 2.0,
+    open_timeout: float = 10.0,
+    since: int | None = None,
+) -> CheckpointCollectionResult:
     subscription_id = _subscription_id()
     relay_filter: dict[str, Any] = {
         "kinds": [NOSTRAIN_CHECKPOINT_KIND],
@@ -1162,6 +1633,7 @@ async def collect_checkpoint_events_across_relays(
     idle_timeout: float = 2.0,
     open_timeout: float = 10.0,
     since: int | None = None,
+    retry_policy: RelayRetryPolicy | None = None,
 ) -> MultiRelayCheckpointCollectionResult:
     normalized_relays = _normalize_relay_urls(relay_urls)
     results = await asyncio.gather(
@@ -1174,6 +1646,7 @@ async def collect_checkpoint_events_across_relays(
                 idle_timeout=idle_timeout,
                 open_timeout=open_timeout,
                 since=since,
+                retry_policy=retry_policy,
             )
             for relay_url in normalized_relays
         ],
@@ -1185,11 +1658,7 @@ async def collect_checkpoint_events_across_relays(
     for relay_url, result in zip(normalized_relays, results):
         if isinstance(result, Exception):
             failed_relays.append(
-                RelayOperationError(
-                    relay_url=relay_url,
-                    operation="collect-checkpoints",
-                    message=f"{type(result).__name__}: {result}",
-                )
+                _relay_operation_error_from_exception(relay_url, "collect-checkpoints", result)
             )
             continue
         relay_results.append(result)
@@ -1236,6 +1705,7 @@ async def collect_gradient_events(
     heartbeat_since: int | None = None,
     reference_time: int | None = None,
     max_missed_heartbeats: int = 3,
+    retry_policy: RelayRetryPolicy | None = None,
 ) -> RelayCollectionResult:
     _require_websocket_support()
 
@@ -1251,6 +1721,58 @@ async def collect_gradient_events(
         raise ValueError("max_missed_heartbeats must be positive")
     strategy = _validate_sync_strategy(strategy)
 
+    heartbeat_collection = None
+    if discover_workers or strategy in {"strict", "quorum"}:
+        heartbeat_collection = await collect_heartbeat_events(
+            relay_url,
+            run_name=run_name,
+            target_round=round_index,
+            idle_timeout=heartbeat_idle_timeout or idle_timeout,
+            open_timeout=open_timeout,
+            since=heartbeat_since if heartbeat_since is not None else since,
+            reference_time=reference_time,
+            max_missed_heartbeats=max_missed_heartbeats,
+            retry_policy=retry_policy,
+        )
+
+    result, attempt_count, retry_delays = await _run_with_retry(
+        relay_url,
+        "collect-gradients",
+        lambda: _collect_gradient_events_once(
+            relay_url,
+            run_name=run_name,
+            round_index=round_index,
+            max_events=max_events,
+            idle_timeout=idle_timeout,
+            open_timeout=open_timeout,
+            since=since,
+            strategy=strategy,
+            known_workers=heartbeat_collection.worker_ids if heartbeat_collection is not None else (),
+            initial_notices=heartbeat_collection.notices if heartbeat_collection is not None else (),
+        ),
+        retry_policy=retry_policy,
+    )
+    return replace(
+        result,
+        heartbeat_collection=heartbeat_collection,
+        attempt_count=attempt_count,
+        retry_delays=retry_delays,
+    )
+
+
+async def _collect_gradient_events_once(
+    relay_url: str,
+    *,
+    run_name: str,
+    round_index: int,
+    max_events: int | None = None,
+    idle_timeout: float = 2.0,
+    open_timeout: float = 10.0,
+    since: int | None = None,
+    strategy: str = "timeout",
+    known_workers: tuple[str, ...] = (),
+    initial_notices: tuple[str, ...] = (),
+) -> RelayCollectionResult:
     subscription_id = _subscription_id()
     relay_filter: dict[str, Any] = {
         "kinds": [NOSTRAIN_GRADIENT_KIND],
@@ -1264,21 +1786,7 @@ async def collect_gradient_events(
     selected: dict[str, CollectedGradientEvent] = {}
     duplicates_discarded = 0
     invalid_events = 0
-    notices: list[str] = []
-    known_workers: tuple[str, ...] = ()
-    if discover_workers or strategy in {"strict", "quorum"}:
-        heartbeats = await collect_heartbeat_events(
-            relay_url,
-            run_name=run_name,
-            target_round=round_index,
-            idle_timeout=heartbeat_idle_timeout or idle_timeout,
-            open_timeout=open_timeout,
-            since=heartbeat_since if heartbeat_since is not None else since,
-            reference_time=reference_time,
-            max_missed_heartbeats=max_missed_heartbeats,
-        )
-        known_workers = heartbeats.worker_ids
-        notices.extend(heartbeats.notices)
+    notices: list[str] = list(initial_notices)
     completion_reason = "idle-timeout"
     saw_eose = False
 
@@ -1399,6 +1907,7 @@ def _merge_gradient_results(
     known_workers: tuple[str, ...],
     failed_relays: Sequence[RelayOperationError],
     notices: Sequence[str],
+    heartbeat_collection: MultiRelayHeartbeatCollectionResult | None = None,
 ) -> MultiRelayCollectionResult:
     selected: dict[str, CollectedGradientEvent] = {}
     duplicates_discarded = sum(result.duplicates_discarded for result in relay_results)
@@ -1457,6 +1966,7 @@ def _merge_gradient_results(
         completion_reason=completion_reason,
         failed_relays=tuple(failed_relays),
         relay_results=tuple(relay_results),
+        heartbeat_collection=heartbeat_collection,
     )
 
 
@@ -1475,6 +1985,7 @@ async def collect_gradient_events_across_relays(
     heartbeat_since: int | None = None,
     reference_time: int | None = None,
     max_missed_heartbeats: int = 3,
+    retry_policy: RelayRetryPolicy | None = None,
 ) -> MultiRelayCollectionResult:
     normalized_relays = _normalize_relay_urls(relay_urls)
     strategy = _validate_sync_strategy(strategy)
@@ -1482,6 +1993,7 @@ async def collect_gradient_events_across_relays(
     known_workers: tuple[str, ...] = ()
     notices: list[str] = []
     failed_relays: list[RelayOperationError] = []
+    heartbeat_results = None
     if discover_workers or strategy in {"strict", "quorum"}:
         heartbeat_results = await collect_heartbeat_events_across_relays(
             normalized_relays,
@@ -1492,6 +2004,7 @@ async def collect_gradient_events_across_relays(
             since=heartbeat_since if heartbeat_since is not None else since,
             reference_time=reference_time,
             max_missed_heartbeats=max_missed_heartbeats,
+            retry_policy=retry_policy,
         )
         known_workers = heartbeat_results.worker_ids
         notices.extend(heartbeat_results.notices)
@@ -1514,6 +2027,7 @@ async def collect_gradient_events_across_relays(
                 heartbeat_since=heartbeat_since,
                 reference_time=reference_time,
                 max_missed_heartbeats=max_missed_heartbeats,
+                retry_policy=retry_policy,
             )
             for relay_url in normalized_relays
         ],
@@ -1524,11 +2038,7 @@ async def collect_gradient_events_across_relays(
     for relay_url, result in zip(normalized_relays, results):
         if isinstance(result, Exception):
             failed_relays.append(
-                RelayOperationError(
-                    relay_url=relay_url,
-                    operation="collect-gradients",
-                    message=f"{type(result).__name__}: {result}",
-                )
+                _relay_operation_error_from_exception(relay_url, "collect-gradients", result)
             )
             continue
         relay_results.append(result)
@@ -1543,6 +2053,7 @@ async def collect_gradient_events_across_relays(
         known_workers=known_workers,
         failed_relays=failed_relays,
         notices=notices,
+        heartbeat_collection=heartbeat_results,
     )
 
 
@@ -1554,6 +2065,7 @@ async def collect_late_gradient_events(
     idle_timeout: float = 0.2,
     open_timeout: float = 10.0,
     since: int | None = None,
+    retry_policy: RelayRetryPolicy | None = None,
 ) -> LateGradientCollectionResult:
     _require_websocket_support()
 
@@ -1570,7 +2082,31 @@ async def collect_late_gradient_events(
             duplicates_discarded=0,
             invalid_events=0,
         )
+    result, attempt_count, retry_delays = await _run_with_retry(
+        relay_url,
+        "collect-late-gradients",
+        lambda: _collect_late_gradient_events_once(
+            relay_url,
+            run_name=run_name,
+            current_round=current_round,
+            idle_timeout=idle_timeout,
+            open_timeout=open_timeout,
+            since=since,
+        ),
+        retry_policy=retry_policy,
+    )
+    return replace(result, attempt_count=attempt_count, retry_delays=retry_delays)
 
+
+async def _collect_late_gradient_events_once(
+    relay_url: str,
+    *,
+    run_name: str,
+    current_round: int,
+    idle_timeout: float = 0.2,
+    open_timeout: float = 10.0,
+    since: int | None = None,
+) -> LateGradientCollectionResult:
     subscription_id = _subscription_id()
     relay_filter: dict[str, Any] = {
         "kinds": [NOSTRAIN_GRADIENT_KIND],
@@ -1722,6 +2258,7 @@ async def collect_late_gradient_events_across_relays(
     idle_timeout: float = 0.2,
     open_timeout: float = 10.0,
     since: int | None = None,
+    retry_policy: RelayRetryPolicy | None = None,
 ) -> MultiRelayLateGradientCollectionResult:
     normalized_relays = _normalize_relay_urls(relay_urls)
     results = await asyncio.gather(
@@ -1733,6 +2270,7 @@ async def collect_late_gradient_events_across_relays(
                 idle_timeout=idle_timeout,
                 open_timeout=open_timeout,
                 since=since,
+                retry_policy=retry_policy,
             )
             for relay_url in normalized_relays
         ],
@@ -1744,11 +2282,7 @@ async def collect_late_gradient_events_across_relays(
     for relay_url, result in zip(normalized_relays, results):
         if isinstance(result, Exception):
             failed_relays.append(
-                RelayOperationError(
-                    relay_url=relay_url,
-                    operation="collect-late-gradients",
-                    message=f"{type(result).__name__}: {result}",
-                )
+                _relay_operation_error_from_exception(relay_url, "collect-late-gradients", result)
             )
             continue
         relay_results.append(result)

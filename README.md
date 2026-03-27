@@ -2,7 +2,7 @@
 
 Distributed ML training over Nostr relays.
 
-The project vision is still the same: no coordinator, no central server, just workers exchanging sparse pseudo-gradients through Nostr. The repository now ships the protocol/payload toolkit, a signed relay transport slice, and a resilient end-to-end training runner: model snapshots, DiLoCo-style deltas, sparse transport payloads, NIP-01-compatible nostrain gradient/heartbeat/checkpoint events, relay collection with active-worker discovery, cross-relay deduplication, resumable checkpoints, relay-visible checkpoint distribution, deferred late-gradient reconciliation, plus runtime-pluggable built-in workers for both linear and non-linear regression over one or more relays.
+The project vision is still the same: no coordinator, no central server, just workers exchanging sparse pseudo-gradients through Nostr. The repository now ships the protocol/payload toolkit, a signed relay transport slice, and a resilient end-to-end training runner: model snapshots, DiLoCo-style deltas, sparse transport payloads, NIP-01-compatible nostrain gradient/heartbeat/checkpoint events, relay collection with active-worker discovery, cross-relay deduplication, resumable checkpoints, relay-visible checkpoint distribution, deferred late-gradient reconciliation, configurable relay retry/backoff, plus runtime-pluggable built-in workers for both linear and non-linear regression over one or more relays.
 
 ## Current status
 
@@ -20,6 +20,8 @@ The project vision is still the same: no coordinator, no central server, just wo
 - active worker discovery with stale-heartbeat filtering
 - replay-safe event collection and round aggregation over a relay
 - cross-relay publish redundancy and replay-safe collection deduplication
+- configurable relay retry/backoff across publish, discovery, and collection operations
+- idempotent duplicate-publish handling plus retry telemetry in CLI summaries and training artifacts
 - round sync strategies (`timeout`, `strict`, `quorum`, `async`) driven by discovered workers
 - a deterministic JSON dataset format for built-in regression workloads
 - pluggable built-in runtimes for `linear-regression` and `mlp-regression`
@@ -251,6 +253,21 @@ nostrain publish-event event.json \
   --relay wss://relay.example.com \
   --json
 ```
+
+Relay-facing commands can retry transient websocket failures with backoff:
+
+```bash
+nostrain collect-events \
+  --relay ws://127.0.0.1:8765 \
+  --run demo-run \
+  --round 7 \
+  --relay-retries 2 \
+  --relay-retry-backoff 0.25 \
+  --relay-retry-backoff-max 1.0 \
+  --json
+```
+
+The shared retry flags are available on `publish-event`, `discover-workers`, `discover-checkpoints`, `collect-events`, `aggregate-round`, and `run-training`. JSON outputs and training summaries include per-relay attempt counts, retry delays, and the relays that needed retries.
 
 Build a signed checkpoint event from a saved worker checkpoint:
 

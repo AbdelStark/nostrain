@@ -66,6 +66,7 @@ from .relay import (
     publish_nostrain_event,
     publish_nostrain_events,
 )
+from .retry import RelayRetryPolicy
 from .training import (
     DEFAULT_TRAINING_RUNTIME,
     LINEAR_BIAS_PARAMETER,
@@ -152,6 +153,7 @@ __all__ = [
     "RelayCollectionResult",
     "RelayOperationError",
     "RelayPublishResult",
+    "RelayRetryPolicy",
     "SUPPORTED_TRAINING_RUNTIMES",
     "TensorLayout",
     "TensorState",

@@ -32,6 +32,7 @@ from .relay import (
     publish_nostrain_events,
     publish_nostrain_event,
 )
+from .retry import RelayRetryPolicy
 from .runtime import (
     DEFAULT_TRAINING_RUNTIME,
     RegressionDataset,
@@ -97,6 +98,74 @@ def _resolve_relay_urls(relay_args: str | list[str]) -> tuple[str, ...]:
     if not relay_urls:
         raise ValueError("at least one --relay is required")
     return relay_urls
+
+
+def _relay_retry_policy_from_args(args: argparse.Namespace) -> RelayRetryPolicy:
+    retries = int(getattr(args, "relay_retries", 0))
+    if retries < 0:
+        raise ValueError("--relay-retries must be non-negative")
+    return RelayRetryPolicy(
+        max_attempts=retries + 1,
+        initial_backoff=float(getattr(args, "relay_retry_backoff", 0.0)),
+        max_backoff=float(getattr(args, "relay_retry_backoff_max", 0.0)),
+        backoff_multiplier=float(getattr(args, "relay_retry_backoff_multiplier", 2.0)),
+    )
+
+
+def _add_relay_retry_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--relay-retries",
+        type=int,
+        default=0,
+        help="Retry transient relay failures this many times per relay operation (default: 0).",
+    )
+    parser.add_argument(
+        "--relay-retry-backoff",
+        type=float,
+        default=0.25,
+        help="Initial backoff in seconds between relay retries (default: 0.25).",
+    )
+    parser.add_argument(
+        "--relay-retry-backoff-max",
+        type=float,
+        default=2.0,
+        help="Maximum backoff in seconds between relay retries (default: 2.0).",
+    )
+    parser.add_argument(
+        "--relay-retry-backoff-multiplier",
+        type=float,
+        default=2.0,
+        help="Multiplier applied to each successive relay retry delay (default: 2.0).",
+    )
+
+
+def _format_retry_delays(delays: tuple[float, ...]) -> str:
+    if not delays:
+        return "-"
+    return ", ".join(f"{delay:.3f}" for delay in delays)
+
+
+def _retry_summary_lines(result: Any) -> list[str]:
+    if hasattr(result, "relay_url"):
+        lines = [
+            f"attempt_count: {getattr(result, 'attempt_count', 1)}",
+            f"retry_count: {getattr(result, 'retry_count', 0)}",
+            f"retry_delays: {_format_retry_delays(tuple(getattr(result, 'retry_delays', ())))}",
+        ]
+    else:
+        retried_relays = tuple(getattr(result, "retried_relays", ()))
+        lines = [
+            f"total_retry_count: {getattr(result, 'total_retry_count', 0)}",
+            f"max_attempt_count: {getattr(result, 'max_attempt_count', 1)}",
+            f"retried_relays: {', '.join(retried_relays) if retried_relays else '-'}",
+        ]
+    heartbeat_collection = getattr(result, "heartbeat_collection", None)
+    if heartbeat_collection is not None:
+        lines.append(
+            "heartbeat_discovery_retry_count: "
+            f"{getattr(heartbeat_collection, 'total_retry_count', getattr(heartbeat_collection, 'retry_count', 0))}"
+        )
+    return lines
 
 
 def _load_payload_string(path: str | Path) -> str:
@@ -234,6 +303,7 @@ def _handle_build_checkpoint(args: argparse.Namespace) -> int:
 def _handle_publish_event(args: argparse.Namespace) -> int:
     event = _load_json(args.event)
     relay_urls = _resolve_relay_urls(args.relay)
+    retry_policy = _relay_retry_policy_from_args(args)
     if len(relay_urls) == 1:
         result = asyncio.run(
             publish_nostrain_event(
@@ -241,6 +311,7 @@ def _handle_publish_event(args: argparse.Namespace) -> int:
                 event,
                 open_timeout=args.timeout,
                 reply_timeout=args.timeout,
+                retry_policy=retry_policy,
             )
         )
         if not result.accepted:
@@ -250,7 +321,7 @@ def _handle_publish_event(args: argparse.Namespace) -> int:
         else:
             _write_text(
                 args.output,
-                f"published {result.event_id} to {result.relay_url}",
+                f"published {result.event_id} to {result.relay_url} after {result.attempt_count} attempt(s)",
             )
         return 0
 
@@ -260,6 +331,7 @@ def _handle_publish_event(args: argparse.Namespace) -> int:
             event,
             open_timeout=args.timeout,
             reply_timeout=args.timeout,
+            retry_policy=retry_policy,
         )
     )
     if not result.accepted:
@@ -272,7 +344,8 @@ def _handle_publish_event(args: argparse.Namespace) -> int:
     else:
         _write_text(
             args.output,
-            f"published {result.event_id} to {len(result.accepted_relays)}/{len(relay_urls)} relays",
+            f"published {result.event_id} to {len(result.accepted_relays)}/{len(relay_urls)} relays "
+            f"with {result.total_retry_count} relay retry(s)",
         )
     return 0
 
@@ -354,6 +427,7 @@ def _handle_run_training(args: argparse.Namespace) -> int:
     relay_urls = _resolve_relay_urls(args.relay)
     worker_id = _resolve_worker_id(args)
     runtime_name = args.runtime
+    retry_policy = _relay_retry_policy_from_args(args)
     if args.resume_from and args.resume_latest_checkpoint:
         raise ValueError("--resume-from cannot be combined with --resume-latest-checkpoint")
     checkpoint = None
@@ -368,6 +442,7 @@ def _handle_run_training(args: argparse.Namespace) -> int:
                 idle_timeout=args.checkpoint_idle_timeout or args.round_timeout,
                 open_timeout=args.timeout,
                 since=args.checkpoint_since,
+                retry_policy=retry_policy,
             )
         )
         latest_event = checkpoint_collection.latest_event
@@ -433,6 +508,7 @@ def _handle_run_training(args: argparse.Namespace) -> int:
                 advertised_relays=tuple(args.advertise_relay or ()),
                 checkpoint_history=args.checkpoint_history,
                 artifact_retention_rounds=args.artifact_retention_rounds,
+                relay_retry_policy=retry_policy,
             ),
             previous_momentum=previous_momentum,
             artifact_dir=args.artifact_dir,
@@ -468,6 +544,7 @@ def _collection_summary(collection: Any) -> str:
             f"invalid_events: {collection.invalid_events}",
             f"sync_strategy: {collection.sync_strategy}",
             f"completion_reason: {collection.completion_reason}",
+            *_retry_summary_lines(collection),
         ]
     )
 
@@ -486,6 +563,7 @@ def _heartbeat_collection_summary(collection: Any) -> str:
             f"duplicates_discarded: {collection.duplicates_discarded}",
             f"invalid_events: {collection.invalid_events}",
             f"stale_events: {collection.stale_events}",
+            *_retry_summary_lines(collection),
         ]
     )
 
@@ -516,12 +594,14 @@ def _checkpoint_collection_summary(collection: Any) -> str:
             f"latest: {latest_label}",
             f"duplicates_discarded: {collection.duplicates_discarded}",
             f"invalid_events: {collection.invalid_events}",
+            *_retry_summary_lines(collection),
         ]
     )
 
 
 def _handle_discover_workers(args: argparse.Namespace) -> int:
     relay_urls = _resolve_relay_urls(args.relay)
+    retry_policy = _relay_retry_policy_from_args(args)
     if len(relay_urls) == 1:
         collection = asyncio.run(
             collect_heartbeat_events(
@@ -532,6 +612,7 @@ def _handle_discover_workers(args: argparse.Namespace) -> int:
                 open_timeout=args.timeout,
                 since=args.since,
                 max_missed_heartbeats=args.max_missed_heartbeats,
+                retry_policy=retry_policy,
             )
         )
     else:
@@ -544,6 +625,7 @@ def _handle_discover_workers(args: argparse.Namespace) -> int:
                 open_timeout=args.timeout,
                 since=args.since,
                 max_missed_heartbeats=args.max_missed_heartbeats,
+                retry_policy=retry_policy,
             )
         )
     if args.json:
@@ -555,6 +637,7 @@ def _handle_discover_workers(args: argparse.Namespace) -> int:
 
 def _handle_discover_checkpoints(args: argparse.Namespace) -> int:
     relay_urls = _resolve_relay_urls(args.relay)
+    retry_policy = _relay_retry_policy_from_args(args)
     if len(relay_urls) == 1:
         collection = asyncio.run(
             collect_checkpoint_events(
@@ -565,6 +648,7 @@ def _handle_discover_checkpoints(args: argparse.Namespace) -> int:
                 idle_timeout=args.idle_timeout,
                 open_timeout=args.timeout,
                 since=args.since,
+                retry_policy=retry_policy,
             )
         )
     else:
@@ -577,6 +661,7 @@ def _handle_discover_checkpoints(args: argparse.Namespace) -> int:
                 idle_timeout=args.idle_timeout,
                 open_timeout=args.timeout,
                 since=args.since,
+                retry_policy=retry_policy,
             )
         )
     if args.json:
@@ -588,6 +673,7 @@ def _handle_discover_checkpoints(args: argparse.Namespace) -> int:
 
 def _handle_collect_events(args: argparse.Namespace) -> int:
     relay_urls = _resolve_relay_urls(args.relay)
+    retry_policy = _relay_retry_policy_from_args(args)
     if len(relay_urls) == 1:
         collection = asyncio.run(
             collect_gradient_events(
@@ -603,6 +689,7 @@ def _handle_collect_events(args: argparse.Namespace) -> int:
                 heartbeat_idle_timeout=args.heartbeat_idle_timeout,
                 heartbeat_since=args.heartbeat_since,
                 max_missed_heartbeats=args.max_missed_heartbeats,
+                retry_policy=retry_policy,
             )
         )
     else:
@@ -620,6 +707,7 @@ def _handle_collect_events(args: argparse.Namespace) -> int:
                 heartbeat_idle_timeout=args.heartbeat_idle_timeout,
                 heartbeat_since=args.heartbeat_since,
                 max_missed_heartbeats=args.max_missed_heartbeats,
+                retry_policy=retry_policy,
             )
         )
     if args.json:
@@ -631,6 +719,7 @@ def _handle_collect_events(args: argparse.Namespace) -> int:
 
 def _handle_aggregate_round(args: argparse.Namespace) -> int:
     relay_urls = _resolve_relay_urls(args.relay)
+    retry_policy = _relay_retry_policy_from_args(args)
     if len(relay_urls) == 1:
         collection = asyncio.run(
             collect_gradient_events(
@@ -646,6 +735,7 @@ def _handle_aggregate_round(args: argparse.Namespace) -> int:
                 heartbeat_idle_timeout=args.heartbeat_idle_timeout,
                 heartbeat_since=args.heartbeat_since,
                 max_missed_heartbeats=args.max_missed_heartbeats,
+                retry_policy=retry_policy,
             )
         )
     else:
@@ -663,6 +753,7 @@ def _handle_aggregate_round(args: argparse.Namespace) -> int:
                 heartbeat_idle_timeout=args.heartbeat_idle_timeout,
                 heartbeat_since=args.heartbeat_since,
                 max_missed_heartbeats=args.max_missed_heartbeats,
+                retry_policy=retry_policy,
             )
         )
     aggregated = collection.aggregate_delta()
@@ -1057,6 +1148,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=10.0,
         help="Connection and relay reply timeout in seconds (default: 10).",
     )
+    _add_relay_retry_arguments(publish_event)
     publish_event.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
     publish_event.add_argument("-o", "--output", help="Optional output path.")
     publish_event.set_defaults(handler=_handle_publish_event)
@@ -1100,6 +1192,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=10.0,
         help="Connection timeout in seconds (default: 10).",
     )
+    _add_relay_retry_arguments(discover_workers)
     discover_workers.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
     discover_workers.add_argument("-o", "--output", help="Optional output path.")
     discover_workers.set_defaults(handler=_handle_discover_workers)
@@ -1141,6 +1234,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=10.0,
         help="Connection timeout in seconds (default: 10).",
     )
+    _add_relay_retry_arguments(discover_checkpoints)
     discover_checkpoints.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
     discover_checkpoints.add_argument("-o", "--output", help="Optional output path.")
     discover_checkpoints.set_defaults(handler=_handle_discover_checkpoints)
@@ -1355,6 +1449,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=10.0,
         help="Relay connection timeout in seconds (default: 10).",
     )
+    _add_relay_retry_arguments(run_training)
     run_training.add_argument(
         "--heartbeat-interval",
         type=int,
@@ -1471,6 +1566,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=10.0,
         help="Connection timeout in seconds (default: 10).",
     )
+    _add_relay_retry_arguments(collect_events)
     collect_events.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
     collect_events.add_argument("-o", "--output", help="Optional output path.")
     collect_events.set_defaults(handler=_handle_collect_events)
@@ -1536,6 +1632,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=10.0,
         help="Connection timeout in seconds (default: 10).",
     )
+    _add_relay_retry_arguments(aggregate_round)
     aggregate_round.add_argument(
         "--summary-out",
         help="Optional path to write collection summary JSON.",

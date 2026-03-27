@@ -35,7 +35,9 @@ from nostrain.relay import (
     collect_gradient_events,
     collect_gradient_events_across_relays,
     collect_heartbeat_events,
+    publish_nostrain_event,
 )
+from nostrain.retry import RelayRetryPolicy
 from nostrain.training import TrainingCheckpoint, TrainingRoundSummary
 from tests.helpers import assert_model_state_almost_equal, assert_state_json_almost_equal
 
@@ -206,7 +208,12 @@ def _build_checkpoint(
 
 
 class MockRelay:
-    def __init__(self, seeded_events: list[dict[str, Any]] | None = None) -> None:
+    def __init__(
+        self,
+        seeded_events: list[dict[str, Any]] | None = None,
+        *,
+        reject_duplicate_publishes: bool = False,
+    ) -> None:
         self._seeded_events = list(seeded_events or [])
         self._events: list[dict[str, Any]] = []
         self._subscriptions: list[dict[str, Any]] = []
@@ -214,6 +221,7 @@ class MockRelay:
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop_event: asyncio.Event | None = None
+        self._reject_duplicate_publishes = reject_duplicate_publishes
         self.url = ""
 
     def __enter__(self) -> "MockRelay":
@@ -247,17 +255,20 @@ class MockRelay:
 
     async def _handle_connection(self, websocket) -> None:
         try:
-            async for raw_message in websocket:
-                frame = json.loads(raw_message)
-                message_type = frame[0]
-                if message_type == "EVENT":
-                    await self._handle_publish(websocket, frame)
-                    continue
-                if message_type == "REQ":
-                    await self._handle_subscription(websocket, frame)
-                    continue
-                if message_type == "CLOSE":
-                    await self._handle_close(websocket, frame)
+            try:
+                async for raw_message in websocket:
+                    frame = json.loads(raw_message)
+                    message_type = frame[0]
+                    if message_type == "EVENT":
+                        await self._handle_publish(websocket, frame)
+                        continue
+                    if message_type == "REQ":
+                        await self._handle_subscription(websocket, frame)
+                        continue
+                    if message_type == "CLOSE":
+                        await self._handle_close(websocket, frame)
+            except websockets.ConnectionClosed:
+                pass
         finally:
             self._subscriptions = [
                 subscription
@@ -276,8 +287,13 @@ class MockRelay:
                 raise ValueError("relay requires fully signed NIP-01 events")
             event_id = parsed.event.fingerprint()
             parsed_event_json = parsed.event.to_json_obj()
-            self._events.append(parsed_event_json)
-            await self._broadcast_event(parsed_event_json)
+            duplicate = any(str(existing.get("id", "")) == event_id for existing in self._events)
+            if duplicate and self._reject_duplicate_publishes:
+                accepted = False
+                message = "duplicate: event already stored"
+            else:
+                self._events.append(parsed_event_json)
+                await self._broadcast_event(parsed_event_json)
         except Exception as exc:
             accepted = False
             message = f"invalid: {exc}"
@@ -361,6 +377,46 @@ class MockRelay:
             if not matching_values.intersection({str(value) for value in values}):
                 return False
         return True
+
+
+class FlakyMockRelay(MockRelay):
+    def __init__(
+        self,
+        seeded_events: list[dict[str, Any]] | None = None,
+        *,
+        disconnect_publish_before_ack_attempts: int = 0,
+        disconnect_subscription_attempts: int = 0,
+        reject_duplicate_publishes: bool = False,
+    ) -> None:
+        super().__init__(
+            seeded_events,
+            reject_duplicate_publishes=reject_duplicate_publishes,
+        )
+        self._disconnect_publish_before_ack_attempts = disconnect_publish_before_ack_attempts
+        self._disconnect_subscription_attempts = disconnect_subscription_attempts
+
+    async def _handle_publish(self, websocket, frame: list[Any]) -> None:
+        if self._disconnect_publish_before_ack_attempts > 0:
+            self._disconnect_publish_before_ack_attempts -= 1
+            parsed = parse_nostrain_event(frame[1])
+            if not parsed.event.is_signed:
+                raise ValueError("relay requires fully signed NIP-01 events")
+            event_json = parsed.event.to_json_obj()
+            event_id = parsed.event.fingerprint()
+            duplicate = any(str(existing.get("id", "")) == event_id for existing in self._events)
+            if not duplicate:
+                self._events.append(event_json)
+                await self._broadcast_event(event_json)
+            await websocket.close(code=1011, reason="transient publish disconnect")
+            return
+        await super()._handle_publish(websocket, frame)
+
+    async def _handle_subscription(self, websocket, frame: list[Any]) -> None:
+        if self._disconnect_subscription_attempts > 0:
+            self._disconnect_subscription_attempts -= 1
+            await websocket.close(code=1011, reason="transient subscription disconnect")
+            return
+        await super()._handle_subscription(websocket, frame)
 
 
 class RelayTransportTests(unittest.TestCase):
@@ -497,6 +553,61 @@ class RelayTransportTests(unittest.TestCase):
         self.assertEqual(collection.known_workers, ("worker-a", "worker-b", "worker-c"))
         self.assertEqual(collection.sync_strategy, "quorum")
         self.assertEqual(collection.completion_reason, "quorum")
+        self.assertIn("heartbeat_discovery", collection.to_json_obj(include_events=False))
+
+    def test_publish_event_retries_transient_disconnect_and_accepts_duplicate_replay(self) -> None:
+        event = _build_event(
+            worker_id="worker-a",
+            current_fixture="current_state.json",
+            created_at=1_700_000_100,
+        )
+
+        with FlakyMockRelay(
+            disconnect_publish_before_ack_attempts=1,
+            reject_duplicate_publishes=True,
+        ) as relay:
+            result = asyncio.run(
+                publish_nostrain_event(
+                    relay.url,
+                    event,
+                    open_timeout=1.0,
+                    reply_timeout=1.0,
+                    retry_policy=RelayRetryPolicy(max_attempts=2, initial_backoff=0.0),
+                )
+            )
+
+        self.assertTrue(result.accepted)
+        self.assertEqual(result.attempt_count, 2)
+        self.assertEqual(result.retry_count, 1)
+        self.assertEqual(result.retry_delays, (0.0,))
+        self.assertIn("duplicate", result.message)
+
+    def test_collect_events_retries_transient_subscription_disconnect(self) -> None:
+        event = _build_event(
+            worker_id="worker-a",
+            current_fixture="current_state.json",
+            created_at=1_700_000_200,
+        )
+
+        with FlakyMockRelay(
+            [event],
+            disconnect_subscription_attempts=1,
+        ) as relay:
+            collection = asyncio.run(
+                collect_gradient_events(
+                    relay.url,
+                    run_name="demo-run",
+                    round_index=7,
+                    idle_timeout=0.2,
+                    open_timeout=1.0,
+                    retry_policy=RelayRetryPolicy(max_attempts=2, initial_backoff=0.0),
+                )
+            )
+
+        self.assertEqual(len(collection.events), 1)
+        self.assertEqual(collection.attempt_count, 2)
+        self.assertEqual(collection.retry_count, 1)
+        self.assertEqual(collection.retry_delays, (0.0,))
 
     def test_cli_publish_collect_and_aggregate_roundtrip(self) -> None:
         expected_average = {
@@ -678,6 +789,46 @@ class RelayTransportTests(unittest.TestCase):
             self.assertEqual(sorted(aggregation_summary_json["workers"]), ["worker-a", "worker-b"])
             self.assertEqual(aggregation_summary_json["completion_reason"], "limit")
             self.assertEqual(aggregation_summary_json["sync_strategy"], "timeout")
+
+    def test_cli_collect_events_retry_flags_surface_retry_telemetry(self) -> None:
+        event = _build_event(
+            worker_id="worker-a",
+            current_fixture="current_state.json",
+            created_at=1_700_000_300,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory, FlakyMockRelay(
+            [event],
+            disconnect_subscription_attempts=1,
+        ) as relay:
+            tempdir = Path(temporary_directory)
+            collected = tempdir / "collected.json"
+
+            self._run(
+                "collect-events",
+                "--relay",
+                relay.url,
+                "--run",
+                "demo-run",
+                "--round",
+                "7",
+                "--idle-timeout",
+                "0.2",
+                "--timeout",
+                "1.0",
+                "--relay-retries",
+                "1",
+                "--relay-retry-backoff",
+                "0",
+                "--json",
+                "-o",
+                str(collected),
+            )
+
+            collected_json = json.loads(collected.read_text(encoding="utf-8"))
+            self.assertEqual(collected_json["attempt_count"], 2)
+            self.assertEqual(collected_json["retry_count"], 1)
+            self.assertEqual(collected_json["retry_delays"], [0.0])
 
     def test_cli_build_publish_and_discover_heartbeats(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory, MockRelay() as relay:
@@ -1407,6 +1558,61 @@ class RelayTransportTests(unittest.TestCase):
             self.assertEqual(summary_json["rounds"][0]["published_gradient_relays"], [relay.url])
             self.assertEqual(summary_json["rounds"][0]["collected_from_relays"], [relay.url])
             self.assertIn(unreachable_relay, summary_json["rounds"][0]["failed_relays"])
+
+    def test_cli_run_training_reports_relay_retries_in_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory, FlakyMockRelay(
+            disconnect_subscription_attempts=1
+        ) as relay:
+            tempdir = Path(temporary_directory)
+            final_state = tempdir / "final-state.json"
+            summary = tempdir / "summary.json"
+
+            self._run(
+                "run-training",
+                str(FIXTURES / "linear_initial_state.json"),
+                str(FIXTURES / "linear_dataset_worker_a.json"),
+                "--relay",
+                relay.url,
+                "--run",
+                "retry-run",
+                "--worker",
+                "worker-a",
+                "--sec-key",
+                WORKER_SECRET_KEYS["worker-a"],
+                "--rounds",
+                "1",
+                "--inner-steps",
+                "20",
+                "--local-learning-rate",
+                "0.05",
+                "--batch-size",
+                "2",
+                "--outer-learning-rate",
+                "1.0",
+                "--momentum",
+                "0.0",
+                "--round-timeout",
+                "0.2",
+                "--timeout",
+                "1.0",
+                "--relay-retries",
+                "1",
+                "--relay-retry-backoff",
+                "0",
+                "--summary-out",
+                str(summary),
+                "-o",
+                str(final_state),
+            )
+
+            summary_json = json.loads(summary.read_text(encoding="utf-8"))
+            self.assertIn("parameters", json.loads(final_state.read_text(encoding="utf-8")))
+            self.assertEqual(summary_json["relay_retry_count"], 1)
+            self.assertEqual(summary_json["max_relay_attempt_count"], 2)
+            self.assertEqual(summary_json["retried_relays"], [relay.url])
+            self.assertEqual(summary_json["rounds"][0]["relay_retry_count"], 1)
+            self.assertEqual(summary_json["rounds"][0]["max_relay_attempt_count"], 2)
+            self.assertEqual(summary_json["rounds"][0]["retried_relays"], [relay.url])
 
     def test_cli_run_training_resume_from_checkpoint_matches_uninterrupted_run(self) -> None:
         with (

@@ -2,7 +2,7 @@
 
 ## Overview
 
-nostrain is a protocol for distributed ML training over Nostr relays. The implemented repository milestone now covers the payload layer, a signed transport slice, and a resilient end-to-end runner: deterministic model snapshots, pseudo-gradient generation, sparse quantized wire encoding, NIP-01-compatible gradient/heartbeat/checkpoint event envelopes, websocket discovery/collection across one or more relays, resumable checkpoints, rolling checkpoint-slot retention, deferred late-gradient reconciliation, and a runtime-aware built-in worker loop that trains both linear and non-linear regression models through relays.
+nostrain is a protocol for distributed ML training over Nostr relays. The implemented repository milestone now covers the payload layer, a signed transport slice, and a resilient end-to-end runner: deterministic model snapshots, pseudo-gradient generation, sparse quantized wire encoding, NIP-01-compatible gradient/heartbeat/checkpoint event envelopes, websocket discovery/collection across one or more relays, resumable checkpoints, rolling checkpoint-slot retention, deferred late-gradient reconciliation, configurable relay retry/backoff, and a runtime-aware built-in worker loop that trains both linear and non-linear regression models through relays.
 
 ## Implemented core
 
@@ -42,6 +42,7 @@ nostrain is a protocol for distributed ML training over Nostr relays. The implem
 34. Resolve training runtimes from dataset metadata, checkpoint metadata, or model-state layout
 35. Generate deterministic built-in initial states for supported runtimes from the CLI
 36. Train a one-hidden-layer `mlp-regression` runtime end to end through the same relay/checkpoint path
+37. Retry transient relay publish/discovery/collection failures with configurable backoff and expose retry telemetry in CLI/training artifacts
 
 ## Model state schema
 
@@ -133,8 +134,10 @@ Transport note:
 - signed relay publication uses canonical event serialization and BIP340 Schnorr signatures over the event id
 - transport is validated against local/mock relay endpoints and public-relay-compatible signed publication flows
 - publication can target multiple relays; the current runner proceeds when at least one relay accepts the event
+- publish/discovery/collection commands can retry transient websocket failures with configurable backoff; duplicate publish rejections are treated as idempotent success so dropped relay acknowledgements do not force false negatives
 - collection subscribes using `kinds=[33333]` and `#t=["nostrain"]`, then narrows `run` and `round` client-side because relay-side tag indexing is only standardized for single-letter tags in NIP-01
 - cross-relay collection deduplicates worker updates by the parameterized event identity and keeps the freshest candidate when duplicates disagree
+- machine-readable relay results include attempt counts, retry delays, and the relays that required retries
 
 ## Heartbeat event schema
 
@@ -172,6 +175,7 @@ Transport note:
 - workers are considered stale after missing more than three advertised heartbeat intervals
 - round collection can optionally snapshot current workers first, then stop when a `strict` or `quorum` target is satisfied
 - multi-relay discovery unions the active worker set across all queried relays while deduplicating replayed heartbeats
+- heartbeat discovery shares the same retry/backoff policy and retry telemetry as the gradient collection path
 
 ## Checkpoint event schema
 
@@ -212,6 +216,7 @@ Transport note:
 - discovery deduplicates replaceable checkpoint identities per worker/slot and selects the highest `next-round` checkpoint as the latest recoverable state
 - legacy round-based checkpoint identities are still parsed for compatibility with older runs
 - relay-based resume restores `current_state`, `momentum_state`, prior round history, and previously observed late gradients from the embedded checkpoint document
+- checkpoint discovery uses the same configurable relay retry/backoff path and emits the same retry telemetry fields as other relay operations
 
 ## Payload wire format
 
@@ -265,6 +270,13 @@ nostrain train-local <state.json> <dataset.json> [--runtime linear-regression|ml
 nostrain run-training <state.json> <dataset.json> [--runtime linear-regression|mlp-regression] --relay <ws://...> [--relay <ws://...> ...] --run <name> --sec-key <hex> [--rounds 1] [--checkpoint-out path.json] [--checkpoint-history 4] [--artifact-retention-rounds N] [--late-gradient-strategy deferred|discard] [--late-gradient-learning-rate X] [--late-gradient-momentum Y] [--resume-from checkpoint.json | --resume-latest-checkpoint]
 nostrain inspect-event <event.json> [--json]
 ```
+
+Relay-facing commands share these retry controls:
+
+- `--relay-retries <n>`: additional attempts after the first try
+- `--relay-retry-backoff <seconds>`: initial delay before retrying
+- `--relay-retry-backoff-max <seconds>`: cap for exponential backoff growth
+- `--relay-retry-backoff-multiplier <factor>`: multiplier applied after each retry
 
 ## Local outer step semantics
 
