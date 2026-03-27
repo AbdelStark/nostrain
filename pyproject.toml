@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nostrain"
-version = "0.10.0"
+version = "0.11.0"
 description = "Protocol, payload, and relay tooling for distributed ML training over Nostr relays."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -24,6 +24,7 @@ dependencies = [
 
 [project.optional-dependencies]
 numpy = ["numpy>=1.26"]
+torch = ["torch>=2.1"]
 zstd = ["zstandard>=0.22"]
 
 [project.scripts]

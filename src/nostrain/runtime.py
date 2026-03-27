@@ -25,10 +25,12 @@ SUPPORTED_TRAINING_RUNTIMES = (
 )
 PYTHON_TRAINING_BACKEND = "python"
 NUMPY_TRAINING_BACKEND = "numpy"
+TORCH_TRAINING_BACKEND = "torch"
 DEFAULT_TRAINING_BACKEND = PYTHON_TRAINING_BACKEND
 SUPPORTED_TRAINING_BACKENDS = (
     PYTHON_TRAINING_BACKEND,
     NUMPY_TRAINING_BACKEND,
+    TORCH_TRAINING_BACKEND,
 )
 
 
@@ -77,6 +79,30 @@ def _dataset_arrays(dataset: RegressionDataset):
         dtype=np.float64,
     )
     return np, inputs, targets
+
+
+def _require_torch(feature_name: str):
+    try:
+        import torch
+    except ImportError as exc:  # pragma: no cover - exercised in environments without torch.
+        raise RuntimeError(
+            f"{feature_name} requires the optional torch dependency; "
+            'install it with `python3 -m pip install -e ".[torch]"`'
+        ) from exc
+    return torch
+
+
+def _dataset_tensors(dataset: RegressionDataset):
+    torch = _require_torch("torch training backend")
+    inputs = torch.tensor(
+        [example.inputs for example in dataset.examples],
+        dtype=torch.float64,
+    )
+    targets = torch.tensor(
+        [example.target for example in dataset.examples],
+        dtype=torch.float64,
+    )
+    return torch, inputs, targets
 
 
 @dataclass(frozen=True)
@@ -553,6 +579,13 @@ def evaluate_linear_regression(
         predictions = inputs @ weights + float(model.bias)
         errors = predictions - targets
         return float(np.mean(errors * errors))
+    if resolved_backend == TORCH_TRAINING_BACKEND:
+        torch, inputs, targets = _dataset_tensors(dataset)
+        weights = torch.tensor(model.weights, dtype=torch.float64)
+        bias = torch.tensor(model.bias, dtype=torch.float64)
+        predictions = inputs @ weights + bias
+        errors = predictions - targets
+        return float((errors * errors).mean().item())
     total_squared_error = 0.0
     for example in dataset.examples:
         error = model.predict(example.inputs) - example.target
@@ -583,6 +616,19 @@ def evaluate_mlp_regression(
         predictions = hidden_activations @ output_weights + float(model.output_bias)
         errors = predictions - targets
         return float(np.mean(errors * errors))
+    if resolved_backend == TORCH_TRAINING_BACKEND:
+        torch, inputs, targets = _dataset_tensors(dataset)
+        hidden_weights = torch.tensor(model.hidden_weights, dtype=torch.float64).reshape(
+            model.hidden_size,
+            model.feature_count,
+        )
+        hidden_bias = torch.tensor(model.hidden_bias, dtype=torch.float64)
+        output_weights = torch.tensor(model.output_weights, dtype=torch.float64)
+        output_bias = torch.tensor(model.output_bias, dtype=torch.float64)
+        hidden_activations = torch.tanh(inputs @ hidden_weights.transpose(0, 1) + hidden_bias)
+        predictions = hidden_activations @ output_weights + output_bias
+        errors = predictions - targets
+        return float((errors * errors).mean().item())
     total_squared_error = 0.0
     for example in dataset.examples:
         error = model.predict(example.inputs) - example.target
@@ -713,6 +759,35 @@ def train_linear_regression(
                 bias=float(bias),
             )
         )
+    elif resolved_backend == TORCH_TRAINING_BACKEND:
+        torch, all_inputs, all_targets = _dataset_tensors(dataset)
+        weights = torch.tensor(model.weights, dtype=torch.float64)
+        bias = torch.tensor(model.bias, dtype=torch.float64)
+        example_index = 0
+
+        for _ in range(config.steps):
+            batch_indexes = [
+                (example_index + offset) % dataset.example_count
+                for offset in range(config.batch_size)
+            ]
+            example_index = (example_index + config.batch_size) % dataset.example_count
+            batch_inputs = all_inputs[batch_indexes]
+            batch_targets = all_targets[batch_indexes]
+
+            errors = batch_inputs @ weights + bias - batch_targets
+            factors = errors * (2.0 / len(batch_indexes))
+            gradients = batch_inputs.transpose(0, 1) @ factors
+            bias_gradient = factors.sum()
+
+            weights = weights - config.learning_rate * gradients
+            bias = bias - config.learning_rate * bias_gradient
+
+        trained_state = adapter.export_state(
+            LinearModel(
+                weights=tuple(float(value) for value in weights.tolist()),
+                bias=float(bias.item()),
+            )
+        )
     else:
         weights = list(model.weights)
         bias = model.bias
@@ -832,6 +907,59 @@ def train_mlp_regression(
                 hidden_bias=tuple(float(value) for value in hidden_bias.tolist()),
                 output_weights=tuple(float(value) for value in output_weights.tolist()),
                 output_bias=float(output_bias),
+            )
+        )
+    elif resolved_backend == TORCH_TRAINING_BACKEND:
+        torch, all_inputs, all_targets = _dataset_tensors(dataset)
+        hidden_weights = torch.tensor(model.hidden_weights, dtype=torch.float64).reshape(
+            model.hidden_size,
+            model.feature_count,
+        )
+        hidden_bias = torch.tensor(model.hidden_bias, dtype=torch.float64)
+        output_weights = torch.tensor(model.output_weights, dtype=torch.float64)
+        output_bias = torch.tensor(model.output_bias, dtype=torch.float64)
+        example_index = 0
+
+        for _ in range(config.steps):
+            batch_indexes = [
+                (example_index + offset) % dataset.example_count
+                for offset in range(config.batch_size)
+            ]
+            example_index = (example_index + config.batch_size) % dataset.example_count
+            batch_inputs = all_inputs[batch_indexes]
+            batch_targets = all_targets[batch_indexes]
+
+            hidden_activations = torch.tanh(
+                batch_inputs @ hidden_weights.transpose(0, 1) + hidden_bias
+            )
+            predictions = hidden_activations @ output_weights + output_bias
+            errors = predictions - batch_targets
+            output_delta = errors * (2.0 / len(batch_indexes))
+
+            output_weight_gradients = hidden_activations.transpose(0, 1) @ output_delta
+            output_bias_gradient = output_delta.sum()
+            hidden_delta = (
+                output_delta.reshape(len(batch_indexes), 1)
+                * output_weights.reshape(1, model.hidden_size)
+            ) * (1.0 - hidden_activations * hidden_activations)
+            hidden_bias_gradients = hidden_delta.sum(axis=0)
+            hidden_weight_gradients = hidden_delta.transpose(0, 1) @ batch_inputs
+
+            hidden_weights = hidden_weights - config.learning_rate * hidden_weight_gradients
+            hidden_bias = hidden_bias - config.learning_rate * hidden_bias_gradients
+            output_weights = output_weights - config.learning_rate * output_weight_gradients
+            output_bias = output_bias - config.learning_rate * output_bias_gradient
+
+        trained_state = adapter.export_state(
+            MLPModel(
+                feature_count=model.feature_count,
+                hidden_size=model.hidden_size,
+                hidden_weights=tuple(
+                    float(value) for value in hidden_weights.reshape(-1).tolist()
+                ),
+                hidden_bias=tuple(float(value) for value in hidden_bias.tolist()),
+                output_weights=tuple(float(value) for value in output_weights.tolist()),
+                output_bias=float(output_bias.item()),
             )
         )
     else:

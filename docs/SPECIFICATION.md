@@ -1,8 +1,8 @@
-# nostrain: Specification v0.10.0
+# nostrain: Specification v0.11.0
 
 ## Overview
 
-nostrain is a protocol for distributed ML training over Nostr relays. The implemented repository milestone now covers the payload layer, a signed transport slice, and a resilient end-to-end runner: deterministic model snapshots, pseudo-gradient generation, sparse quantized wire encoding, NIP-01-compatible gradient/heartbeat/checkpoint event envelopes, websocket discovery/collection across one or more relays, resumable checkpoints, rolling checkpoint-slot retention, deferred late-gradient reconciliation, configurable relay retry/backoff, runtime-aware worker loops for both linear and non-linear regression, plus NumPy-backed and PyTorch-compatible edge/runtime paths for state interchange and local optimization.
+nostrain is a protocol for distributed ML training over Nostr relays. The implemented repository milestone now covers the payload layer, a signed transport slice, and a resilient end-to-end runner: deterministic model snapshots, pseudo-gradient generation, sparse quantized wire encoding, NIP-01-compatible gradient/heartbeat/checkpoint event envelopes, websocket discovery/collection across one or more relays, resumable checkpoints, rolling checkpoint-slot retention, deferred late-gradient reconciliation, configurable relay retry/backoff, runtime-aware worker loops for both linear and non-linear regression, plus NumPy-backed and PyTorch-backed runtime paths for state interchange and local optimization, including native `torch.save` checkpoint I/O.
 
 ## Implemented core
 
@@ -45,8 +45,10 @@ nostrain is a protocol for distributed ML training over Nostr relays. The implem
 37. Retry transient relay publish/discovery/collection failures with configurable backoff and expose retry telemetry in CLI/training artifacts
 38. Convert model states between canonical JSON, `numpy-npz`, and PyTorch-compatible state-dict archives
 39. Normalize common PyTorch state-dict key layouts (direct module, nested module, and `module.*` wrappers) back into canonical nostrain parameter names
-40. Run local evaluation and inner-loop training through either the pure-Python or NumPy backend
+40. Run local evaluation and inner-loop training through the pure-Python, NumPy, or torch backend
 41. Auto-detect model-state formats across CLI training/state commands and preserve runtime metadata when possible
+42. Load and write native `.pt` / `.pth` `torch.save` checkpoints for built-in runtime state dicts
+43. Accept common wrapped PyTorch checkpoints carrying `state_dict` / `model_state_dict` payloads
 
 ## Model state schema
 
@@ -84,6 +86,7 @@ PyTorch-compatible state-dict layouts:
 - linear runtime export: `weight`, `bias`
 - MLP runtime export: `hidden.weight`, `hidden.bias`, `output.weight`, `output.bias`
 - import accepts the above direct layouts, the canonical `linear.*` / `mlp.*` forms, and arbitrarily nested shared prefixes such as `module.model.*`
+- native `.pt` / `.pth` checkpoints may contain a bare state dict or a wrapped checkpoint object with `state_dict` / `model_state_dict`
 
 ## Regression dataset schema
 
@@ -260,15 +263,15 @@ Reconstruction is exact with respect to the sparse support and approximate with 
 Implemented commands:
 
 ```bash
-nostrain hash-state <state.{json|npz|pt.npz}> [--state-format auto|json|numpy-npz|pytorch-state-dict]
+nostrain hash-state <state.{json|npz|pt|pth|pt.npz}> [--state-format auto|json|numpy-npz|pytorch-state-dict]
 nostrain init-state --runtime linear-regression|mlp-regression --features <n> [--hidden-size <h>] [--output-format auto|json|numpy-npz|pytorch-state-dict]
-nostrain convert-state <state.{json|npz|pt.npz}> [--input-format auto|json|numpy-npz|pytorch-state-dict] [--output-format auto|json|numpy-npz|pytorch-state-dict]
+nostrain convert-state <state.{json|npz|pt|pth|pt.npz}> [--input-format auto|json|numpy-npz|pytorch-state-dict] [--output-format auto|json|numpy-npz|pytorch-state-dict]
 nostrain derive-pubkey <sec-key>
-nostrain encode-delta <initial.{json|npz|pt.npz}> <current.{json|npz|pt.npz}> [--state-format auto|json|numpy-npz|pytorch-state-dict] [--topk 0.01] [--codec zlib|zstd]
+nostrain encode-delta <initial.{json|npz|pt|pth|pt.npz}> <current.{json|npz|pt|pth|pt.npz}> [--state-format auto|json|numpy-npz|pytorch-state-dict] [--topk 0.01] [--codec zlib|zstd]
 nostrain decode-payload <payload.json>
 nostrain aggregate-payloads <payload-a.json> <payload-b.json> [...]
-nostrain apply-payload <base.{json|npz|pt.npz}> <payload.json> [--state-format auto|json|numpy-npz|pytorch-state-dict] [--output-format auto|json|numpy-npz|pytorch-state-dict]
-nostrain outer-step <base.{json|npz|pt.npz}> <aggregated.json> [--state-format auto|json|numpy-npz|pytorch-state-dict] [--output-format auto|json|numpy-npz|pytorch-state-dict] [--learning-rate 0.7] [--momentum 0.9]
+nostrain apply-payload <base.{json|npz|pt|pth|pt.npz}> <payload.json> [--state-format auto|json|numpy-npz|pytorch-state-dict] [--output-format auto|json|numpy-npz|pytorch-state-dict]
+nostrain outer-step <base.{json|npz|pt|pth|pt.npz}> <aggregated.json> [--state-format auto|json|numpy-npz|pytorch-state-dict] [--output-format auto|json|numpy-npz|pytorch-state-dict] [--learning-rate 0.7] [--momentum 0.9]
 nostrain build-event <payload.json> --run <name> --round <n> --worker <id> --model <sha256> [--sec-key <hex> | --pubkey <hex> [--sig <hex>]]
 nostrain build-heartbeat --run <name> --round <n> --worker <id> [--capability gradient-event] [--advertise-relay ws://...]
 nostrain build-checkpoint <checkpoint.json> [--worker <id>] [--history-slot <n>] [--sec-key <hex> | --pubkey <hex> [--sig <hex>]]
@@ -277,8 +280,8 @@ nostrain discover-workers --relay <ws://...> [--relay <ws://...> ...] --run <nam
 nostrain discover-checkpoints --relay <ws://...> [--relay <ws://...> ...] --run <name> [--worker <id>]
 nostrain collect-events --relay <ws://...> [--relay <ws://...> ...] --run <name> --round <n> [--sync timeout|strict|quorum|async] [--discover-workers]
 nostrain aggregate-round --relay <ws://...> [--relay <ws://...> ...] --run <name> --round <n> [--sync timeout|strict|quorum|async] [--discover-workers]
-nostrain train-local <state.{json|npz|pt.npz}> <dataset.json> [--state-format auto|json|numpy-npz|pytorch-state-dict] [--output-format auto|json|numpy-npz|pytorch-state-dict] [--runtime linear-regression|mlp-regression] [--backend python|numpy] [--steps 500] [--learning-rate 0.01] [--batch-size 1]
-nostrain run-training <state.{json|npz|pt.npz}> <dataset.json> [--state-format auto|json|numpy-npz|pytorch-state-dict] [--output-format auto|json|numpy-npz|pytorch-state-dict] [--runtime linear-regression|mlp-regression] [--backend python|numpy] --relay <ws://...> [--relay <ws://...> ...] --run <name> --sec-key <hex> [--rounds 1] [--checkpoint-out path.json] [--checkpoint-history 4] [--artifact-retention-rounds N] [--late-gradient-strategy deferred|discard] [--late-gradient-learning-rate X] [--late-gradient-momentum Y] [--resume-from checkpoint.json | --resume-latest-checkpoint]
+nostrain train-local <state.{json|npz|pt|pth|pt.npz}> <dataset.json> [--state-format auto|json|numpy-npz|pytorch-state-dict] [--output-format auto|json|numpy-npz|pytorch-state-dict] [--runtime linear-regression|mlp-regression] [--backend python|numpy|torch] [--steps 500] [--learning-rate 0.01] [--batch-size 1]
+nostrain run-training <state.{json|npz|pt|pth|pt.npz}> <dataset.json> [--state-format auto|json|numpy-npz|pytorch-state-dict] [--output-format auto|json|numpy-npz|pytorch-state-dict] [--runtime linear-regression|mlp-regression] [--backend python|numpy|torch] --relay <ws://...> [--relay <ws://...> ...] --run <name> --sec-key <hex> [--rounds 1] [--checkpoint-out path.json] [--checkpoint-history 4] [--artifact-retention-rounds N] [--late-gradient-strategy deferred|discard] [--late-gradient-learning-rate X] [--late-gradient-momentum Y] [--resume-from checkpoint.json | --resume-latest-checkpoint]
 nostrain inspect-event <event.json> [--json]
 ```
 
@@ -325,8 +328,8 @@ Fault-tolerance boundary:
 - late gradients from older rounds are surfaced separately and can be folded into the next round through a separate deferred outer step without replaying earlier rounds
 - total relay failure or zero collected gradients still aborts the round to avoid silent model divergence
 
-## Deferred from v0.10.0
+## Deferred from v0.11.0
 
-- direct `torch.save` / framework-native checkpoint loading beyond the archive bridge
-- framework-native execution backends for PyTorch or MLX modules
+- arbitrary framework-module execution beyond the built-in linear and MLP runtime contracts
+- MLX or other non-PyTorch framework backends
 - live dashboarding

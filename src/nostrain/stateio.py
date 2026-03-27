@@ -4,7 +4,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .model import ModelState, TensorState
-from .pytorch import export_pytorch_state_dict, import_pytorch_state_dict
+from .pytorch import (
+    export_pytorch_state_dict,
+    import_pytorch_state_dict,
+    load_torch_checkpoint,
+    write_torch_checkpoint,
+)
 from .runtime import infer_training_runtime_from_state
 
 JSON_STATE_FORMAT = "json"
@@ -54,6 +59,8 @@ def _require_numpy(feature_name: str):
 def infer_state_format_from_path(path: str | Path) -> str:
     suffixes = [suffix.lower() for suffix in Path(path).suffixes]
     if len(suffixes) >= 2 and suffixes[-2:] in ([".pt", ".npz"], [".pth", ".npz"]):
+        return PYTORCH_STATE_DICT_STATE_FORMAT
+    if suffixes and suffixes[-1] in {".pt", ".pth"}:
         return PYTORCH_STATE_DICT_STATE_FORMAT
     if suffixes and suffixes[-1] == ".npz":
         return NUMPY_NPZ_STATE_FORMAT
@@ -156,6 +163,11 @@ def _write_npz_document(
         np.savez(handle, **arrays)
 
 
+def _uses_native_torch_checkpoint(path: str | Path) -> bool:
+    suffixes = [suffix.lower() for suffix in Path(path).suffixes]
+    return bool(suffixes and suffixes[-1] in {".pt", ".pth"})
+
+
 def load_model_state_document(
     path: str | Path,
     *,
@@ -170,6 +182,10 @@ def load_model_state_document(
             feature_name="numpy-npz state loading",
             expected_schema=_MODEL_STATE_NPZ_SCHEMA_VALUE,
         )
+
+    if _uses_native_torch_checkpoint(path):
+        state, runtime_name = load_torch_checkpoint(path)
+        return ModelStateDocument(state=state, runtime_name=runtime_name)
 
     document = _load_npz_document(
         path,
@@ -210,6 +226,14 @@ def write_model_state_document(
         return
 
     runtime_name = document.runtime_name or infer_training_runtime_from_state(document.state)
+    if _uses_native_torch_checkpoint(target):
+        write_torch_checkpoint(
+            target,
+            document.state,
+            runtime_name=runtime_name,
+        )
+        return
+
     _write_npz_document(
         target,
         ModelStateDocument(

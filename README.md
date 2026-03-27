@@ -6,7 +6,7 @@ The project vision is still the same: no coordinator, no central server, just wo
 
 ## Current status
 
-`nostrain` v0.10.0 is a protocol, relay, and training toolchain. It implements:
+`nostrain` v0.11.0 is a protocol, relay, and training toolchain. It implements:
 
 - canonical model-state JSON loading and hashing
 - pseudo-gradient computation (`current - initial`)
@@ -25,9 +25,10 @@ The project vision is still the same: no coordinator, no central server, just wo
 - round sync strategies (`timeout`, `strict`, `quorum`, `async`) driven by discovered workers
 - a deterministic JSON dataset format for built-in regression workloads
 - pluggable built-in runtimes for `linear-regression` and `mlp-regression`
-- backend-selectable local SGD/evaluation paths (`python`, `numpy`) for both runtimes
-- canonical model-state interchange between JSON, `numpy-npz`, and PyTorch-compatible state-dict archives
+- backend-selectable local SGD/evaluation paths (`python`, `numpy`, `torch`) for both runtimes
+- canonical model-state interchange between JSON, `numpy-npz`, PyTorch-compatible state-dict archives, and native `torch.save` checkpoints
 - PyTorch state-dict import normalization for direct-module, nested-module, and `module.*`-prefixed key layouts
+- native `.pt` / `.pth` checkpoint loading for bare state dicts and common wrapped `state_dict` / `model_state_dict` payloads
 - CLI state-format auto-detection plus `convert-state` for explicit format conversion
 - a relay-backed training runner that publishes heartbeats and gradients to one or more relays, tolerates partial relay outages, and applies the outer step locally
 - resumable training checkpoints carrying model state, momentum state, and prior round history
@@ -40,7 +41,7 @@ The project vision is still the same: no coordinator, no central server, just wo
 - deterministic `init-state` generation for supported built-in runtimes
 - a CLI for converting, encoding, decoding, applying, publishing, collecting, and inspecting payloads
 
-It now ships a PyTorch-compatible state-dict archive bridge, but it does **not** yet execute native PyTorch/MLX modules or load raw `torch.save` checkpoints directly. The signed transport path now targets public NIP-01 relays as well as local/mock websocket endpoints, and the built-in runners stay dependency-light and testable while exercising real external runtime boundaries through NumPy interchange, PyTorch-style state-dict layouts, and backend execution.
+It now ships native `torch.save` state-dict checkpoint I/O plus an optional torch backend for the built-in runtimes, but it does **not** yet execute arbitrary user-defined PyTorch/MLX modules or raw full-object framework pickles beyond state-dict-oriented checkpoints. The signed transport path now targets public NIP-01 relays as well as local/mock websocket endpoints, and the built-in runners stay dependency-light and testable while exercising real external runtime boundaries through NumPy interchange, PyTorch state-dict layouts, and backend execution.
 
 ## Install
 
@@ -58,6 +59,12 @@ Optional `numpy` support for `numpy-npz` state interchange and the NumPy trainin
 
 ```bash
 python3 -m pip install -e ".[numpy]"
+```
+
+Optional `torch` support for native `.pt` / `.pth` checkpoints and the torch training backend:
+
+```bash
+python3 -m pip install -e ".[torch]"
 ```
 
 ## Model state format
@@ -141,7 +148,7 @@ nostrain convert-state linear-initial.npz -o linear-initial-roundtrip.json
 
 ## PyTorch state-dict interop
 
-`nostrain` can also import and export PyTorch-compatible state-dict archives stored as `.pt.npz` or `.pth.npz`. Linear states are emitted as `weight` / `bias`; MLP states are emitted as `hidden.*` and `output.*`. On import, common wrapper prefixes such as `module.` or `model.` are stripped automatically before the state is normalized back into canonical nostrain parameter names.
+`nostrain` can also import and export PyTorch-compatible state dicts either as dependency-light archives (`.pt.npz` / `.pth.npz`) or as native `torch.save` checkpoints (`.pt` / `.pth`). Linear states are emitted as `weight` / `bias`; MLP states are emitted as `hidden.*` and `output.*`. On import, common wrapper prefixes such as `module.` or `model.` are stripped automatically before the state is normalized back into canonical nostrain parameter names, and wrapped checkpoints with `state_dict` / `model_state_dict` payloads are accepted.
 
 Convert a canonical JSON state into a PyTorch-style state dict archive:
 
@@ -155,18 +162,18 @@ Round-trip it back to canonical JSON:
 nostrain convert-state linear-initial.pt.npz -o linear-initial-from-pytorch.json
 ```
 
-Load that archive into a PyTorch module with a small edge bridge:
+Write a native `torch.save` checkpoint instead:
+
+```bash
+nostrain convert-state linear-initial.json -o linear-initial.pt
+```
+
+Load that native checkpoint into a PyTorch module:
 
 ```python
-import numpy as np
 import torch
 
-with np.load("linear-initial.pt.npz", allow_pickle=False) as archive:
-    state_dict = {
-        name: torch.from_numpy(archive[name].copy())
-        for name in archive.files
-        if not name.startswith("__")
-    }
+state_dict = torch.load("linear-initial.pt", map_location="cpu")
 model.load_state_dict(state_dict)
 ```
 
@@ -263,6 +270,18 @@ nostrain train-local linear-initial.npz worker-a-dataset.json \
   --batch-size 2 \
   --metrics-out local-training.json \
   -o local-state.npz
+```
+
+Run the same local training loop through the torch backend and emit a native `.pt` checkpoint:
+
+```bash
+nostrain train-local linear-initial.pt worker-a-dataset.json \
+  --backend torch \
+  --steps 50 \
+  --learning-rate 0.05 \
+  --batch-size 2 \
+  --metrics-out local-training.json \
+  -o local-state.pt
 ```
 
 Run the non-linear MLP runtime against an `mlp-regression` dataset:
@@ -405,7 +424,7 @@ nostrain run-training linear-initial.json worker-a-dataset.json \
   -o final-state.json
 ```
 
-The same command accepts `.npz` model states and `--backend numpy` while keeping checkpoints, payloads, and relay envelopes in the canonical nostrain formats.
+The same command also accepts `.npz` model states with `--backend numpy` and native `.pt` / `.pth` checkpoints with `--backend torch` while keeping checkpoints, payloads, and relay envelopes in the canonical nostrain formats.
 
 Resume a worker from its last saved checkpoint:
 

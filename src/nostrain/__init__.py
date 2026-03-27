@@ -31,7 +31,12 @@ from .pytorch import (
     export_pytorch_state_dict,
     import_pytorch_state_dict,
     infer_training_runtime_from_pytorch_state_dict,
+    load_torch_checkpoint,
+    model_state_from_torch_state_dict_payload,
+    model_state_to_torch_state_dict_payload,
+    write_torch_checkpoint,
 )
+from .runtime import TORCH_TRAINING_BACKEND
 from .protocol import (
     CheckpointEventMetadata,
     GradientEventMetadata,
@@ -205,6 +210,7 @@ __all__ = [
     "SUPPORTED_TRAINING_RUNTIMES",
     "SUPPORTED_STATE_FORMATS",
     "SUPPORTED_TRAINING_BACKENDS",
+    "TORCH_TRAINING_BACKEND",
     "TensorLayout",
     "TensorState",
     "TrainingCheckpoint",
@@ -242,6 +248,9 @@ __all__ = [
     "inspect_payload",
     "load_model_state",
     "load_model_state_document",
+    "load_torch_checkpoint",
+    "model_state_from_torch_state_dict_payload",
+    "model_state_to_torch_state_dict_payload",
     "nesterov_outer_step",
     "parse_checkpoint_event",
     "parse_heartbeat_event",
@@ -267,7 +276,8 @@ __all__ = [
     "train_regression",
     "train_linear_regression",
     "train_mlp_regression",
+    "write_torch_checkpoint",
     "zeros_like",
 ]
 
-__version__ = "0.10.0"
+__version__ = "0.11.0"

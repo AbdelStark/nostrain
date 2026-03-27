@@ -172,14 +172,26 @@ Delivered in the current repository state:
 
 This moves the project from an abstract external-runtime boundary to a concrete framework-facing bridge that can exchange model weights with PyTorch-style state dicts while preserving the existing protocol and training contracts.
 
-## Next milestone: native framework execution
+## Completed milestone: native PyTorch checkpoints + torch backend
 
-Goal: move beyond state interchange and let the worker loop execute against at least one real framework runtime directly.
+Delivered in the current repository state:
+
+- direct `.pt` / `.pth` `torch.save` checkpoint import/export alongside the existing `.pt.npz` archive bridge
+- wrapped checkpoint loading for common `state_dict` / `model_state_dict` payload layouts
+- backend-selectable local training/evaluation through `python`, `numpy`, and `torch`
+- relay-backed `run-training` support for torch-backed workers without changing protocol/checkpoint semantics
+- conformance tests covering native checkpoint round-trips plus CLI/relay torch-backend execution
+
+This moves the project from a state-dict archive bridge to a framework-aware runtime path that can exchange and optimize built-in models through native PyTorch checkpoint files and tensor execution.
+
+## Next milestone: module-native adapters
+
+Goal: move beyond built-in tensor layouts and support richer framework-native module workflows.
 
 Deliverables:
 
-- direct `torch.save` / framework-native checkpoint I/O without the intermediate `.pt.npz` archive bridge
-- at least one framework-backed local training/evaluation path that conforms to the existing `train-local` / `run-training` contracts
+- optional module wrappers for built-in runtimes so `nostrain` can materialize `torch.nn.Module` graphs directly
+- broader checkpoint import support for common framework training bundles without requiring manual state-dict extraction
 
 ## Deferred polish
 

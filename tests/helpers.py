@@ -1,9 +1,45 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+import os
+from pathlib import Path
+import sys
 from typing import Any
 import unittest
 
 from nostrain.model import ModelState
+
+ROOT = Path(__file__).resolve().parents[1]
+FAKE_TORCH_ROOT = ROOT / "tests" / "fake_torch"
+
+
+def build_test_env(*, include_fake_torch: bool = False) -> dict[str, str]:
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH")
+    pythonpath_entries = [str(ROOT / "src")]
+    if include_fake_torch:
+        pythonpath_entries.append(str(FAKE_TORCH_ROOT))
+    if existing_pythonpath:
+        pythonpath_entries.append(existing_pythonpath)
+    env["PYTHONPATH"] = ":".join(pythonpath_entries)
+    return env
+
+
+@contextmanager
+def fake_torch_imports():
+    fake_torch_path = str(FAKE_TORCH_ROOT)
+    previous_module = sys.modules.pop("torch", None)
+    sys.path.insert(0, fake_torch_path)
+    try:
+        yield
+    finally:
+        sys.modules.pop("torch", None)
+        try:
+            sys.path.remove(fake_torch_path)
+        except ValueError:
+            pass
+        if previous_module is not None:
+            sys.modules["torch"] = previous_module
 
 
 def assert_state_json_almost_equal(

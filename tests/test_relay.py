@@ -39,7 +39,11 @@ from nostrain.relay import (
 )
 from nostrain.retry import RelayRetryPolicy
 from nostrain.training import TrainingCheckpoint, TrainingRoundSummary
-from tests.helpers import assert_model_state_almost_equal, assert_state_json_almost_equal
+from tests.helpers import (
+    assert_model_state_almost_equal,
+    assert_state_json_almost_equal,
+    build_test_env,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -420,15 +424,15 @@ class FlakyMockRelay(MockRelay):
 
 
 class RelayTransportTests(unittest.TestCase):
-    def _run(self, *args: str) -> subprocess.CompletedProcess[str]:
-        env = os.environ.copy()
-        existing_pythonpath = env.get("PYTHONPATH")
-        src_path = str(ROOT / "src")
-        env["PYTHONPATH"] = src_path if not existing_pythonpath else f"{src_path}:{existing_pythonpath}"
+    def _run(
+        self,
+        *args: str,
+        include_fake_torch: bool = False,
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [sys.executable, "-m", "nostrain", *args],
             cwd=ROOT,
-            env=env,
+            env=build_test_env(include_fake_torch=include_fake_torch),
             text=True,
             capture_output=True,
             check=True,
@@ -1265,6 +1269,71 @@ class RelayTransportTests(unittest.TestCase):
 
             self.assertIn("parameters", final_state_json_data)
             self.assertEqual(summary_json["backend"], "numpy")
+            self.assertEqual(summary_json["rounds_completed"], 1)
+            self.assertEqual(summary_json["rounds"][0]["collected_event_count"], 1)
+
+    def test_cli_run_training_supports_torch_backend_and_native_torch_state_io(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory, MockRelay() as relay:
+            tempdir = Path(temporary_directory)
+            initial_state = tempdir / "initial-state.pt"
+            final_state = tempdir / "final-state.pt"
+            final_state_json = tempdir / "final-state.json"
+            summary = tempdir / "summary.json"
+
+            self._run(
+                "convert-state",
+                str(FIXTURES / "linear_initial_state.json"),
+                "-o",
+                str(initial_state),
+                include_fake_torch=True,
+            )
+            self._run(
+                "run-training",
+                str(initial_state),
+                str(FIXTURES / "linear_dataset_worker_a.json"),
+                "--relay",
+                relay.url,
+                "--run",
+                "torch-run",
+                "--worker",
+                "worker-a",
+                "--sec-key",
+                WORKER_SECRET_KEYS["worker-a"],
+                "--backend",
+                "torch",
+                "--rounds",
+                "1",
+                "--inner-steps",
+                "20",
+                "--local-learning-rate",
+                "0.05",
+                "--batch-size",
+                "2",
+                "--outer-learning-rate",
+                "1.0",
+                "--momentum",
+                "0.0",
+                "--round-timeout",
+                "0.2",
+                "--summary-out",
+                str(summary),
+                "-o",
+                str(final_state),
+                include_fake_torch=True,
+            )
+            self._run(
+                "convert-state",
+                str(final_state),
+                "-o",
+                str(final_state_json),
+                include_fake_torch=True,
+            )
+
+            final_state_json_data = json.loads(final_state_json.read_text(encoding="utf-8"))
+            summary_json = json.loads(summary.read_text(encoding="utf-8"))
+
+            self.assertIn("parameters", final_state_json_data)
+            self.assertEqual(summary_json["backend"], "torch")
             self.assertEqual(summary_json["rounds_completed"], 1)
             self.assertEqual(summary_json["rounds"][0]["collected_event_count"], 1)
 

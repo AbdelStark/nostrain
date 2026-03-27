@@ -9,7 +9,11 @@ import tempfile
 import unittest
 
 from nostrain.model import ModelState
-from nostrain.runtime import NUMPY_TRAINING_BACKEND, PYTHON_TRAINING_BACKEND
+from nostrain.runtime import (
+    NUMPY_TRAINING_BACKEND,
+    PYTHON_TRAINING_BACKEND,
+    TORCH_TRAINING_BACKEND,
+)
 from nostrain.training import (
     MLP_REGRESSION_RUNTIME,
     LateGradientRecord,
@@ -25,7 +29,7 @@ from nostrain.training import (
     train_regression,
     train_linear_regression,
 )
-from tests.helpers import assert_model_state_almost_equal
+from tests.helpers import assert_model_state_almost_equal, build_test_env, fake_torch_imports
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -33,15 +37,15 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 
 class TrainingRuntimeTests(unittest.TestCase):
-    def _run(self, *args: str) -> subprocess.CompletedProcess[str]:
-        env = os.environ.copy()
-        existing_pythonpath = env.get("PYTHONPATH")
-        src_path = str(ROOT / "src")
-        env["PYTHONPATH"] = src_path if not existing_pythonpath else f"{src_path}:{existing_pythonpath}"
+    def _run(
+        self,
+        *args: str,
+        include_fake_torch: bool = False,
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [sys.executable, "-m", "nostrain", *args],
             cwd=ROOT,
-            env=env,
+            env=build_test_env(include_fake_torch=include_fake_torch),
             text=True,
             capture_output=True,
             check=True,
@@ -159,6 +163,72 @@ class TrainingRuntimeTests(unittest.TestCase):
             self,
             python_result.trained_state,
             numpy_result.trained_state,
+            places=8,
+        )
+
+    def test_train_linear_regression_torch_backend_matches_python_backend(self) -> None:
+        state = ModelState.from_path(FIXTURES / "linear_initial_state.json")
+        dataset = LinearRegressionDataset.from_path(FIXTURES / "linear_dataset_worker_a.json")
+        config = LocalTrainingConfig(
+            steps=40,
+            learning_rate=0.05,
+            batch_size=2,
+        )
+
+        python_result = train_linear_regression(
+            state,
+            dataset,
+            config=config,
+            backend_name=PYTHON_TRAINING_BACKEND,
+        )
+        with fake_torch_imports():
+            torch_result = train_linear_regression(
+                state,
+                dataset,
+                config=config,
+                backend_name=TORCH_TRAINING_BACKEND,
+            )
+
+        self.assertEqual(torch_result.backend_name, TORCH_TRAINING_BACKEND)
+        self.assertAlmostEqual(python_result.loss_after, torch_result.loss_after, places=10)
+        assert_model_state_almost_equal(
+            self,
+            python_result.trained_state,
+            torch_result.trained_state,
+            places=10,
+        )
+
+    def test_train_mlp_regression_torch_backend_matches_python_backend(self) -> None:
+        state = ModelState.from_path(FIXTURES / "mlp_initial_state.json")
+        dataset = RegressionDataset.from_path(FIXTURES / "mlp_dataset_worker_a.json")
+        config = LocalTrainingConfig(
+            steps=40,
+            learning_rate=0.05,
+            batch_size=2,
+        )
+
+        python_result = train_regression(
+            state,
+            dataset,
+            config=config,
+            runtime_name=MLP_REGRESSION_RUNTIME,
+            backend_name=PYTHON_TRAINING_BACKEND,
+        )
+        with fake_torch_imports():
+            torch_result = train_regression(
+                state,
+                dataset,
+                config=config,
+                runtime_name=MLP_REGRESSION_RUNTIME,
+                backend_name=TORCH_TRAINING_BACKEND,
+            )
+
+        self.assertEqual(torch_result.backend_name, TORCH_TRAINING_BACKEND)
+        self.assertAlmostEqual(python_result.loss_after, torch_result.loss_after, places=8)
+        assert_model_state_almost_equal(
+            self,
+            python_result.trained_state,
+            torch_result.trained_state,
             places=8,
         )
 
@@ -333,6 +403,54 @@ class TrainingRuntimeTests(unittest.TestCase):
 
             self.assertIn("parameters", trained_json)
             self.assertEqual(metrics_json["runtime"], "linear-regression")
+            self.assertLess(metrics_json["loss_after"], metrics_json["loss_before"])
+
+    def test_cli_train_local_supports_torch_backend_and_native_torch_state_io(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            tempdir = Path(temporary_directory)
+            initial_state = tempdir / "linear-state.pt"
+            trained_state = tempdir / "trained-state.pt"
+            trained_state_json = tempdir / "trained-state.json"
+            metrics = tempdir / "metrics.json"
+
+            self._run(
+                "convert-state",
+                str(FIXTURES / "linear_initial_state.json"),
+                "-o",
+                str(initial_state),
+                include_fake_torch=True,
+            )
+            self._run(
+                "train-local",
+                str(initial_state),
+                str(FIXTURES / "linear_dataset_worker_a.json"),
+                "--backend",
+                "torch",
+                "--steps",
+                "30",
+                "--learning-rate",
+                "0.05",
+                "--batch-size",
+                "2",
+                "--metrics-out",
+                str(metrics),
+                "-o",
+                str(trained_state),
+                include_fake_torch=True,
+            )
+            self._run(
+                "convert-state",
+                str(trained_state),
+                "-o",
+                str(trained_state_json),
+                include_fake_torch=True,
+            )
+
+            trained_json = json.loads(trained_state_json.read_text(encoding="utf-8"))
+            metrics_json = json.loads(metrics.read_text(encoding="utf-8"))
+
+            self.assertIn("parameters", trained_json)
+            self.assertEqual(metrics_json["backend"], "torch")
             self.assertLess(metrics_json["loss_after"], metrics_json["loss_before"])
 
     def test_training_checkpoint_roundtrip_preserves_late_gradients(self) -> None:
