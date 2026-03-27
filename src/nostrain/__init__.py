@@ -73,6 +73,7 @@ from .training import (
     LinearModelAdapter,
     LinearRegressionDataset,
     LateGradientRecord,
+    LateGradientReconciliationSummary,
     LocalTrainingConfig,
     LocalTrainingResult,
     RegressionExample,
@@ -103,6 +104,7 @@ __all__ = [
     "LinearRegressionDataset",
     "LateGradientCollectionResult",
     "LateGradientRecord",
+    "LateGradientReconciliationSummary",
     "LocalTrainingConfig",
     "LocalTrainingResult",
     "ModelState",
@@ -166,4 +168,4 @@ __all__ = [
     "zeros_like",
 ]
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"

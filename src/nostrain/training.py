@@ -7,9 +7,16 @@ import shutil
 import time
 from typing import Any
 
-from .aggregation import nesterov_outer_step
-from .compression import CompressionCodec, compress_delta
-from .model import ModelState, TensorState, compute_delta, state_digest
+from .aggregation import aggregate_deltas, nesterov_outer_step
+from .compression import CompressionCodec, compress_delta, decompress_payload
+from .model import (
+    ModelState,
+    TensorState,
+    add_states,
+    compute_delta,
+    state_digest,
+    zeros_like,
+)
 from .protocol import (
     CheckpointEventMetadata,
     GradientEventMetadata,
@@ -26,6 +33,7 @@ from .relay import (
 
 LINEAR_WEIGHT_PARAMETER = "linear.weight"
 LINEAR_BIAS_PARAMETER = "linear.bias"
+LATE_GRADIENT_STRATEGIES = {"discard", "deferred"}
 
 
 @dataclass(frozen=True)
@@ -315,6 +323,9 @@ class TrainingWorkerConfig:
     heartbeat_interval: int = 60
     max_missed_heartbeats: int = 3
     late_gradient_timeout: float = 0.2
+    late_gradient_strategy: str = "deferred"
+    late_reconciliation_learning_rate: float | None = None
+    late_reconciliation_momentum: float | None = None
     advertised_relays: tuple[str, ...] = ()
     checkpoint_history: int = 4
     artifact_retention_rounds: int | None = None
@@ -352,6 +363,21 @@ class TrainingWorkerConfig:
             raise ValueError("max missed heartbeats must be positive")
         if self.late_gradient_timeout <= 0:
             raise ValueError("late gradient timeout must be positive")
+        if self.late_gradient_strategy not in LATE_GRADIENT_STRATEGIES:
+            raise ValueError(
+                "late gradient strategy must be one of: "
+                + ", ".join(sorted(LATE_GRADIENT_STRATEGIES))
+            )
+        if (
+            self.late_reconciliation_learning_rate is not None
+            and self.late_reconciliation_learning_rate <= 0
+        ):
+            raise ValueError("late reconciliation learning rate must be positive when provided")
+        if (
+            self.late_reconciliation_momentum is not None
+            and not 0 <= self.late_reconciliation_momentum < 1
+        ):
+            raise ValueError("late reconciliation momentum must be within [0, 1)")
         if self.checkpoint_history <= 0:
             raise ValueError("checkpoint history must be positive")
         if (
@@ -375,6 +401,18 @@ class TrainingWorkerConfig:
     def relay_url(self) -> str:
         return self.relay_urls[0]
 
+    @property
+    def effective_late_reconciliation_learning_rate(self) -> float:
+        if self.late_reconciliation_learning_rate is None:
+            return self.outer_learning_rate
+        return self.late_reconciliation_learning_rate
+
+    @property
+    def effective_late_reconciliation_momentum(self) -> float:
+        if self.late_reconciliation_momentum is None:
+            return self.outer_momentum
+        return self.late_reconciliation_momentum
+
 
 @dataclass(frozen=True)
 class LateGradientRecord:
@@ -383,15 +421,43 @@ class LateGradientRecord:
     event_id: str
     created_at: int
     model_hash: str
+    payload: str | None = None
+    reconciliation_round: int | None = None
+    reconciliation_model_hash_before: str | None = None
+    reconciliation_model_hash_after: str | None = None
+    reconciliation_error: str | None = None
+
+    @property
+    def is_reconciled(self) -> bool:
+        return self.reconciliation_round is not None
+
+    @property
+    def is_reconcilable(self) -> bool:
+        return (
+            self.payload is not None
+            and self.reconciliation_round is None
+            and self.reconciliation_error is None
+        )
 
     def to_json_obj(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "round": self.round_index,
             "worker": self.worker_id,
             "event_id": self.event_id,
             "created_at": self.created_at,
             "model_hash": self.model_hash,
         }
+        if self.payload is not None:
+            data["payload"] = self.payload
+        if self.reconciliation_round is not None:
+            data["reconciliation_round"] = self.reconciliation_round
+        if self.reconciliation_model_hash_before is not None:
+            data["reconciliation_model_hash_before"] = self.reconciliation_model_hash_before
+        if self.reconciliation_model_hash_after is not None:
+            data["reconciliation_model_hash_after"] = self.reconciliation_model_hash_after
+        if self.reconciliation_error is not None:
+            data["reconciliation_error"] = self.reconciliation_error
+        return data
 
     @classmethod
     def from_json_obj(cls, data: Any) -> "LateGradientRecord":
@@ -403,6 +469,72 @@ class LateGradientRecord:
             event_id=str(data["event_id"]),
             created_at=int(data["created_at"]),
             model_hash=str(data["model_hash"]),
+            payload=str(data["payload"]) if data.get("payload") is not None else None,
+            reconciliation_round=(
+                int(data["reconciliation_round"])
+                if data.get("reconciliation_round") is not None
+                else None
+            ),
+            reconciliation_model_hash_before=(
+                str(data["reconciliation_model_hash_before"])
+                if data.get("reconciliation_model_hash_before") is not None
+                else None
+            ),
+            reconciliation_model_hash_after=(
+                str(data["reconciliation_model_hash_after"])
+                if data.get("reconciliation_model_hash_after") is not None
+                else None
+            ),
+            reconciliation_error=(
+                str(data["reconciliation_error"])
+                if data.get("reconciliation_error") is not None
+                else None
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class LateGradientReconciliationSummary:
+    current_round: int
+    event_count: int
+    worker_ids: tuple[str, ...]
+    late_rounds: tuple[int, ...]
+    event_ids: tuple[str, ...]
+    learning_rate: float
+    momentum: float
+    model_hash_before: str
+    model_hash_after: str
+    applied_at: int
+
+    def to_json_obj(self) -> dict[str, Any]:
+        return {
+            "current_round": self.current_round,
+            "event_count": self.event_count,
+            "workers": list(self.worker_ids),
+            "late_rounds": list(self.late_rounds),
+            "event_ids": list(self.event_ids),
+            "learning_rate": self.learning_rate,
+            "momentum": self.momentum,
+            "model_hash_before": self.model_hash_before,
+            "model_hash_after": self.model_hash_after,
+            "applied_at": self.applied_at,
+        }
+
+    @classmethod
+    def from_json_obj(cls, data: Any) -> "LateGradientReconciliationSummary":
+        if not isinstance(data, dict):
+            raise ValueError("late gradient reconciliation JSON must be an object")
+        return cls(
+            current_round=int(data["current_round"]),
+            event_count=int(data["event_count"]),
+            worker_ids=tuple(str(worker) for worker in data.get("workers", [])),
+            late_rounds=tuple(int(round_index) for round_index in data.get("late_rounds", [])),
+            event_ids=tuple(str(event_id) for event_id in data.get("event_ids", [])),
+            learning_rate=float(data["learning_rate"]),
+            momentum=float(data["momentum"]),
+            model_hash_before=str(data["model_hash_before"]),
+            model_hash_after=str(data["model_hash_after"]),
+            applied_at=int(data["applied_at"]),
         )
 
 
@@ -427,6 +559,12 @@ class TrainingRoundSummary:
     published_checkpoint_relays: tuple[str, ...]
     collected_from_relays: tuple[str, ...]
     failed_relays: tuple[str, ...]
+    reconciled_late_gradient_count: int = 0
+    reconciled_late_workers: tuple[str, ...] = ()
+    reconciled_late_rounds: tuple[int, ...] = ()
+    late_reconciliation_model_hash_before: str = ""
+    late_reconciliation_model_hash_after: str = ""
+    late_reconciliation_error_count: int = 0
 
     @property
     def missing_workers(self) -> tuple[str, ...]:
@@ -454,6 +592,12 @@ class TrainingRoundSummary:
             "published_checkpoint_relays": list(self.published_checkpoint_relays),
             "collected_from_relays": list(self.collected_from_relays),
             "failed_relays": list(self.failed_relays),
+            "reconciled_late_gradient_count": self.reconciled_late_gradient_count,
+            "reconciled_late_workers": list(self.reconciled_late_workers),
+            "reconciled_late_rounds": list(self.reconciled_late_rounds),
+            "late_reconciliation_model_hash_before": self.late_reconciliation_model_hash_before,
+            "late_reconciliation_model_hash_after": self.late_reconciliation_model_hash_after,
+            "late_reconciliation_error_count": self.late_reconciliation_error_count,
         }
 
     @classmethod
@@ -488,6 +632,20 @@ class TrainingRoundSummary:
                 str(relay) for relay in data.get("collected_from_relays", [])
             ),
             failed_relays=tuple(str(relay) for relay in data.get("failed_relays", [])),
+            reconciled_late_gradient_count=int(data.get("reconciled_late_gradient_count", 0)),
+            reconciled_late_workers=tuple(
+                str(worker) for worker in data.get("reconciled_late_workers", [])
+            ),
+            reconciled_late_rounds=tuple(
+                int(round_index) for round_index in data.get("reconciled_late_rounds", [])
+            ),
+            late_reconciliation_model_hash_before=str(
+                data.get("late_reconciliation_model_hash_before", "")
+            ),
+            late_reconciliation_model_hash_after=str(
+                data.get("late_reconciliation_model_hash_after", "")
+            ),
+            late_reconciliation_error_count=int(data.get("late_reconciliation_error_count", 0)),
         )
 
 
@@ -504,10 +662,23 @@ class TrainingSessionResult:
     checkpoint_history: int = 1
     artifact_retention_rounds: int | None = None
     late_gradients: tuple[LateGradientRecord, ...] = ()
+    late_reconciliations: tuple[LateGradientReconciliationSummary, ...] = ()
 
     @property
     def final_model_hash(self) -> str:
         return state_digest(self.final_state)
+
+    @property
+    def reconciled_late_gradient_count(self) -> int:
+        return sum(1 for record in self.late_gradients if record.is_reconciled)
+
+    @property
+    def pending_late_gradient_count(self) -> int:
+        return sum(1 for record in self.late_gradients if record.is_reconcilable)
+
+    @property
+    def late_gradient_error_count(self) -> int:
+        return sum(1 for record in self.late_gradients if record.reconciliation_error is not None)
 
     def to_json_obj(
         self,
@@ -526,12 +697,19 @@ class TrainingSessionResult:
             "checkpoint_history": self.checkpoint_history,
             "artifact_retention_rounds": self.artifact_retention_rounds,
             "late_gradient_count": len(self.late_gradients),
+            "reconciled_late_gradient_count": self.reconciled_late_gradient_count,
+            "pending_late_gradient_count": self.pending_late_gradient_count,
+            "late_gradient_error_count": self.late_gradient_error_count,
         }
         if include_rounds:
             data["rounds"] = [round_summary.to_json_obj() for round_summary in self.rounds]
         if self.late_gradients:
             data["late_gradients"] = [
                 late_gradient.to_json_obj() for late_gradient in self.late_gradients
+            ]
+        if self.late_reconciliations:
+            data["late_reconciliations"] = [
+                reconciliation.to_json_obj() for reconciliation in self.late_reconciliations
             ]
         if include_final_state:
             data["final_state"] = self.final_state.to_json_obj()
@@ -550,7 +728,9 @@ class TrainingCheckpoint:
     momentum_state: ModelState | None
     rounds: tuple[TrainingRoundSummary, ...]
     late_gradients: tuple[LateGradientRecord, ...]
+    late_reconciliations: tuple[LateGradientReconciliationSummary, ...]
     updated_at: int
+    late_gradient_since: int = 0
 
     @property
     def rounds_completed(self) -> int:
@@ -565,7 +745,7 @@ class TrainingCheckpoint:
     def to_json_obj(self) -> dict[str, Any]:
         data: dict[str, Any] = {
             "format": "nostrain-training-checkpoint",
-            "version": 1,
+            "version": 2,
             "run": self.run_name,
             "worker": self.worker_id,
             "relays": list(self.relay_urls),
@@ -576,6 +756,10 @@ class TrainingCheckpoint:
             "current_state": self.current_state.to_json_obj(),
             "rounds": [round_summary.to_json_obj() for round_summary in self.rounds],
             "late_gradients": [late_gradient.to_json_obj() for late_gradient in self.late_gradients],
+            "late_reconciliations": [
+                reconciliation.to_json_obj() for reconciliation in self.late_reconciliations
+            ],
+            "late_gradient_since": self.late_gradient_since,
         }
         if self.momentum_state is not None:
             data["momentum_state"] = self.momentum_state.to_json_obj()
@@ -605,6 +789,11 @@ class TrainingCheckpoint:
                 LateGradientRecord.from_json_obj(record)
                 for record in data.get("late_gradients", [])
             ),
+            late_reconciliations=tuple(
+                LateGradientReconciliationSummary.from_json_obj(record)
+                for record in data.get("late_reconciliations", [])
+            ),
+            late_gradient_since=int(data.get("late_gradient_since", 0)),
             updated_at=int(data.get("updated_at", 0)),
         )
 
@@ -713,6 +902,181 @@ def _apply_artifact_retention(
     )
 
 
+def _merge_late_gradient_record(
+    existing: LateGradientRecord,
+    incoming: LateGradientRecord,
+) -> LateGradientRecord:
+    return LateGradientRecord(
+        round_index=existing.round_index,
+        worker_id=existing.worker_id,
+        event_id=existing.event_id,
+        created_at=max(existing.created_at, incoming.created_at),
+        model_hash=existing.model_hash or incoming.model_hash,
+        payload=existing.payload if existing.payload is not None else incoming.payload,
+        reconciliation_round=(
+            existing.reconciliation_round
+            if existing.reconciliation_round is not None
+            else incoming.reconciliation_round
+        ),
+        reconciliation_model_hash_before=(
+            existing.reconciliation_model_hash_before
+            if existing.reconciliation_model_hash_before is not None
+            else incoming.reconciliation_model_hash_before
+        ),
+        reconciliation_model_hash_after=(
+            existing.reconciliation_model_hash_after
+            if existing.reconciliation_model_hash_after is not None
+            else incoming.reconciliation_model_hash_after
+        ),
+        reconciliation_error=(
+            existing.reconciliation_error
+            if existing.reconciliation_error is not None
+            else incoming.reconciliation_error
+        ),
+    )
+
+
+def _merge_late_gradient_records(
+    existing_records: list[LateGradientRecord],
+    new_records: list[LateGradientRecord],
+) -> list[LateGradientRecord]:
+    merged: dict[str, LateGradientRecord] = {}
+    order: list[str] = []
+    for record in (*existing_records, *new_records):
+        current = merged.get(record.event_id)
+        if current is None:
+            merged[record.event_id] = record
+            order.append(record.event_id)
+            continue
+        merged[record.event_id] = _merge_late_gradient_record(current, record)
+    return [merged[event_id] for event_id in order]
+
+
+@dataclass(frozen=True)
+class _LateGradientReconciliationOutcome:
+    current_state: ModelState
+    momentum_state: ModelState | None
+    late_gradients: tuple[LateGradientRecord, ...]
+    summary: LateGradientReconciliationSummary | None
+    error_count: int
+
+
+def _reconcile_late_gradients(
+    current_state: ModelState,
+    current_momentum: ModelState | None,
+    late_gradients: list[LateGradientRecord],
+    *,
+    current_round: int,
+    config: TrainingWorkerConfig,
+) -> _LateGradientReconciliationOutcome:
+    if config.late_gradient_strategy != "deferred":
+        return _LateGradientReconciliationOutcome(
+            current_state=current_state,
+            momentum_state=current_momentum,
+            late_gradients=tuple(late_gradients),
+            summary=None,
+            error_count=0,
+        )
+
+    pending_records = [record for record in late_gradients if record.is_reconcilable]
+    if not pending_records:
+        return _LateGradientReconciliationOutcome(
+            current_state=current_state,
+            momentum_state=current_momentum,
+            late_gradients=tuple(late_gradients),
+            summary=None,
+            error_count=0,
+        )
+
+    updated_records = list(late_gradients)
+    record_indexes = {
+        record.event_id: index for index, record in enumerate(updated_records)
+    }
+    validated_records: list[LateGradientRecord] = []
+    validated_deltas: list[ModelState] = []
+    error_count = 0
+
+    for record in pending_records:
+        try:
+            delta = decompress_payload(record.payload or "")
+            add_states(zeros_like(current_state), delta)
+        except Exception as exc:
+            error_count += 1
+            updated_records[record_indexes[record.event_id]] = LateGradientRecord(
+                round_index=record.round_index,
+                worker_id=record.worker_id,
+                event_id=record.event_id,
+                created_at=record.created_at,
+                model_hash=record.model_hash,
+                payload=record.payload,
+                reconciliation_round=record.reconciliation_round,
+                reconciliation_model_hash_before=record.reconciliation_model_hash_before,
+                reconciliation_model_hash_after=record.reconciliation_model_hash_after,
+                reconciliation_error=f"{type(exc).__name__}: {exc}",
+            )
+            continue
+        validated_records.append(record)
+        validated_deltas.append(delta)
+
+    if not validated_records:
+        return _LateGradientReconciliationOutcome(
+            current_state=current_state,
+            momentum_state=current_momentum,
+            late_gradients=tuple(updated_records),
+            summary=None,
+            error_count=error_count,
+        )
+
+    learning_rate = config.effective_late_reconciliation_learning_rate
+    momentum = config.effective_late_reconciliation_momentum
+    model_hash_before = state_digest(current_state)
+    outer_result = nesterov_outer_step(
+        current_state,
+        aggregate_deltas(validated_deltas),
+        learning_rate=learning_rate,
+        momentum=momentum,
+        previous_momentum=current_momentum,
+    )
+    model_hash_after = state_digest(outer_result.next_state)
+
+    for record in validated_records:
+        updated_records[record_indexes[record.event_id]] = LateGradientRecord(
+            round_index=record.round_index,
+            worker_id=record.worker_id,
+            event_id=record.event_id,
+            created_at=record.created_at,
+            model_hash=record.model_hash,
+            payload=record.payload,
+            reconciliation_round=current_round,
+            reconciliation_model_hash_before=model_hash_before,
+            reconciliation_model_hash_after=model_hash_after,
+            reconciliation_error=None,
+        )
+
+    return _LateGradientReconciliationOutcome(
+        current_state=outer_result.next_state,
+        momentum_state=outer_result.momentum_state,
+        late_gradients=tuple(updated_records),
+        summary=LateGradientReconciliationSummary(
+            current_round=current_round,
+            event_count=len(validated_records),
+            worker_ids=tuple(
+                sorted({record.worker_id for record in validated_records})
+            ),
+            late_rounds=tuple(
+                sorted({record.round_index for record in validated_records})
+            ),
+            event_ids=tuple(record.event_id for record in validated_records),
+            learning_rate=learning_rate,
+            momentum=momentum,
+            model_hash_before=model_hash_before,
+            model_hash_after=model_hash_after,
+            applied_at=int(time.time()),
+        ),
+        error_count=error_count,
+    )
+
+
 async def run_training_session(
     initial_state: ModelState,
     dataset: LinearRegressionDataset,
@@ -723,6 +1087,7 @@ async def run_training_session(
     artifact_dir: str | Path | None = None,
     prior_rounds: tuple[TrainingRoundSummary, ...] = (),
     prior_late_gradients: tuple[LateGradientRecord, ...] = (),
+    prior_late_reconciliations: tuple[LateGradientReconciliationSummary, ...] = (),
     late_gradient_since: int | None = None,
     checkpoint_out: str | Path | None = None,
 ) -> TrainingSessionResult:
@@ -731,6 +1096,9 @@ async def run_training_session(
     current_momentum = previous_momentum
     round_summaries: list[TrainingRoundSummary] = list(prior_rounds)
     late_gradients: list[LateGradientRecord] = list(prior_late_gradients)
+    late_reconciliations: list[LateGradientReconciliationSummary] = list(
+        prior_late_reconciliations
+    )
     late_scan_since = late_gradient_since
     artifact_root = Path(artifact_dir) if artifact_dir is not None else None
 
@@ -741,6 +1109,8 @@ async def run_training_session(
             artifact_root / f"round-{round_index:04d}" if artifact_root is not None else None
         )
         late_collection = None
+        late_reconciliation = None
+        late_reconciliation_error_count = 0
 
         if late_scan_since is not None:
             late_collection = await collect_late_gradient_events_across_relays(
@@ -749,20 +1119,43 @@ async def run_training_session(
                 current_round=round_index,
                 idle_timeout=min(config.late_gradient_timeout, config.round_timeout),
                 open_timeout=config.open_timeout,
-                since=late_scan_since,
+                since=late_scan_since + 1,
             )
-            late_gradients.extend(
-                LateGradientRecord(
-                    round_index=event.parsed.metadata.round_index,
-                    worker_id=event.parsed.metadata.worker_id,
-                    event_id=event.event_id,
-                    created_at=event.parsed.event.created_at,
-                    model_hash=event.parsed.metadata.model_hash,
-                )
-                for event in late_collection.events
+            late_gradients = _merge_late_gradient_records(
+                late_gradients,
+                [
+                    LateGradientRecord(
+                        round_index=event.parsed.metadata.round_index,
+                        worker_id=event.parsed.metadata.worker_id,
+                        event_id=event.event_id,
+                        created_at=event.parsed.event.created_at,
+                        model_hash=event.parsed.metadata.model_hash,
+                        payload=event.parsed.event.content,
+                    )
+                    for event in late_collection.events
+                ],
             )
             if round_dir is not None:
                 _write_json(round_dir / "late-gradients.json", late_collection.to_json_obj())
+
+        late_reconciliation = _reconcile_late_gradients(
+            current_state,
+            current_momentum,
+            late_gradients,
+            current_round=round_index,
+            config=config,
+        )
+        current_state = late_reconciliation.current_state
+        current_momentum = late_reconciliation.momentum_state
+        late_gradients = list(late_reconciliation.late_gradients)
+        late_reconciliation_error_count = late_reconciliation.error_count
+        if late_reconciliation.summary is not None:
+            late_reconciliations.append(late_reconciliation.summary)
+            if round_dir is not None:
+                _write_json(
+                    round_dir / "late-reconciliation.json",
+                    late_reconciliation.summary.to_json_obj(),
+                )
 
         heartbeat_event = build_heartbeat_event(
             HeartbeatEventMetadata(
@@ -894,6 +1287,32 @@ async def run_training_session(
             published_checkpoint_relays=(),
             collected_from_relays=collection.successful_relays,
             failed_relays=(),
+            reconciled_late_gradient_count=(
+                late_reconciliation.summary.event_count
+                if late_reconciliation.summary is not None
+                else 0
+            ),
+            reconciled_late_workers=(
+                late_reconciliation.summary.worker_ids
+                if late_reconciliation.summary is not None
+                else ()
+            ),
+            reconciled_late_rounds=(
+                late_reconciliation.summary.late_rounds
+                if late_reconciliation.summary is not None
+                else ()
+            ),
+            late_reconciliation_model_hash_before=(
+                late_reconciliation.summary.model_hash_before
+                if late_reconciliation.summary is not None
+                else ""
+            ),
+            late_reconciliation_model_hash_after=(
+                late_reconciliation.summary.model_hash_after
+                if late_reconciliation.summary is not None
+                else ""
+            ),
+            late_reconciliation_error_count=late_reconciliation_error_count,
         )
         checkpoint_rounds = tuple((*round_summaries, checkpoint_round_summary))
         checkpoint = TrainingCheckpoint(
@@ -905,7 +1324,21 @@ async def run_training_session(
             momentum_state=current_momentum,
             rounds=checkpoint_rounds,
             late_gradients=tuple(late_gradients),
+            late_reconciliations=tuple(late_reconciliations),
             updated_at=int(time.time()),
+            late_gradient_since=max(
+                value
+                for value in (
+                    late_scan_since,
+                    gradient_event.created_at,
+                    *(event.parsed.event.created_at for event in collection.events),
+                    *(
+                        event.parsed.event.created_at
+                        for event in (late_collection.events if late_collection is not None else ())
+                    ),
+                )
+                if value is not None
+            ),
         )
         checkpoint_event = build_checkpoint_event(
             CheckpointEventMetadata(
@@ -962,6 +1395,32 @@ async def run_training_session(
                 failed_relays=tuple(
                     relay_url for relay_url in config.relay_urls if relay_url in failed_relay_urls
                 ),
+                reconciled_late_gradient_count=(
+                    late_reconciliation.summary.event_count
+                    if late_reconciliation.summary is not None
+                    else 0
+                ),
+                reconciled_late_workers=(
+                    late_reconciliation.summary.worker_ids
+                    if late_reconciliation.summary is not None
+                    else ()
+                ),
+                reconciled_late_rounds=(
+                    late_reconciliation.summary.late_rounds
+                    if late_reconciliation.summary is not None
+                    else ()
+                ),
+                late_reconciliation_model_hash_before=(
+                    late_reconciliation.summary.model_hash_before
+                    if late_reconciliation.summary is not None
+                    else ""
+                ),
+                late_reconciliation_model_hash_after=(
+                    late_reconciliation.summary.model_hash_after
+                    if late_reconciliation.summary is not None
+                    else ""
+                ),
+                late_reconciliation_error_count=late_reconciliation_error_count,
             )
         )
 
@@ -987,7 +1446,7 @@ async def run_training_session(
             )
         if checkpoint_out is not None:
             _write_json(Path(checkpoint_out), checkpoint.to_json_obj())
-        late_scan_since = checkpoint.updated_at
+        late_scan_since = checkpoint.late_gradient_since
 
     return TrainingSessionResult(
         run_name=config.run_name,
@@ -1001,4 +1460,5 @@ async def run_training_session(
         checkpoint_history=config.checkpoint_history,
         artifact_retention_rounds=config.artifact_retention_rounds,
         late_gradients=tuple(late_gradients),
+        late_reconciliations=tuple(late_reconciliations),
     )

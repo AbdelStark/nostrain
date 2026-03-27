@@ -2,11 +2,11 @@
 
 Distributed ML training over Nostr relays.
 
-The project vision is still the same: no coordinator, no central server, just workers exchanging sparse pseudo-gradients through Nostr. The repository now ships the protocol/payload toolkit, a signed relay transport slice, and a resilient end-to-end training runner: model snapshots, DiLoCo-style deltas, sparse transport payloads, NIP-01-compatible nostrain gradient/heartbeat/checkpoint events, relay collection with active-worker discovery, cross-relay deduplication, resumable checkpoints, relay-visible checkpoint distribution, late-gradient discard tracking, plus a built-in linear-regression worker loop that can train locally and synchronize through one or more relays.
+The project vision is still the same: no coordinator, no central server, just workers exchanging sparse pseudo-gradients through Nostr. The repository now ships the protocol/payload toolkit, a signed relay transport slice, and a resilient end-to-end training runner: model snapshots, DiLoCo-style deltas, sparse transport payloads, NIP-01-compatible nostrain gradient/heartbeat/checkpoint events, relay collection with active-worker discovery, cross-relay deduplication, resumable checkpoints, relay-visible checkpoint distribution, deferred late-gradient reconciliation, plus a built-in linear-regression worker loop that can train locally and synchronize through one or more relays.
 
 ## Current status
 
-`nostrain` v0.7.0 is a protocol, relay, and training toolchain. It implements:
+`nostrain` v0.8.0 is a protocol, relay, and training toolchain. It implements:
 
 - canonical model-state JSON loading and hashing
 - pseudo-gradient computation (`current - initial`)
@@ -28,11 +28,12 @@ The project vision is still the same: no coordinator, no central server, just wo
 - signed checkpoint distribution events carrying the latest recoverable training state
 - relay checkpoint discovery plus `run-training --resume-latest-checkpoint` for rejoining workers
 - rolling checkpoint-slot retention that bounds relay-visible checkpoint history per worker
-- explicit late-gradient scanning/discard reporting after a worker has already advanced rounds
+- checkpointed late-gradient payload tracking plus deferred reconciliation before the next round
+- configurable `run-training --late-gradient-strategy discard` accounting for record-only stale updates
 - bounded checkpoint artifacts plus optional per-round artifact pruning under `run-training`
 - a CLI for encoding, decoding, applying, publishing, collecting, and inspecting payloads
 
-It does **not** yet implement full late-gradient reconciliation after discard or richer runtimes such as PyTorch/MLX. The signed transport path now targets public NIP-01 relays as well as local/mock websocket endpoints, and the built-in runner is intentionally scoped to linear regression so the end-to-end training loop stays dependency-light and testable.
+It does **not** yet implement richer runtimes such as PyTorch/MLX. The signed transport path now targets public NIP-01 relays as well as local/mock websocket endpoints, and the built-in runner is intentionally scoped to linear regression so the end-to-end training loop stays dependency-light and testable.
 
 ## Install
 
@@ -299,6 +300,19 @@ nostrain run-training linear-initial.json worker-a-dataset.json \
   -o relay-resume-state.json
 ```
 
+Keep late gradients for audit only instead of folding them into the next round:
+
+```bash
+nostrain run-training linear-initial.json worker-a-dataset.json \
+  --relay ws://127.0.0.1:8765 \
+  --run linear-demo \
+  --sec-key 0000000000000000000000000000000000000000000000000000000000000003 \
+  --resume-latest-checkpoint \
+  --late-gradient-strategy discard \
+  --summary-out relay-resume-summary.json \
+  -o relay-resume-state.json
+```
+
 List active workers advertising a given run/round:
 
 ```bash
@@ -374,6 +388,5 @@ Heartbeat content is intentionally empty; worker capabilities and relay hints li
 - [x] Local checkpoint recovery for resumed workers
 - [x] Relay checkpoint advertisement/distribution
 - [x] Checkpoint retention/pruning policy
-- [x] Late-gradient discard tracking across advanced rounds
-- [ ] Full late-gradient reconciliation across advanced rounds
+- [x] Late-gradient reconciliation across advanced rounds
 - [ ] Live monitoring dashboard

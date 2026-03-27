@@ -112,13 +112,24 @@ Delivered in the current repository state:
 
 This moves the project from unbounded checkpoint accumulation to a retention-aware training system that can keep distributed recovery state compact without losing resumability.
 
-## Next milestone: late-gradient reconciliation + richer runtimes
+## Completed milestone: deferred late-gradient reconciliation
 
-Goal: finish the stale-update story and prepare the transport/runtime boundary for larger models.
+Delivered in the current repository state:
+
+- checkpoint/session persistence for late-gradient payloads plus an explicit late-gradient watermark for resume-safe scanning
+- deferred late-gradient reconciliation before the next round using a separate configurable outer step
+- CLI support for `run-training --late-gradient-strategy`, `--late-gradient-learning-rate`, and `--late-gradient-momentum`
+- per-round/session reporting that distinguishes reconciled, pending, and failed late-gradient records
+- protocol, relay, CLI, and training tests covering deferred reconciliation, record-only late-gradient mode, and checkpoint-resume equivalence
+
+This moves the project from stale-update accounting to a training loop that can actually reincorporate compatible late updates without replaying earlier rounds.
+
+## Next milestone: richer runtimes
+
+Goal: prepare the transport/runtime boundary for larger models.
 
 Deliverables:
 
-- a clearer reconciliation story for discarded late gradients
 - compatibility story for richer runtimes such as PyTorch/MLX on top of the resilient transport layer
 
 ## Deferred polish

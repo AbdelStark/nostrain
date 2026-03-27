@@ -1,8 +1,8 @@
-# nostrain: Specification v0.7.0
+# nostrain: Specification v0.8.0
 
 ## Overview
 
-nostrain is a protocol for distributed ML training over Nostr relays. The implemented repository milestone now covers the payload layer, a signed transport slice, and a resilient end-to-end runner: deterministic model snapshots, pseudo-gradient generation, sparse quantized wire encoding, NIP-01-compatible gradient/heartbeat/checkpoint event envelopes, websocket discovery/collection across one or more relays, resumable checkpoints, rolling checkpoint-slot retention, late-gradient discard tracking, and a built-in linear-regression worker loop that trains locally and synchronizes through relays.
+nostrain is a protocol for distributed ML training over Nostr relays. The implemented repository milestone now covers the payload layer, a signed transport slice, and a resilient end-to-end runner: deterministic model snapshots, pseudo-gradient generation, sparse quantized wire encoding, NIP-01-compatible gradient/heartbeat/checkpoint event envelopes, websocket discovery/collection across one or more relays, resumable checkpoints, rolling checkpoint-slot retention, deferred late-gradient reconciliation, and a built-in linear-regression worker loop that trains locally and synchronizes through relays.
 
 ## Implemented core
 
@@ -35,9 +35,10 @@ nostrain is a protocol for distributed ML training over Nostr relays. The implem
 27. Build and validate signed checkpoint distribution events (kind `33335`)
 28. Discover the latest recoverable checkpoint across one or more relays
 29. Resume `run-training` from the latest relay checkpoint for a run without local state handoff
-30. Scan for late gradients from earlier rounds after advancing and report them as discarded
+30. Scan for late gradients from earlier rounds after advancing and record them with checkpointed metadata
 31. Bound relay-visible checkpoint history per worker by publishing checkpoints into configurable rolling slots
 32. Bound local checkpoint artifacts and optionally prune old per-round artifact directories under `run-training`
+33. Persist late-gradient payloads in checkpoints and fold compatible stale updates back into the next round through a deferred reconciliation pass
 
 ## Model state schema
 
@@ -253,7 +254,7 @@ nostrain discover-checkpoints --relay <ws://...> [--relay <ws://...> ...] --run 
 nostrain collect-events --relay <ws://...> [--relay <ws://...> ...] --run <name> --round <n> [--sync timeout|strict|quorum|async] [--discover-workers]
 nostrain aggregate-round --relay <ws://...> [--relay <ws://...> ...] --run <name> --round <n> [--sync timeout|strict|quorum|async] [--discover-workers]
 nostrain train-local <state.json> <dataset.json> [--steps 500] [--learning-rate 0.01] [--batch-size 1]
-nostrain run-training <state.json> <dataset.json> --relay <ws://...> [--relay <ws://...> ...] --run <name> --sec-key <hex> [--rounds 1] [--checkpoint-out path.json] [--checkpoint-history 4] [--artifact-retention-rounds N] [--resume-from checkpoint.json | --resume-latest-checkpoint]
+nostrain run-training <state.json> <dataset.json> --relay <ws://...> [--relay <ws://...> ...] --run <name> --sec-key <hex> [--rounds 1] [--checkpoint-out path.json] [--checkpoint-history 4] [--artifact-retention-rounds N] [--late-gradient-strategy deferred|discard] [--late-gradient-learning-rate X] [--late-gradient-momentum Y] [--resume-from checkpoint.json | --resume-latest-checkpoint]
 nostrain inspect-event <event.json> [--json]
 ```
 
@@ -282,19 +283,18 @@ The built-in runner executes the following loop for each round:
 6. average the collected deltas and apply the configured outer Nesterov step
 7. build and publish a signed checkpoint event containing the latest recoverable run state, reusing a rolling checkpoint slot when retention is enabled
 8. persist round/session artifacts, bounded checkpoint-slot artifacts, and an optional resumable checkpoint when output paths are configured
-9. before the next round, scan for newly arrived gradients from earlier rounds and record them as discarded late arrivals
-10. on resume, restore model state, momentum state, round history, and prior late-gradient observations from either a local checkpoint file or the latest relay checkpoint before continuing at `next_round`
+9. before the next round, scan for newly arrived gradients from earlier rounds, persist their payloads, and either defer-reconcile them into the next round or keep them as record-only late arrivals depending on `--late-gradient-strategy`
+10. on resume, restore model state, momentum state, round history, the late-gradient watermark, and prior late-gradient observations from either a local checkpoint file or the latest relay checkpoint before continuing at `next_round`
 
 Fault-tolerance boundary:
 
 - missing peer gradients are tolerated when at least one valid gradient event is collected before timeout
 - partial relay outages are tolerated when at least one configured relay accepts publication and later yields a valid gradient collection
 - stale or invalid events are discarded by the existing transport validators
-- late gradients from older rounds are surfaced separately and excluded from the current outer step
+- late gradients from older rounds are surfaced separately and can be folded into the next round through a separate deferred outer step without replaying earlier rounds
 - total relay failure or zero collected gradients still aborts the round to avoid silent model divergence
 
-## Deferred from v0.7.0
+## Deferred from v0.8.0
 
-- reconciliation of discarded late gradients after a worker has already advanced
 - DiLoCo training loop integration with PyTorch or MLX
 - live dashboarding

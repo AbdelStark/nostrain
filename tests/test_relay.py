@@ -14,7 +14,9 @@ import unittest
 
 import websockets
 
+from nostrain.aggregation import nesterov_outer_step
 from nostrain.compression import compress_delta
+from nostrain.compression import decompress_payload
 from nostrain.model import ModelState, compute_delta, state_digest
 from nostrain.protocol import (
     CheckpointEventMetadata,
@@ -70,6 +72,45 @@ def _build_event(
             worker_id=worker_id,
             model_hash=state_digest(initial),
             inner_steps=500,
+            created_at=created_at,
+        ),
+        payload,
+        secret_key_hex=WORKER_SECRET_KEYS[worker_id],
+    )
+    return event.to_json_obj()
+
+
+def _build_linear_event(
+    *,
+    worker_id: str,
+    created_at: int,
+    run_name: str = "demo-run",
+    round_index: int = 0,
+) -> dict[str, Any]:
+    initial = ModelState.from_path(FIXTURES / "linear_initial_state.json")
+    current = ModelState.from_json_obj(
+        {
+            "parameters": {
+                "linear.bias": {
+                    "shape": [1],
+                    "values": [0.15],
+                },
+                "linear.weight": {
+                    "shape": [1, 2],
+                    "values": [0.4, -0.2],
+                },
+            }
+        }
+    )
+    delta = compute_delta(initial, current)
+    payload = compress_delta(delta, topk_ratio=1.0)
+    event = build_gradient_event(
+        GradientEventMetadata(
+            run_name=run_name,
+            round_index=round_index,
+            worker_id=worker_id,
+            model_hash=state_digest(initial),
+            inner_steps=20,
             created_at=created_at,
         ),
         payload,
@@ -144,6 +185,7 @@ def _build_checkpoint(
             ),
         ),
         late_gradients=(),
+        late_reconciliations=(),
         updated_at=created_at - 10,
     )
     event = build_checkpoint_event(
@@ -1354,18 +1396,139 @@ class RelayTransportTests(unittest.TestCase):
                 [0, 1],
             )
 
-    def test_cli_run_training_can_resume_from_latest_relay_checkpoint_and_track_late_gradients(self) -> None:
+    def test_cli_run_training_reconciles_late_gradients_before_next_round(self) -> None:
         checkpoint_event = _build_checkpoint(
             worker_id="worker-b",
             created_at=1_700_000_500,
             run_name="relay-resume-run",
             round_index=0,
         )
-        late_gradient = _build_event(
+        late_gradient = _build_linear_event(
             worker_id="worker-c",
-            current_fixture="current_state_peer.json",
             created_at=1_700_000_520,
             run_name="relay-resume-run",
+            round_index=0,
+        )
+
+        late_delta = decompress_payload(parse_gradient_event(late_gradient).payload)
+        reconciled_start_state = nesterov_outer_step(
+            ModelState.from_path(FIXTURES / "linear_initial_state.json"),
+            late_delta,
+            learning_rate=1.0,
+            momentum=0.0,
+        ).next_state
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            tempdir = Path(temporary_directory)
+            resumed_state_path = tempdir / "resumed-state.json"
+            resumed_summary = tempdir / "resumed-summary.json"
+            baseline_start_state_path = tempdir / "reconciled-start.json"
+            baseline_final_state_path = tempdir / "baseline-state.json"
+            baseline_summary = tempdir / "baseline-summary.json"
+            reconciled_start_state.write_json(baseline_start_state_path)
+
+            with MockRelay([checkpoint_event, late_gradient]) as relay:
+                self._run(
+                    "run-training",
+                    str(FIXTURES / "linear_initial_state.json"),
+                    str(FIXTURES / "linear_dataset_worker_a.json"),
+                    "--relay",
+                    relay.url,
+                    "--run",
+                    "relay-resume-run",
+                    "--worker",
+                    "worker-a",
+                    "--sec-key",
+                    WORKER_SECRET_KEYS["worker-a"],
+                    "--rounds",
+                    "1",
+                    "--inner-steps",
+                    "20",
+                    "--local-learning-rate",
+                    "0.05",
+                    "--batch-size",
+                    "2",
+                    "--outer-learning-rate",
+                    "1.0",
+                    "--momentum",
+                    "0.0",
+                    "--round-timeout",
+                    "0.2",
+                    "--resume-latest-checkpoint",
+                    "--late-gradient-timeout",
+                    "0.2",
+                    "--summary-out",
+                    str(resumed_summary),
+                    "-o",
+                    str(resumed_state_path),
+                )
+
+            with MockRelay() as baseline_relay:
+                self._run(
+                    "run-training",
+                    str(baseline_start_state_path),
+                    str(FIXTURES / "linear_dataset_worker_a.json"),
+                    "--relay",
+                    baseline_relay.url,
+                    "--run",
+                    "relay-resume-baseline",
+                    "--worker",
+                    "worker-a",
+                    "--sec-key",
+                    WORKER_SECRET_KEYS["worker-a"],
+                    "--rounds",
+                    "1",
+                    "--start-round",
+                    "1",
+                    "--inner-steps",
+                    "20",
+                    "--local-learning-rate",
+                    "0.05",
+                    "--batch-size",
+                    "2",
+                    "--outer-learning-rate",
+                    "1.0",
+                    "--momentum",
+                    "0.0",
+                    "--round-timeout",
+                    "0.2",
+                    "--summary-out",
+                    str(baseline_summary),
+                    "-o",
+                    str(baseline_final_state_path),
+                )
+
+            resumed_state = ModelState.from_path(resumed_state_path)
+            baseline_state = ModelState.from_path(baseline_final_state_path)
+            resumed_summary_json = json.loads(resumed_summary.read_text(encoding="utf-8"))
+
+            assert_model_state_almost_equal(self, resumed_state, baseline_state, places=8)
+            self.assertEqual(resumed_summary_json["start_round"], 0)
+            self.assertEqual(resumed_summary_json["rounds_completed"], 2)
+            self.assertEqual(resumed_summary_json["late_gradient_count"], 1)
+            self.assertEqual(resumed_summary_json["reconciled_late_gradient_count"], 1)
+            self.assertEqual(resumed_summary_json["pending_late_gradient_count"], 0)
+            self.assertEqual(resumed_summary_json["late_gradients"][0]["round"], 0)
+            self.assertEqual(resumed_summary_json["late_gradients"][0]["worker"], "worker-c")
+            self.assertEqual(resumed_summary_json["late_gradients"][0]["reconciliation_round"], 1)
+            self.assertEqual(resumed_summary_json["late_reconciliations"][0]["event_count"], 1)
+            self.assertEqual(
+                resumed_summary_json["rounds"][-1]["reconciled_late_gradient_count"],
+                1,
+            )
+            self.assertTrue(resumed_summary_json["rounds"][-1]["published_checkpoint_event_id"])
+
+    def test_cli_run_training_can_record_late_gradients_without_reconciling(self) -> None:
+        checkpoint_event = _build_checkpoint(
+            worker_id="worker-b",
+            created_at=1_700_000_500,
+            run_name="relay-discard-run",
+            round_index=0,
+        )
+        late_gradient = _build_linear_event(
+            worker_id="worker-c",
+            created_at=1_700_000_520,
+            run_name="relay-discard-run",
             round_index=0,
         )
 
@@ -1383,7 +1546,7 @@ class RelayTransportTests(unittest.TestCase):
                 "--relay",
                 relay.url,
                 "--run",
-                "relay-resume-run",
+                "relay-discard-run",
                 "--worker",
                 "worker-a",
                 "--sec-key",
@@ -1403,8 +1566,8 @@ class RelayTransportTests(unittest.TestCase):
                 "--round-timeout",
                 "0.2",
                 "--resume-latest-checkpoint",
-                "--late-gradient-timeout",
-                "0.2",
+                "--late-gradient-strategy",
+                "discard",
                 "--summary-out",
                 str(summary),
                 "-o",
@@ -1413,12 +1576,15 @@ class RelayTransportTests(unittest.TestCase):
 
             summary_json = json.loads(summary.read_text(encoding="utf-8"))
             self.assertIn("parameters", json.loads(final_state.read_text(encoding="utf-8")))
-            self.assertEqual(summary_json["start_round"], 0)
-            self.assertEqual(summary_json["rounds_completed"], 2)
             self.assertEqual(summary_json["late_gradient_count"], 1)
-            self.assertEqual(summary_json["late_gradients"][0]["round"], 0)
-            self.assertEqual(summary_json["late_gradients"][0]["worker"], "worker-c")
-            self.assertTrue(summary_json["rounds"][-1]["published_checkpoint_event_id"])
+            self.assertEqual(summary_json["reconciled_late_gradient_count"], 0)
+            self.assertEqual(summary_json["pending_late_gradient_count"], 1)
+            self.assertEqual(summary_json["late_gradient_error_count"], 0)
+            self.assertNotIn("reconciliation_round", summary_json["late_gradients"][0])
+            self.assertEqual(
+                summary_json["rounds"][-1]["reconciled_late_gradient_count"],
+                0,
+            )
 
 
 if __name__ == "__main__":

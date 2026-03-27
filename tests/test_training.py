@@ -11,6 +11,7 @@ import unittest
 from nostrain.model import ModelState
 from nostrain.training import (
     LateGradientRecord,
+    LateGradientReconciliationSummary,
     LinearRegressionDataset,
     LocalTrainingConfig,
     TrainingCheckpoint,
@@ -131,6 +132,24 @@ class TrainingRuntimeTests(unittest.TestCase):
                     event_id="e" * 64,
                     created_at=1_700_000_000,
                     model_hash="f" * 64,
+                    payload="payload-1",
+                    reconciliation_round=1,
+                    reconciliation_model_hash_before="1" * 64,
+                    reconciliation_model_hash_after="2" * 64,
+                ),
+            ),
+            late_reconciliations=(
+                LateGradientReconciliationSummary(
+                    current_round=1,
+                    event_count=1,
+                    worker_ids=("worker-b",),
+                    late_rounds=(0,),
+                    event_ids=("e" * 64,),
+                    learning_rate=0.7,
+                    momentum=0.9,
+                    model_hash_before="1" * 64,
+                    model_hash_after="2" * 64,
+                    applied_at=1_700_000_050,
                 ),
             ),
             updated_at=1_700_000_100,
@@ -142,6 +161,12 @@ class TrainingRuntimeTests(unittest.TestCase):
         self.assertEqual(restored.rounds_completed, 1)
         self.assertEqual(len(restored.late_gradients), 1)
         self.assertEqual(restored.late_gradients[0].worker_id, "worker-b")
+        self.assertEqual(restored.late_gradients[0].payload, "payload-1")
+        self.assertEqual(restored.late_gradients[0].reconciliation_round, 1)
+        self.assertEqual(restored.late_gradients[0].reconciliation_model_hash_after, "2" * 64)
+        self.assertEqual(len(restored.late_reconciliations), 1)
+        self.assertEqual(restored.late_reconciliations[0].event_count, 1)
+        self.assertEqual(restored.late_reconciliations[0].worker_ids, ("worker-b",))
 
 
 if __name__ == "__main__":

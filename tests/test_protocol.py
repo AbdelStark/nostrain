@@ -156,6 +156,7 @@ class ProtocolTests(unittest.TestCase):
                 ),
             ),
             late_gradients=(),
+            late_reconciliations=(),
             updated_at=1_700_000_200,
         )
         event = build_checkpoint_event(

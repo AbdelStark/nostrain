@@ -369,7 +369,8 @@ def _handle_run_training(args: argparse.Namespace) -> int:
         start_round = checkpoint.next_round
         prior_rounds = checkpoint.rounds
         prior_late_gradients = checkpoint.late_gradients
-        late_gradient_since = checkpoint.updated_at
+        prior_late_reconciliations = checkpoint.late_reconciliations
+        late_gradient_since = checkpoint.late_gradient_since or checkpoint.updated_at
     else:
         initial_state = ModelState.from_path(args.state)
         previous_momentum = (
@@ -378,6 +379,7 @@ def _handle_run_training(args: argparse.Namespace) -> int:
         start_round = args.start_round
         prior_rounds = ()
         prior_late_gradients = ()
+        prior_late_reconciliations = ()
         late_gradient_since = None
     if (args.resume_from or args.resume_latest_checkpoint) and args.momentum_state:
         raise ValueError("--momentum-state cannot be combined with checkpoint-based resume")
@@ -404,6 +406,9 @@ def _handle_run_training(args: argparse.Namespace) -> int:
                 heartbeat_interval=args.heartbeat_interval,
                 max_missed_heartbeats=args.max_missed_heartbeats,
                 late_gradient_timeout=args.late_gradient_timeout,
+                late_gradient_strategy=args.late_gradient_strategy,
+                late_reconciliation_learning_rate=args.late_gradient_learning_rate,
+                late_reconciliation_momentum=args.late_gradient_momentum,
                 advertised_relays=tuple(args.advertise_relay or ()),
                 checkpoint_history=args.checkpoint_history,
                 artifact_retention_rounds=args.artifact_retention_rounds,
@@ -412,6 +417,7 @@ def _handle_run_training(args: argparse.Namespace) -> int:
             artifact_dir=args.artifact_dir,
             prior_rounds=prior_rounds,
             prior_late_gradients=prior_late_gradients,
+            prior_late_reconciliations=prior_late_reconciliations,
             late_gradient_since=late_gradient_since,
             checkpoint_out=args.checkpoint_out,
         )
@@ -1299,6 +1305,22 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.2,
         help="Idle timeout for scanning late gradients from older rounds (default: 0.2).",
+    )
+    run_training.add_argument(
+        "--late-gradient-strategy",
+        choices=("deferred", "discard"),
+        default="deferred",
+        help="How to handle late gradients from completed rounds: fold them into the next round or only record them (default: deferred).",
+    )
+    run_training.add_argument(
+        "--late-gradient-learning-rate",
+        type=float,
+        help="Optional learning rate override for deferred late-gradient reconciliation. Defaults to --outer-learning-rate.",
+    )
+    run_training.add_argument(
+        "--late-gradient-momentum",
+        type=float,
+        help="Optional momentum override for deferred late-gradient reconciliation. Defaults to --momentum.",
     )
     run_training.add_argument(
         "--advertise-relay",
