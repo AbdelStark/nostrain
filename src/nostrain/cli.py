@@ -1082,7 +1082,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     convert_state = subparsers.add_parser(
         "convert-state",
-        help="Convert a model state between canonical JSON and numpy-npz formats.",
+        help="Convert a model state between canonical JSON, numpy-npz, and PyTorch state-dict formats.",
     )
     convert_state.add_argument("state", help="Path to the source model state file.")
     _add_state_format_argument(

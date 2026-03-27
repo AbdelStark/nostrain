@@ -2,11 +2,11 @@
 
 Distributed ML training over Nostr relays.
 
-The project vision is still the same: no coordinator, no central server, just workers exchanging sparse pseudo-gradients through Nostr. The repository now ships the protocol/payload toolkit, a signed relay transport slice, and a resilient end-to-end training runner: model snapshots, DiLoCo-style deltas, sparse transport payloads, NIP-01-compatible nostrain gradient/heartbeat/checkpoint events, relay collection with active-worker discovery, cross-relay deduplication, resumable checkpoints, relay-visible checkpoint distribution, deferred late-gradient reconciliation, configurable relay retry/backoff, runtime-pluggable built-in workers for both linear and non-linear regression over one or more relays, plus a NumPy edge-runtime path for model-state interchange and local optimization.
+The project vision is still the same: no coordinator, no central server, just workers exchanging sparse pseudo-gradients through Nostr. The repository now ships the protocol/payload toolkit, a signed relay transport slice, and a resilient end-to-end training runner: model snapshots, DiLoCo-style deltas, sparse transport payloads, NIP-01-compatible nostrain gradient/heartbeat/checkpoint events, relay collection with active-worker discovery, cross-relay deduplication, resumable checkpoints, relay-visible checkpoint distribution, deferred late-gradient reconciliation, configurable relay retry/backoff, runtime-pluggable built-in workers for both linear and non-linear regression over one or more relays, plus NumPy and PyTorch-compatible edge-runtime paths for model-state interchange and local optimization.
 
 ## Current status
 
-`nostrain` v0.9.0 is a protocol, relay, and training toolchain. It implements:
+`nostrain` v0.10.0 is a protocol, relay, and training toolchain. It implements:
 
 - canonical model-state JSON loading and hashing
 - pseudo-gradient computation (`current - initial`)
@@ -26,7 +26,8 @@ The project vision is still the same: no coordinator, no central server, just wo
 - a deterministic JSON dataset format for built-in regression workloads
 - pluggable built-in runtimes for `linear-regression` and `mlp-regression`
 - backend-selectable local SGD/evaluation paths (`python`, `numpy`) for both runtimes
-- canonical model-state interchange between JSON and `numpy-npz`
+- canonical model-state interchange between JSON, `numpy-npz`, and PyTorch-compatible state-dict archives
+- PyTorch state-dict import normalization for direct-module, nested-module, and `module.*`-prefixed key layouts
 - CLI state-format auto-detection plus `convert-state` for explicit format conversion
 - a relay-backed training runner that publishes heartbeats and gradients to one or more relays, tolerates partial relay outages, and applies the outer step locally
 - resumable training checkpoints carrying model state, momentum state, and prior round history
@@ -39,7 +40,7 @@ The project vision is still the same: no coordinator, no central server, just wo
 - deterministic `init-state` generation for supported built-in runtimes
 - a CLI for converting, encoding, decoding, applying, publishing, collecting, and inspecting payloads
 
-It does **not** yet implement framework-specific adapters such as PyTorch/MLX modules or state-dicts. The signed transport path now targets public NIP-01 relays as well as local/mock websocket endpoints, and the built-in runners stay dependency-light and testable while exercising a real external runtime boundary through NumPy state interchange and backend execution.
+It now ships a PyTorch-compatible state-dict archive bridge, but it does **not** yet execute native PyTorch/MLX modules or load raw `torch.save` checkpoints directly. The signed transport path now targets public NIP-01 relays as well as local/mock websocket endpoints, and the built-in runners stay dependency-light and testable while exercising real external runtime boundaries through NumPy interchange, PyTorch-style state-dict layouts, and backend execution.
 
 ## Install
 
@@ -136,6 +137,37 @@ Round-trip it back to JSON:
 
 ```bash
 nostrain convert-state linear-initial.npz -o linear-initial-roundtrip.json
+```
+
+## PyTorch state-dict interop
+
+`nostrain` can also import and export PyTorch-compatible state-dict archives stored as `.pt.npz` or `.pth.npz`. Linear states are emitted as `weight` / `bias`; MLP states are emitted as `hidden.*` and `output.*`. On import, common wrapper prefixes such as `module.` or `model.` are stripped automatically before the state is normalized back into canonical nostrain parameter names.
+
+Convert a canonical JSON state into a PyTorch-style state dict archive:
+
+```bash
+nostrain convert-state linear-initial.json -o linear-initial.pt.npz
+```
+
+Round-trip it back to canonical JSON:
+
+```bash
+nostrain convert-state linear-initial.pt.npz -o linear-initial-from-pytorch.json
+```
+
+Load that archive into a PyTorch module with a small edge bridge:
+
+```python
+import numpy as np
+import torch
+
+with np.load("linear-initial.pt.npz", allow_pickle=False) as archive:
+    state_dict = {
+        name: torch.from_numpy(archive[name].copy())
+        for name in archive.files
+        if not name.startswith("__")
+    }
+model.load_state_dict(state_dict)
 ```
 
 ## Dataset format

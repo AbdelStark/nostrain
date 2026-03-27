@@ -160,14 +160,26 @@ Delivered in the current repository state:
 
 This moves the project from built-in-only runtime execution to a real external runtime boundary that can exchange and optimize model states outside the canonical JSON edge without weakening the protocol contracts.
 
-## Next milestone: framework-specific adapters
+## Completed milestone: PyTorch state-dict adapter
 
-Goal: connect the new external runtime boundary to widely used framework objects such as PyTorch or MLX modules/state-dicts without losing the protocol guarantees.
+Delivered in the current repository state:
+
+- PyTorch-compatible state-dict archive conversion via the shared `convert-state` and auto-detected state-format path
+- direct-module export layouts (`weight` / `bias`, `hidden.*`, `output.*`) for the built-in runtimes
+- import normalization for nested wrapper prefixes such as `module.model.*`
+- local training and state hashing over `.pt.npz` / `.pth.npz` archives without changing the canonical protocol payloads
+- conformance tests covering adapter round-trips, prefixed import, and CLI training over PyTorch-style archives
+
+This moves the project from an abstract external-runtime boundary to a concrete framework-facing bridge that can exchange model weights with PyTorch-style state dicts while preserving the existing protocol and training contracts.
+
+## Next milestone: native framework execution
+
+Goal: move beyond state interchange and let the worker loop execute against at least one real framework runtime directly.
 
 Deliverables:
 
-- import/export paths for real framework-native module/state-dict layouts through the shared `ModelState` schema
-- at least one framework-specific adapter with conformance coverage against the existing Python/NumPy training contracts
+- direct `torch.save` / framework-native checkpoint I/O without the intermediate `.pt.npz` archive bridge
+- at least one framework-backed local training/evaluation path that conforms to the existing `train-local` / `run-training` contracts
 
 ## Deferred polish
 

@@ -21,6 +21,17 @@ from .model import (
     subtract_states,
     zeros_like,
 )
+from .pytorch import (
+    PYTORCH_LINEAR_BIAS_KEY,
+    PYTORCH_LINEAR_WEIGHT_KEY,
+    PYTORCH_MLP_HIDDEN_BIAS_KEY,
+    PYTORCH_MLP_HIDDEN_WEIGHT_KEY,
+    PYTORCH_MLP_OUTPUT_BIAS_KEY,
+    PYTORCH_MLP_OUTPUT_WEIGHT_KEY,
+    export_pytorch_state_dict,
+    import_pytorch_state_dict,
+    infer_training_runtime_from_pytorch_state_dict,
+)
 from .protocol import (
     CheckpointEventMetadata,
     GradientEventMetadata,
@@ -72,6 +83,7 @@ from .stateio import (
     JSON_STATE_FORMAT,
     ModelStateDocument,
     NUMPY_NPZ_STATE_FORMAT,
+    PYTORCH_STATE_DICT_STATE_FORMAT,
     STATE_FORMAT_AUTO,
     STATE_FORMAT_CHOICES,
     SUPPORTED_STATE_FORMATS,
@@ -171,6 +183,13 @@ __all__ = [
     "NUMPY_NPZ_STATE_FORMAT",
     "NUMPY_TRAINING_BACKEND",
     "OuterStepResult",
+    "PYTORCH_LINEAR_BIAS_KEY",
+    "PYTORCH_LINEAR_WEIGHT_KEY",
+    "PYTORCH_MLP_HIDDEN_BIAS_KEY",
+    "PYTORCH_MLP_HIDDEN_WEIGHT_KEY",
+    "PYTORCH_MLP_OUTPUT_BIAS_KEY",
+    "PYTORCH_MLP_OUTPUT_WEIGHT_KEY",
+    "PYTORCH_STATE_DICT_STATE_FORMAT",
     "ParsedCheckpointEvent",
     "ParsedGradientEvent",
     "ParsedHeartbeatEvent",
@@ -212,8 +231,11 @@ __all__ = [
     "evaluate_regression",
     "evaluate_linear_regression",
     "evaluate_mlp_regression",
+    "export_pytorch_state_dict",
     "infer_state_format_from_path",
+    "infer_training_runtime_from_pytorch_state_dict",
     "infer_training_runtime_from_state",
+    "import_pytorch_state_dict",
     "initialize_linear_regression_state",
     "initialize_mlp_regression_state",
     "initialize_training_state",
@@ -248,4 +270,4 @@ __all__ = [
     "zeros_like",
 ]
 
-__version__ = "0.9.0"
+__version__ = "0.10.0"
