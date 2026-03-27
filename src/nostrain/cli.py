@@ -22,6 +22,10 @@ from .protocol import (
     parse_gradient_event,
     parse_nostrain_event,
 )
+from .pytorch import (
+    DEFAULT_TORCH_CHECKPOINT_PAYLOAD_KIND,
+    TORCH_CHECKPOINT_PAYLOAD_CHOICES,
+)
 from .relay import (
     collect_checkpoint_events,
     collect_checkpoint_events_across_relays,
@@ -95,6 +99,7 @@ def _write_state(
     *,
     state_format: str | None,
     runtime_name: str | None = None,
+    torch_checkpoint_payload_kind: str | None = DEFAULT_TORCH_CHECKPOINT_PAYLOAD_KIND,
 ) -> None:
     resolved_format = resolve_state_format(state_format, path)
     runtime_name = runtime_name or _infer_runtime_name(state)
@@ -108,6 +113,7 @@ def _write_state(
         state,
         state_format=resolved_format,
         runtime_name=runtime_name,
+        torch_checkpoint_payload_kind=torch_checkpoint_payload_kind,
     )
 
 
@@ -212,6 +218,15 @@ def _add_output_state_format_argument(parser: argparse.ArgumentParser) -> None:
             "Defaults to stdout JSON or infers from the output path extension."
         ),
     )
+    parser.add_argument(
+        "--torch-checkpoint-payload",
+        choices=TORCH_CHECKPOINT_PAYLOAD_CHOICES,
+        default=DEFAULT_TORCH_CHECKPOINT_PAYLOAD_KIND,
+        help=(
+            "For native .pt/.pth outputs, save either a raw state dict or a built-in "
+            "torch.nn.Module checkpoint (default: state-dict)."
+        ),
+    )
 
 
 def _add_backend_argument(parser: argparse.ArgumentParser) -> None:
@@ -291,6 +306,7 @@ def _handle_init_state(args: argparse.Namespace) -> int:
         state,
         state_format=args.output_format,
         runtime_name=args.runtime,
+        torch_checkpoint_payload_kind=args.torch_checkpoint_payload,
     )
     return 0
 
@@ -323,6 +339,7 @@ def _handle_apply_payload(args: argparse.Namespace) -> int:
         args.output,
         reconstructed,
         state_format=args.output_format,
+        torch_checkpoint_payload_kind=args.torch_checkpoint_payload,
     )
     return 0
 
@@ -487,12 +504,14 @@ def _handle_outer_step(args: argparse.Namespace) -> int:
         args.output,
         result.next_state,
         state_format=args.output_format,
+        torch_checkpoint_payload_kind=args.torch_checkpoint_payload,
     )
     if args.momentum_out:
         _write_state(
             args.momentum_out,
             result.momentum_state,
             state_format=args.output_format,
+            torch_checkpoint_payload_kind=args.torch_checkpoint_payload,
         )
     if args.summary_out:
         _write_json(
@@ -526,6 +545,7 @@ def _handle_train_local(args: argparse.Namespace) -> int:
         result.trained_state,
         state_format=args.output_format,
         runtime_name=result.runtime_name,
+        torch_checkpoint_payload_kind=args.torch_checkpoint_payload,
     )
     if args.metrics_out:
         _write_json(args.metrics_out, result.to_json_obj())
@@ -539,6 +559,7 @@ def _handle_convert_state(args: argparse.Namespace) -> int:
         document.state,
         state_format=args.output_format,
         runtime_name=document.runtime_name,
+        torch_checkpoint_payload_kind=args.torch_checkpoint_payload,
     )
     return 0
 
@@ -646,6 +667,7 @@ def _handle_run_training(args: argparse.Namespace) -> int:
         session.final_state,
         state_format=args.output_format,
         runtime_name=session.runtime_name,
+        torch_checkpoint_payload_kind=args.torch_checkpoint_payload,
     )
     if args.momentum_out and session.final_momentum_state is not None:
         _write_state(
@@ -653,6 +675,7 @@ def _handle_run_training(args: argparse.Namespace) -> int:
             session.final_momentum_state,
             state_format=args.output_format,
             runtime_name=session.runtime_name,
+            torch_checkpoint_payload_kind=args.torch_checkpoint_payload,
         )
     if args.summary_out:
         _write_json(args.summary_out, session.to_json_obj())

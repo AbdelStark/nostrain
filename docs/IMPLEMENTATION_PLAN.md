@@ -184,14 +184,26 @@ Delivered in the current repository state:
 
 This moves the project from a state-dict archive bridge to a framework-aware runtime path that can exchange and optimize built-in models through native PyTorch checkpoint files and tensor execution.
 
-## Next milestone: module-native adapters
+## Completed milestone: module-native PyTorch adapters
 
-Goal: move beyond built-in tensor layouts and support richer framework-native module workflows.
+Delivered in the current repository state:
+
+- built-in `torch.nn.Module` materialization for the `linear-regression` and `mlp-regression` runtimes
+- optional native `.pt` / `.pth` checkpoint writing that stores those built-in modules directly instead of only raw state dicts
+- broader checkpoint extraction that accepts raw built-in modules and nested training bundles carrying `model` / `module` objects or state-dict payloads
+- CLI support for `--torch-checkpoint-payload module` anywhere model-state outputs are written
+- conformance tests covering module round-trips plus `train-local` / `run-training` execution over module-native checkpoints
+
+This moves the project from torch tensor/state-dict compatibility to a concrete built-in module workflow that can save, load, and execute module-native checkpoints without manual state-dict extraction.
+
+## Next milestone: framework-native user modules
+
+Goal: move beyond built-in module graphs and support richer user-defined framework-native module workflows.
 
 Deliverables:
 
-- optional module wrappers for built-in runtimes so `nostrain` can materialize `torch.nn.Module` graphs directly
-- broader checkpoint import support for common framework training bundles without requiring manual state-dict extraction
+- explicit adapter contracts for user-supplied PyTorch modules while preserving the canonical nostrain protocol edge
+- broader checkpoint import/export support for user training bundles without relying on built-in runtime layouts
 
 ## Deferred polish
 

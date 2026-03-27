@@ -1,8 +1,8 @@
-# nostrain: Specification v0.11.0
+# nostrain: Specification v0.12.0
 
 ## Overview
 
-nostrain is a protocol for distributed ML training over Nostr relays. The implemented repository milestone now covers the payload layer, a signed transport slice, and a resilient end-to-end runner: deterministic model snapshots, pseudo-gradient generation, sparse quantized wire encoding, NIP-01-compatible gradient/heartbeat/checkpoint event envelopes, websocket discovery/collection across one or more relays, resumable checkpoints, rolling checkpoint-slot retention, deferred late-gradient reconciliation, configurable relay retry/backoff, runtime-aware worker loops for both linear and non-linear regression, plus NumPy-backed and PyTorch-backed runtime paths for state interchange and local optimization, including native `torch.save` checkpoint I/O.
+nostrain is a protocol for distributed ML training over Nostr relays. The implemented repository milestone now covers the payload layer, a signed transport slice, and a resilient end-to-end runner: deterministic model snapshots, pseudo-gradient generation, sparse quantized wire encoding, NIP-01-compatible gradient/heartbeat/checkpoint event envelopes, websocket discovery/collection across one or more relays, resumable checkpoints, rolling checkpoint-slot retention, deferred late-gradient reconciliation, configurable relay retry/backoff, runtime-aware worker loops for both linear and non-linear regression, plus NumPy-backed and PyTorch-backed runtime paths for state interchange and local optimization, including native `torch.save` state-dict and built-in-module checkpoint I/O.
 
 ## Implemented core
 
@@ -49,6 +49,8 @@ nostrain is a protocol for distributed ML training over Nostr relays. The implem
 41. Auto-detect model-state formats across CLI training/state commands and preserve runtime metadata when possible
 42. Load and write native `.pt` / `.pth` `torch.save` checkpoints for built-in runtime state dicts
 43. Accept common wrapped PyTorch checkpoints carrying `state_dict` / `model_state_dict` payloads
+44. Materialize built-in `torch.nn.Module` graphs for the linear and MLP runtimes and optionally write them as native checkpoints
+45. Load native PyTorch checkpoints from raw built-in modules and nested training bundles that carry module objects or state-dict payloads
 
 ## Model state schema
 
@@ -86,7 +88,8 @@ PyTorch-compatible state-dict layouts:
 - linear runtime export: `weight`, `bias`
 - MLP runtime export: `hidden.weight`, `hidden.bias`, `output.weight`, `output.bias`
 - import accepts the above direct layouts, the canonical `linear.*` / `mlp.*` forms, and arbitrarily nested shared prefixes such as `module.model.*`
-- native `.pt` / `.pth` checkpoints may contain a bare state dict or a wrapped checkpoint object with `state_dict` / `model_state_dict`
+- built-in runtime modules may be materialized as a direct `nn.Linear` graph for the linear runtime or a `Sequential(hidden -> tanh -> output)` graph for the MLP runtime
+- native `.pt` / `.pth` checkpoints may contain a bare state dict, a raw built-in module object, or a wrapped checkpoint object with `state_dict` / `model_state_dict` or nested `model` / `module` entries
 
 ## Regression dataset schema
 
@@ -291,6 +294,10 @@ Relay-facing commands share these retry controls:
 - `--relay-retry-backoff <seconds>`: initial delay before retrying
 - `--relay-retry-backoff-max <seconds>`: cap for exponential backoff growth
 - `--relay-retry-backoff-multiplier <factor>`: multiplier applied after each retry
+
+Commands that write native `.pt` / `.pth` outputs also accept:
+
+- `--torch-checkpoint-payload state-dict|module`: choose whether the native checkpoint stores a raw state dict or a built-in `torch.nn.Module`
 
 ## Local outer step semantics
 

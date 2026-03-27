@@ -6,7 +6,7 @@ The project vision is still the same: no coordinator, no central server, just wo
 
 ## Current status
 
-`nostrain` v0.11.0 is a protocol, relay, and training toolchain. It implements:
+`nostrain` v0.12.0 is a protocol, relay, and training toolchain. It implements:
 
 - canonical model-state JSON loading and hashing
 - pseudo-gradient computation (`current - initial`)
@@ -29,6 +29,8 @@ The project vision is still the same: no coordinator, no central server, just wo
 - canonical model-state interchange between JSON, `numpy-npz`, PyTorch-compatible state-dict archives, and native `torch.save` checkpoints
 - PyTorch state-dict import normalization for direct-module, nested-module, and `module.*`-prefixed key layouts
 - native `.pt` / `.pth` checkpoint loading for bare state dicts and common wrapped `state_dict` / `model_state_dict` payloads
+- built-in `torch.nn.Module` materialization for the linear and MLP runtimes plus optional module-native `.pt` / `.pth` checkpoint writing
+- native checkpoint loading from raw built-in modules and common nested training bundles that carry model objects or state dicts
 - CLI state-format auto-detection plus `convert-state` for explicit format conversion
 - a relay-backed training runner that publishes heartbeats and gradients to one or more relays, tolerates partial relay outages, and applies the outer step locally
 - resumable training checkpoints carrying model state, momentum state, and prior round history
@@ -41,7 +43,7 @@ The project vision is still the same: no coordinator, no central server, just wo
 - deterministic `init-state` generation for supported built-in runtimes
 - a CLI for converting, encoding, decoding, applying, publishing, collecting, and inspecting payloads
 
-It now ships native `torch.save` state-dict checkpoint I/O plus an optional torch backend for the built-in runtimes, but it does **not** yet execute arbitrary user-defined PyTorch/MLX modules or raw full-object framework pickles beyond state-dict-oriented checkpoints. The signed transport path now targets public NIP-01 relays as well as local/mock websocket endpoints, and the built-in runners stay dependency-light and testable while exercising real external runtime boundaries through NumPy interchange, PyTorch state-dict layouts, and backend execution.
+It now ships native `torch.save` state-dict and built-in-module checkpoint I/O plus an optional torch backend for the built-in runtimes, but it does **not** yet execute arbitrary user-defined PyTorch/MLX modules as training runtimes. The signed transport path now targets public NIP-01 relays as well as local/mock websocket endpoints, and the built-in runners stay dependency-light and testable while exercising real external runtime boundaries through NumPy interchange, PyTorch state-dict layouts, module-native checkpoints, and backend execution.
 
 ## Install
 
@@ -166,6 +168,14 @@ Write a native `torch.save` checkpoint instead:
 
 ```bash
 nostrain convert-state linear-initial.json -o linear-initial.pt
+```
+
+Write a native checkpoint that stores a built-in `torch.nn.Module` instead of a raw state dict:
+
+```bash
+nostrain convert-state linear-initial.json \
+  --torch-checkpoint-payload module \
+  -o linear-module.pt
 ```
 
 Load that native checkpoint into a PyTorch module:

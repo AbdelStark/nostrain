@@ -5,6 +5,7 @@ from pathlib import Path
 
 from .model import ModelState, TensorState
 from .pytorch import (
+    DEFAULT_TORCH_CHECKPOINT_PAYLOAD_KIND,
     export_pytorch_state_dict,
     import_pytorch_state_dict,
     load_torch_checkpoint,
@@ -210,6 +211,7 @@ def write_model_state_document(
     document: ModelStateDocument,
     *,
     state_format: str | None = None,
+    torch_checkpoint_payload_kind: str | None = DEFAULT_TORCH_CHECKPOINT_PAYLOAD_KIND,
 ) -> None:
     target = Path(path)
     resolved_format = resolve_state_format(state_format, target)
@@ -231,6 +233,7 @@ def write_model_state_document(
             target,
             document.state,
             runtime_name=runtime_name,
+            payload_kind=torch_checkpoint_payload_kind,
         )
         return
 
@@ -251,9 +254,11 @@ def write_model_state(
     *,
     state_format: str | None = None,
     runtime_name: str | None = None,
+    torch_checkpoint_payload_kind: str | None = DEFAULT_TORCH_CHECKPOINT_PAYLOAD_KIND,
 ) -> None:
     write_model_state_document(
         path,
         ModelStateDocument(state=state, runtime_name=runtime_name),
         state_format=state_format,
+        torch_checkpoint_payload_kind=torch_checkpoint_payload_kind,
     )

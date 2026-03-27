@@ -8,9 +8,11 @@ from nostrain.pytorch import (
     export_pytorch_state_dict,
     import_pytorch_state_dict,
     infer_training_runtime_from_pytorch_state_dict,
+    model_state_from_torch_module,
+    model_state_to_torch_module,
 )
 from nostrain.runtime import LINEAR_REGRESSION_RUNTIME, MLP_REGRESSION_RUNTIME
-from tests.helpers import assert_model_state_almost_equal
+from tests.helpers import assert_model_state_almost_equal, fake_torch_imports
 
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -65,6 +67,36 @@ class PyTorchAdapterTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             import_pytorch_state_dict(invalid_state)
+
+    def test_linear_state_materializes_to_torch_module_and_roundtrips(self) -> None:
+        state = ModelState.from_path(FIXTURES / "linear_initial_state.json")
+
+        with fake_torch_imports():
+            module = model_state_to_torch_module(state, runtime_name=LINEAR_REGRESSION_RUNTIME)
+            restored = model_state_from_torch_module(module)
+
+        self.assertEqual(type(module).__name__, "Linear")
+        self.assertEqual(set(module.state_dict()), {"weight", "bias"})
+        assert_model_state_almost_equal(self, restored, state, places=12)
+
+    def test_mlp_state_materializes_to_sequential_torch_module_and_roundtrips(self) -> None:
+        state = ModelState.from_path(FIXTURES / "mlp_initial_state.json")
+
+        with fake_torch_imports():
+            module = model_state_to_torch_module(state, runtime_name=MLP_REGRESSION_RUNTIME)
+            restored = model_state_from_torch_module(module)
+
+        self.assertEqual(type(module).__name__, "Sequential")
+        self.assertEqual(
+            set(module.state_dict()),
+            {
+                "hidden.weight",
+                "hidden.bias",
+                "output.weight",
+                "output.bias",
+            },
+        )
+        assert_model_state_almost_equal(self, restored, state, places=12)
 
 
 if __name__ == "__main__":

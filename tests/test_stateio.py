@@ -7,6 +7,7 @@ import unittest
 import numpy as np
 
 from nostrain.model import ModelState
+from nostrain.pytorch import model_state_to_torch_module
 from nostrain.stateio import (
     load_model_state,
     load_model_state_document,
@@ -119,6 +120,24 @@ class StateIoTests(unittest.TestCase):
         self.assertEqual(restored.runtime_name, "mlp-regression")
         self.assertEqual(restored.state.to_json_obj(), state.to_json_obj())
 
+    def test_native_torch_module_checkpoint_roundtrip_preserves_state(self) -> None:
+        state = ModelState.from_path(FIXTURES / "mlp_initial_state.json")
+
+        with tempfile.TemporaryDirectory() as temporary_directory, fake_torch_imports():
+            checkpoint_path = Path(temporary_directory) / "state.pt"
+            write_model_state(
+                checkpoint_path,
+                state,
+                state_format="pytorch-state-dict",
+                runtime_name="mlp-regression",
+                torch_checkpoint_payload_kind="module",
+            )
+
+            restored = load_model_state_document(checkpoint_path)
+
+        self.assertEqual(restored.runtime_name, "mlp-regression")
+        self.assertEqual(restored.state.to_json_obj(), state.to_json_obj())
+
     def test_native_torch_checkpoint_loading_accepts_wrapped_state_dicts(self) -> None:
         state = ModelState.from_path(FIXTURES / "linear_initial_state.json")
 
@@ -133,6 +152,29 @@ class StateIoTests(unittest.TestCase):
                     "state_dict": {
                         "module.training_stack.weight": torch.tensor([[0.0, 0.0]], dtype=torch.float64),
                         "module.training_stack.bias": torch.tensor([0.0], dtype=torch.float64),
+                    },
+                },
+                checkpoint_path,
+            )
+
+            restored = load_model_state_document(checkpoint_path)
+
+        self.assertEqual(restored.runtime_name, "linear-regression")
+        self.assertEqual(restored.state.to_json_obj(), state.to_json_obj())
+
+    def test_native_torch_checkpoint_loading_accepts_nested_module_bundles(self) -> None:
+        state = ModelState.from_path(FIXTURES / "linear_initial_state.json")
+
+        with tempfile.TemporaryDirectory() as temporary_directory, fake_torch_imports():
+            import torch
+
+            checkpoint_path = Path(temporary_directory) / "wrapped-module.pth"
+            module = model_state_to_torch_module(state, runtime_name="linear-regression")
+            torch.save(
+                {
+                    "runtime": "linear-regression",
+                    "checkpoint": {
+                        "model": module,
                     },
                 },
                 checkpoint_path,

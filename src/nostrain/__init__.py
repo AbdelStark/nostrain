@@ -22,18 +22,25 @@ from .model import (
     zeros_like,
 )
 from .pytorch import (
+    DEFAULT_TORCH_CHECKPOINT_PAYLOAD_KIND,
     PYTORCH_LINEAR_BIAS_KEY,
     PYTORCH_LINEAR_WEIGHT_KEY,
     PYTORCH_MLP_HIDDEN_BIAS_KEY,
     PYTORCH_MLP_HIDDEN_WEIGHT_KEY,
     PYTORCH_MLP_OUTPUT_BIAS_KEY,
     PYTORCH_MLP_OUTPUT_WEIGHT_KEY,
+    TORCH_CHECKPOINT_MODULE_PAYLOAD,
+    TORCH_CHECKPOINT_PAYLOAD_CHOICES,
+    TORCH_CHECKPOINT_STATE_DICT_PAYLOAD,
     export_pytorch_state_dict,
     import_pytorch_state_dict,
     infer_training_runtime_from_pytorch_state_dict,
+    model_state_from_torch_module,
     load_torch_checkpoint,
     model_state_from_torch_state_dict_payload,
+    model_state_to_torch_module,
     model_state_to_torch_state_dict_payload,
+    resolve_torch_checkpoint_payload_kind,
     write_torch_checkpoint,
 )
 from .runtime import TORCH_TRAINING_BACKEND
@@ -153,6 +160,7 @@ __all__ = [
     "CollectedGradientEvent",
     "CollectedHeartbeatEvent",
     "DEFAULT_STATE_FORMAT",
+    "DEFAULT_TORCH_CHECKPOINT_PAYLOAD_KIND",
     "DEFAULT_TRAINING_BACKEND",
     "DEFAULT_TRAINING_RUNTIME",
     "GradientEventMetadata",
@@ -195,6 +203,9 @@ __all__ = [
     "PYTORCH_MLP_OUTPUT_BIAS_KEY",
     "PYTORCH_MLP_OUTPUT_WEIGHT_KEY",
     "PYTORCH_STATE_DICT_STATE_FORMAT",
+    "TORCH_CHECKPOINT_MODULE_PAYLOAD",
+    "TORCH_CHECKPOINT_PAYLOAD_CHOICES",
+    "TORCH_CHECKPOINT_STATE_DICT_PAYLOAD",
     "ParsedCheckpointEvent",
     "ParsedGradientEvent",
     "ParsedHeartbeatEvent",
@@ -249,7 +260,9 @@ __all__ = [
     "load_model_state",
     "load_model_state_document",
     "load_torch_checkpoint",
+    "model_state_from_torch_module",
     "model_state_from_torch_state_dict_payload",
+    "model_state_to_torch_module",
     "model_state_to_torch_state_dict_payload",
     "nesterov_outer_step",
     "parse_checkpoint_event",
@@ -261,6 +274,7 @@ __all__ = [
     "publish_gradient_event",
     "publish_nostrain_event",
     "publish_nostrain_events",
+    "resolve_torch_checkpoint_payload_kind",
     "resolve_state_format",
     "resolve_training_backend",
     "resolve_training_runtime",
@@ -280,4 +294,4 @@ __all__ = [
     "zeros_like",
 ]
 
-__version__ = "0.11.0"
+__version__ = "0.12.0"

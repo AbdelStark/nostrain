@@ -453,6 +453,58 @@ class TrainingRuntimeTests(unittest.TestCase):
             self.assertEqual(metrics_json["backend"], "torch")
             self.assertLess(metrics_json["loss_after"], metrics_json["loss_before"])
 
+    def test_cli_train_local_supports_module_native_torch_checkpoints(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            tempdir = Path(temporary_directory)
+            initial_state = tempdir / "linear-state.pt"
+            trained_state = tempdir / "trained-state.pt"
+            trained_state_json = tempdir / "trained-state.json"
+            metrics = tempdir / "metrics.json"
+
+            self._run(
+                "convert-state",
+                str(FIXTURES / "linear_initial_state.json"),
+                "--torch-checkpoint-payload",
+                "module",
+                "-o",
+                str(initial_state),
+                include_fake_torch=True,
+            )
+            self._run(
+                "train-local",
+                str(initial_state),
+                str(FIXTURES / "linear_dataset_worker_a.json"),
+                "--backend",
+                "torch",
+                "--steps",
+                "30",
+                "--learning-rate",
+                "0.05",
+                "--batch-size",
+                "2",
+                "--torch-checkpoint-payload",
+                "module",
+                "--metrics-out",
+                str(metrics),
+                "-o",
+                str(trained_state),
+                include_fake_torch=True,
+            )
+            self._run(
+                "convert-state",
+                str(trained_state),
+                "-o",
+                str(trained_state_json),
+                include_fake_torch=True,
+            )
+
+            trained_json = json.loads(trained_state_json.read_text(encoding="utf-8"))
+            metrics_json = json.loads(metrics.read_text(encoding="utf-8"))
+
+            self.assertIn("parameters", trained_json)
+            self.assertEqual(metrics_json["backend"], "torch")
+            self.assertLess(metrics_json["loss_after"], metrics_json["loss_before"])
+
     def test_training_checkpoint_roundtrip_preserves_late_gradients(self) -> None:
         state = ModelState.from_path(FIXTURES / "linear_initial_state.json")
         checkpoint = TrainingCheckpoint(

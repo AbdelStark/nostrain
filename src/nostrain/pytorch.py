@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -9,11 +10,13 @@ from .runtime import (
     LINEAR_BIAS_PARAMETER,
     LINEAR_REGRESSION_RUNTIME,
     LINEAR_WEIGHT_PARAMETER,
+    LinearModelAdapter,
     MLP_HIDDEN_BIAS_PARAMETER,
     MLP_HIDDEN_WEIGHT_PARAMETER,
     MLP_OUTPUT_BIAS_PARAMETER,
     MLP_OUTPUT_WEIGHT_PARAMETER,
     MLP_REGRESSION_RUNTIME,
+    MLPModelAdapter,
     infer_training_runtime_from_state,
     resolve_training_runtime,
 )
@@ -43,7 +46,35 @@ _PYTORCH_IMPORT_MAPS = {
     runtime_name: {target_name: source_name for source_name, target_name in export_map.items()}
     for runtime_name, export_map in _PYTORCH_EXPORT_MAPS.items()
 }
-_CHECKPOINT_STATE_DICT_KEYS = ("state_dict", "model_state_dict")
+TORCH_CHECKPOINT_STATE_DICT_PAYLOAD = "state-dict"
+TORCH_CHECKPOINT_MODULE_PAYLOAD = "module"
+DEFAULT_TORCH_CHECKPOINT_PAYLOAD_KIND = TORCH_CHECKPOINT_STATE_DICT_PAYLOAD
+TORCH_CHECKPOINT_PAYLOAD_CHOICES = (
+    TORCH_CHECKPOINT_STATE_DICT_PAYLOAD,
+    TORCH_CHECKPOINT_MODULE_PAYLOAD,
+)
+
+_CHECKPOINT_STATE_DICT_KEYS = (
+    "state_dict",
+    "model_state_dict",
+    "network_state_dict",
+    "module_state_dict",
+    "ema_state_dict",
+)
+_CHECKPOINT_CONTAINER_KEYS = (
+    *_CHECKPOINT_STATE_DICT_KEYS,
+    "model",
+    "module",
+    "network",
+    "net",
+    "ema",
+    "ema_model",
+    "student",
+    "teacher",
+    "checkpoint",
+    "trainer",
+)
+_CHECKPOINT_SCAN_DEPTH = 3
 
 
 def _require_torch(feature_name: str):
@@ -59,6 +90,20 @@ def _require_torch(feature_name: str):
 
 def _sorted_state(parameters: list[TensorState]) -> ModelState:
     return ModelState(parameters=tuple(sorted(parameters, key=lambda parameter: parameter.name)))
+
+
+def resolve_torch_checkpoint_payload_kind(payload_kind: str | None) -> str:
+    normalized = (
+        DEFAULT_TORCH_CHECKPOINT_PAYLOAD_KIND
+        if payload_kind is None
+        else str(payload_kind).strip().lower() or DEFAULT_TORCH_CHECKPOINT_PAYLOAD_KIND
+    )
+    if normalized not in TORCH_CHECKPOINT_PAYLOAD_CHOICES:
+        raise ValueError(
+            "torch checkpoint payload kind must be one of: "
+            + ", ".join(TORCH_CHECKPOINT_PAYLOAD_CHOICES)
+        )
+    return normalized
 
 
 def _strip_shared_prefix(
@@ -204,23 +249,102 @@ def model_state_from_torch_state_dict_payload(payload: Mapping[str, Any]) -> Mod
     return _sorted_state(parameters)
 
 
+def model_state_from_torch_module(
+    module: Any,
+    *,
+    runtime_name: str | None = None,
+) -> ModelState:
+    if not hasattr(module, "state_dict") or not callable(module.state_dict):
+        raise ValueError(
+            f"PyTorch module payload {type(module).__name__!r} does not expose state_dict()"
+        )
+    state_dict = model_state_from_torch_state_dict_payload(module.state_dict())
+    return import_pytorch_state_dict(state_dict, runtime_name=runtime_name)
+
+
+def model_state_to_torch_module(
+    state: ModelState,
+    *,
+    runtime_name: str | None = None,
+):
+    torch = _require_torch("PyTorch module materialization")
+    resolved_runtime = resolve_training_runtime(runtime_name, state=state)
+    if resolved_runtime == LINEAR_REGRESSION_RUNTIME:
+        model = LinearModelAdapter().import_state(state)
+        module = torch.nn.Linear(
+            model.feature_count,
+            1,
+            bias=True,
+            dtype=torch.float64,
+        )
+    else:
+        model = MLPModelAdapter().import_state(state)
+        module = torch.nn.Sequential(
+            OrderedDict(
+                (
+                    (
+                        "hidden",
+                        torch.nn.Linear(
+                            model.feature_count,
+                            model.hidden_size,
+                            bias=True,
+                            dtype=torch.float64,
+                        ),
+                    ),
+                    ("activation", torch.nn.Tanh()),
+                    (
+                        "output",
+                        torch.nn.Linear(
+                            model.hidden_size,
+                            1,
+                            bias=True,
+                            dtype=torch.float64,
+                        ),
+                    ),
+                )
+            )
+        )
+    module.load_state_dict(
+        model_state_to_torch_state_dict_payload(state, runtime_name=resolved_runtime)
+    )
+    return module
+
+
 def _extract_checkpoint_runtime_name(payload: Any) -> str | None:
-    if not isinstance(payload, Mapping):
+    visited: set[int] = set()
+
+    def search(node: Any, *, depth: int) -> str | None:
+        if not isinstance(node, Mapping) or depth < 0:
+            return None
+        node_id = id(node)
+        if node_id in visited:
+            return None
+        visited.add(node_id)
+
+        for key in ("__nostrain_runtime__", "runtime"):
+            raw_value = node.get(key)
+            if raw_value is None:
+                continue
+            try:
+                return resolve_training_runtime(str(raw_value))
+            except ValueError:
+                continue
+
+        for key in ("metadata", "meta", "checkpoint"):
+            if key not in node:
+                continue
+            resolved = search(node[key], depth=depth - 1)
+            if resolved is not None:
+                return resolved
         return None
-    for key in ("__nostrain_runtime__", "runtime"):
-        raw_value = payload.get(key)
-        if raw_value is None:
-            continue
-        try:
-            return resolve_training_runtime(str(raw_value))
-        except ValueError:
-            continue
-    return None
+
+    return search(payload, depth=_CHECKPOINT_SCAN_DEPTH)
 
 
 def _candidate_state_dict_payloads(payload: Any) -> list[Mapping[str, Any]]:
     candidates: list[Mapping[str, Any]] = []
     seen: set[int] = set()
+    visited: set[int] = set()
 
     def add_candidate(candidate: Any) -> None:
         if hasattr(candidate, "state_dict") and callable(candidate.state_dict):
@@ -233,15 +357,22 @@ def _candidate_state_dict_payloads(payload: Any) -> list[Mapping[str, Any]]:
         seen.add(candidate_id)
         candidates.append(candidate)
 
-    add_candidate(payload)
-    if isinstance(payload, Mapping):
-        for key in _CHECKPOINT_STATE_DICT_KEYS:
-            add_candidate(payload.get(key))
-        for key, value in payload.items():
-            if key in _CHECKPOINT_STATE_DICT_KEYS:
-                continue
-            if hasattr(value, "state_dict") and callable(value.state_dict):
-                add_candidate(value)
+    def walk(node: Any, *, depth: int) -> None:
+        node_id = id(node)
+        if node_id in visited or depth < 0:
+            return
+        visited.add(node_id)
+        add_candidate(node)
+        if isinstance(node, Mapping):
+            for key in _CHECKPOINT_CONTAINER_KEYS:
+                if key in node:
+                    walk(node[key], depth=depth - 1)
+            for key, value in node.items():
+                if key in _CHECKPOINT_CONTAINER_KEYS:
+                    continue
+                walk(value, depth=depth - 1)
+
+    walk(payload, depth=_CHECKPOINT_SCAN_DEPTH)
     return candidates
 
 
@@ -250,7 +381,11 @@ def _torch_load_checkpoint(path: str | Path):
     try:
         return torch.load(path, map_location="cpu", weights_only=True)
     except TypeError:
-        return torch.load(path, map_location="cpu")
+        pass
+    except Exception:
+        # Raw module checkpoints and rich training bundles can fail safe weights-only loading.
+        pass
+    return torch.load(path, map_location="cpu")
 
 
 def load_torch_checkpoint(
@@ -304,11 +439,14 @@ def write_torch_checkpoint(
     state: ModelState,
     *,
     runtime_name: str | None = None,
+    payload_kind: str | None = None,
 ) -> None:
     torch = _require_torch("PyTorch checkpoint writing")
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        model_state_to_torch_state_dict_payload(state, runtime_name=runtime_name),
-        target,
-    )
+    resolved_kind = resolve_torch_checkpoint_payload_kind(payload_kind)
+    if resolved_kind == TORCH_CHECKPOINT_MODULE_PAYLOAD:
+        payload = model_state_to_torch_module(state, runtime_name=runtime_name)
+    else:
+        payload = model_state_to_torch_state_dict_payload(state, runtime_name=runtime_name)
+    torch.save(payload, target)
