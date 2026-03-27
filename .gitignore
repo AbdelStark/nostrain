@@ -11,3 +11,5 @@ uv.lock
 .env
 demo/artifacts/
 demo/*.log
+*.json
+**/.DS_Store
