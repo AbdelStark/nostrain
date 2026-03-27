@@ -10,8 +10,11 @@ import unittest
 
 from nostrain.model import ModelState
 from nostrain.training import (
+    LateGradientRecord,
     LinearRegressionDataset,
     LocalTrainingConfig,
+    TrainingCheckpoint,
+    TrainingRoundSummary,
     evaluate_linear_regression,
     train_linear_regression,
 )
@@ -88,6 +91,57 @@ class TrainingRuntimeTests(unittest.TestCase):
             self.assertLess(metrics_json["loss_after"], metrics_json["loss_before"])
             self.assertEqual(metrics_json["feature_count"], 2)
             self.assertEqual(metrics_json["example_count"], 4)
+
+    def test_training_checkpoint_roundtrip_preserves_late_gradients(self) -> None:
+        state = ModelState.from_path(FIXTURES / "linear_initial_state.json")
+        checkpoint = TrainingCheckpoint(
+            run_name="demo-run",
+            worker_id="worker-a",
+            relay_urls=("ws://127.0.0.1:8765",),
+            next_round=1,
+            current_state=state,
+            momentum_state=None,
+            rounds=(
+                TrainingRoundSummary(
+                    round_index=0,
+                    model_hash_before="a" * 64,
+                    model_hash_after="b" * 64,
+                    local_loss_before=1.0,
+                    local_loss_after_inner=0.5,
+                    local_loss_after_outer=0.4,
+                    collected_event_count=1,
+                    known_workers=("worker-a",),
+                    collected_workers=("worker-a",),
+                    completion_reason="timeout",
+                    published_gradient_event_id="c" * 64,
+                    published_heartbeat_event_id="d" * 64,
+                    published_checkpoint_event_id="",
+                    configured_relays=("ws://127.0.0.1:8765",),
+                    published_heartbeat_relays=("ws://127.0.0.1:8765",),
+                    published_gradient_relays=("ws://127.0.0.1:8765",),
+                    published_checkpoint_relays=(),
+                    collected_from_relays=("ws://127.0.0.1:8765",),
+                    failed_relays=(),
+                ),
+            ),
+            late_gradients=(
+                LateGradientRecord(
+                    round_index=0,
+                    worker_id="worker-b",
+                    event_id="e" * 64,
+                    created_at=1_700_000_000,
+                    model_hash="f" * 64,
+                ),
+            ),
+            updated_at=1_700_000_100,
+        )
+
+        restored = TrainingCheckpoint.from_json_obj(checkpoint.to_json_obj())
+
+        self.assertEqual(restored.next_round, 1)
+        self.assertEqual(restored.rounds_completed, 1)
+        self.assertEqual(len(restored.late_gradients), 1)
+        self.assertEqual(restored.late_gradients[0].worker_id, "worker-b")
 
 
 if __name__ == "__main__":

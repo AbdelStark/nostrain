@@ -17,19 +17,24 @@ import websockets
 from nostrain.compression import compress_delta
 from nostrain.model import ModelState, compute_delta, state_digest
 from nostrain.protocol import (
+    CheckpointEventMetadata,
     GradientEventMetadata,
     HeartbeatEventMetadata,
     NostrainEvent,
+    build_checkpoint_event,
     build_gradient_event,
     build_heartbeat_event,
     parse_nostrain_event,
     parse_gradient_event,
 )
 from nostrain.relay import (
+    collect_checkpoint_events,
+    collect_checkpoint_events_across_relays,
     collect_gradient_events,
     collect_gradient_events_across_relays,
     collect_heartbeat_events,
 )
+from nostrain.training import TrainingCheckpoint, TrainingRoundSummary
 from tests.helpers import assert_model_state_almost_equal, assert_state_json_almost_equal
 
 
@@ -93,6 +98,64 @@ def _build_heartbeat(
             advertised_relays=advertised_relays,
             created_at=created_at,
         ),
+        secret_key_hex=WORKER_SECRET_KEYS[worker_id],
+    )
+    return event.to_json_obj()
+
+
+def _build_checkpoint(
+    *,
+    worker_id: str,
+    created_at: int,
+    run_name: str = "demo-run",
+    round_index: int = 0,
+    state_fixture: str = "linear_initial_state.json",
+) -> dict[str, Any]:
+    state = ModelState.from_path(FIXTURES / state_fixture)
+    checkpoint = TrainingCheckpoint(
+        run_name=run_name,
+        worker_id=worker_id,
+        relay_urls=("ws://127.0.0.1:8765",),
+        next_round=round_index + 1,
+        current_state=state,
+        momentum_state=None,
+        rounds=(
+            TrainingRoundSummary(
+                round_index=round_index,
+                model_hash_before=state_digest(state),
+                model_hash_after=state_digest(state),
+                local_loss_before=1.0,
+                local_loss_after_inner=0.5,
+                local_loss_after_outer=0.5,
+                collected_event_count=1,
+                known_workers=(worker_id,),
+                collected_workers=(worker_id,),
+                completion_reason="timeout",
+                published_gradient_event_id="a" * 64,
+                published_heartbeat_event_id="b" * 64,
+                published_checkpoint_event_id="",
+                configured_relays=("ws://127.0.0.1:8765",),
+                published_heartbeat_relays=("ws://127.0.0.1:8765",),
+                published_gradient_relays=("ws://127.0.0.1:8765",),
+                published_checkpoint_relays=(),
+                collected_from_relays=("ws://127.0.0.1:8765",),
+                failed_relays=(),
+            ),
+        ),
+        late_gradients=(),
+        updated_at=created_at - 10,
+    )
+    event = build_checkpoint_event(
+        CheckpointEventMetadata(
+            run_name=run_name,
+            worker_id=worker_id,
+            round_index=round_index,
+            next_round=round_index + 1,
+            model_hash=state_digest(state),
+            rounds_completed=checkpoint.rounds_completed,
+            created_at=created_at,
+        ),
+        checkpoint.to_json_obj(),
         secret_key_hex=WORKER_SECRET_KEYS[worker_id],
     )
     return event.to_json_obj()
@@ -660,6 +723,92 @@ class RelayTransportTests(unittest.TestCase):
                 ["gradient-event"],
             )
 
+    def test_collect_checkpoint_events_discovers_latest_recoverable_state(self) -> None:
+        older = _build_checkpoint(
+            worker_id="worker-a",
+            created_at=1_700_000_300,
+            round_index=0,
+        )
+        newer = _build_checkpoint(
+            worker_id="worker-a",
+            created_at=1_700_000_320,
+            round_index=1,
+        )
+        other_worker = _build_checkpoint(
+            worker_id="worker-b",
+            created_at=1_700_000_310,
+            round_index=0,
+        )
+
+        with MockRelay([older, other_worker, newer]) as relay:
+            collection = asyncio.run(
+                collect_checkpoint_events(
+                    relay.url,
+                    run_name="demo-run",
+                    idle_timeout=0.2,
+                )
+            )
+
+        self.assertEqual(collection.events[0].parsed.metadata.round_index, 0)
+        self.assertEqual(collection.events[-1].parsed.metadata.round_index, 1)
+        self.assertEqual(sorted(set(collection.worker_ids)), ["worker-a", "worker-b"])
+        self.assertEqual(collection.latest_event.parsed.metadata.round_index, 1)
+        self.assertEqual(collection.latest_event.parsed.metadata.next_round, 2)
+        self.assertEqual(collection.latest_event.parsed.metadata.worker_id, "worker-a")
+
+    def test_cli_build_publish_and_discover_checkpoints(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory, MockRelay() as relay:
+            tempdir = Path(temporary_directory)
+            checkpoint_path = tempdir / "checkpoint.json"
+            event_path = tempdir / "checkpoint-event.json"
+            discovered = tempdir / "checkpoints.json"
+
+            checkpoint_event = _build_checkpoint(
+                worker_id="worker-a",
+                created_at=1_700_000_400,
+                round_index=0,
+            )
+            checkpoint_json = parse_nostrain_event(checkpoint_event).checkpoint_data
+            checkpoint_path.write_text(
+                json.dumps(checkpoint_json, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+            self._run(
+                "build-checkpoint",
+                str(checkpoint_path),
+                "--worker",
+                "worker-a",
+                "--sec-key",
+                WORKER_SECRET_KEYS["worker-a"],
+                "--created-at",
+                "1700000401",
+                "-o",
+                str(event_path),
+            )
+            self._run(
+                "publish-event",
+                str(event_path),
+                "--relay",
+                relay.url,
+            )
+            self._run(
+                "discover-checkpoints",
+                "--relay",
+                relay.url,
+                "--run",
+                "demo-run",
+                "--json",
+                "-o",
+                str(discovered),
+            )
+
+            discovered_json = json.loads(discovered.read_text(encoding="utf-8"))
+            self.assertEqual(discovered_json["event_count"], 1)
+            self.assertEqual(discovered_json["latest"]["round"], 0)
+            self.assertEqual(discovered_json["latest"]["next_round"], 1)
+            self.assertEqual(discovered_json["workers"], ["worker-a"])
+
     def test_cli_publish_rejects_unsigned_event_on_signed_relay(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory, MockRelay() as relay:
             tempdir = Path(temporary_directory)
@@ -1105,6 +1254,72 @@ class RelayTransportTests(unittest.TestCase):
                 [round_summary["round"] for round_summary in resumed_summary_json["rounds"]],
                 [0, 1],
             )
+
+    def test_cli_run_training_can_resume_from_latest_relay_checkpoint_and_track_late_gradients(self) -> None:
+        checkpoint_event = _build_checkpoint(
+            worker_id="worker-b",
+            created_at=1_700_000_500,
+            run_name="relay-resume-run",
+            round_index=0,
+        )
+        late_gradient = _build_event(
+            worker_id="worker-c",
+            current_fixture="current_state_peer.json",
+            created_at=1_700_000_520,
+            run_name="relay-resume-run",
+            round_index=0,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory, MockRelay(
+            [checkpoint_event, late_gradient]
+        ) as relay:
+            tempdir = Path(temporary_directory)
+            final_state = tempdir / "final-state.json"
+            summary = tempdir / "summary.json"
+
+            self._run(
+                "run-training",
+                str(FIXTURES / "linear_initial_state.json"),
+                str(FIXTURES / "linear_dataset_worker_a.json"),
+                "--relay",
+                relay.url,
+                "--run",
+                "relay-resume-run",
+                "--worker",
+                "worker-a",
+                "--sec-key",
+                WORKER_SECRET_KEYS["worker-a"],
+                "--rounds",
+                "1",
+                "--inner-steps",
+                "20",
+                "--local-learning-rate",
+                "0.05",
+                "--batch-size",
+                "2",
+                "--outer-learning-rate",
+                "1.0",
+                "--momentum",
+                "0.0",
+                "--round-timeout",
+                "0.2",
+                "--resume-latest-checkpoint",
+                "--late-gradient-timeout",
+                "0.2",
+                "--summary-out",
+                str(summary),
+                "-o",
+                str(final_state),
+            )
+
+            summary_json = json.loads(summary.read_text(encoding="utf-8"))
+            self.assertIn("parameters", json.loads(final_state.read_text(encoding="utf-8")))
+            self.assertEqual(summary_json["start_round"], 0)
+            self.assertEqual(summary_json["rounds_completed"], 2)
+            self.assertEqual(summary_json["late_gradient_count"], 1)
+            self.assertEqual(summary_json["late_gradients"][0]["round"], 0)
+            self.assertEqual(summary_json["late_gradients"][0]["worker"], "worker-c")
+            self.assertTrue(summary_json["rounds"][-1]["published_checkpoint_event_id"])
 
 
 if __name__ == "__main__":

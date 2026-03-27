@@ -11,12 +11,15 @@ from .aggregation import aggregate_deltas
 from .compression import decompress_payload
 from .model import ModelState
 from .protocol import (
+    NOSTRAIN_CHECKPOINT_KIND,
     NOSTRAIN_GRADIENT_KIND,
     NOSTRAIN_HEARTBEAT_KIND,
     NOSTRAIN_MARKER,
     NostrainEvent,
+    ParsedCheckpointEvent,
     ParsedGradientEvent,
     ParsedHeartbeatEvent,
+    parse_checkpoint_event,
     parse_gradient_event,
     parse_heartbeat_event,
     parse_nostrain_event,
@@ -198,6 +201,34 @@ class CollectedHeartbeatEvent:
 
 
 @dataclass(frozen=True)
+class CollectedCheckpointEvent:
+    event_id: str
+    parsed: ParsedCheckpointEvent
+
+    def to_summary_obj(self) -> dict[str, Any]:
+        return {
+            "event_id": self.event_id,
+            "kind": self.parsed.event.kind,
+            "created_at": self.parsed.event.created_at,
+            "signed": self.parsed.event.is_signed,
+            "pubkey": self.parsed.event.pubkey,
+            "run": self.parsed.metadata.run_name,
+            "worker": self.parsed.metadata.worker_id,
+            "round": self.parsed.metadata.round_index,
+            "next_round": self.parsed.metadata.next_round,
+            "model": self.parsed.metadata.model_hash,
+            "rounds_completed": self.parsed.metadata.rounds_completed,
+            "checkpoint_updated_at": int(self.parsed.checkpoint_data.get("updated_at", 0)),
+        }
+
+    def to_json_obj(self) -> dict[str, Any]:
+        data = self.to_summary_obj()
+        data["event"] = self.parsed.event.to_json_obj()
+        data["checkpoint"] = self.parsed.checkpoint_data
+        return data
+
+
+@dataclass(frozen=True)
 class HeartbeatCollectionResult:
     relay_url: str
     run_name: str
@@ -224,6 +255,103 @@ class HeartbeatCollectionResult:
             "stale_events": self.stale_events,
             "notices": list(self.notices),
         }
+        if include_events:
+            data["events"] = [event.to_json_obj() for event in self.events]
+        return data
+
+
+def _latest_checkpoint_event(
+    events: Sequence[CollectedCheckpointEvent],
+) -> CollectedCheckpointEvent | None:
+    if not events:
+        return None
+    return max(
+        events,
+        key=lambda event: (
+            event.parsed.metadata.next_round,
+            event.parsed.metadata.round_index,
+            event.parsed.event.created_at,
+            event.event_id,
+        ),
+    )
+
+
+@dataclass(frozen=True)
+class CheckpointCollectionResult:
+    relay_url: str
+    run_name: str
+    events: tuple[CollectedCheckpointEvent, ...]
+    duplicates_discarded: int
+    invalid_events: int
+    notices: tuple[str, ...] = ()
+
+    @property
+    def worker_ids(self) -> tuple[str, ...]:
+        return tuple(event.parsed.metadata.worker_id for event in self.events)
+
+    @property
+    def latest_event(self) -> CollectedCheckpointEvent | None:
+        return _latest_checkpoint_event(self.events)
+
+    def to_json_obj(self, *, include_events: bool = True) -> dict[str, Any]:
+        latest_event = self.latest_event
+        data: dict[str, Any] = {
+            "relay": self.relay_url,
+            "run": self.run_name,
+            "event_count": len(self.events),
+            "workers": list(self.worker_ids),
+            "duplicates_discarded": self.duplicates_discarded,
+            "invalid_events": self.invalid_events,
+            "notices": list(self.notices),
+        }
+        if latest_event is not None:
+            data["latest"] = latest_event.to_summary_obj()
+        if include_events:
+            data["events"] = [event.to_json_obj() for event in self.events]
+        return data
+
+
+@dataclass(frozen=True)
+class MultiRelayCheckpointCollectionResult:
+    relay_urls: tuple[str, ...]
+    run_name: str
+    events: tuple[CollectedCheckpointEvent, ...]
+    duplicates_discarded: int
+    invalid_events: int
+    notices: tuple[str, ...] = ()
+    failed_relays: tuple[RelayOperationError, ...] = ()
+    relay_results: tuple[CheckpointCollectionResult, ...] = ()
+
+    @property
+    def worker_ids(self) -> tuple[str, ...]:
+        return tuple(event.parsed.metadata.worker_id for event in self.events)
+
+    @property
+    def successful_relays(self) -> tuple[str, ...]:
+        return tuple(result.relay_url for result in self.relay_results)
+
+    @property
+    def latest_event(self) -> CollectedCheckpointEvent | None:
+        return _latest_checkpoint_event(self.events)
+
+    def to_json_obj(self, *, include_events: bool = True) -> dict[str, Any]:
+        latest_event = self.latest_event
+        data: dict[str, Any] = {
+            "relays": list(self.relay_urls),
+            "successful_relays": list(self.successful_relays),
+            "run": self.run_name,
+            "event_count": len(self.events),
+            "workers": list(self.worker_ids),
+            "duplicates_discarded": self.duplicates_discarded,
+            "invalid_events": self.invalid_events,
+            "failed_relays": [failure.to_json_obj() for failure in self.failed_relays],
+            "notices": list(self.notices),
+            "relay_results": [
+                result.to_json_obj(include_events=False) for result in self.relay_results
+            ],
+        }
+        if latest_event is not None:
+            data["latest"] = latest_event.to_summary_obj()
         if include_events:
             data["events"] = [event.to_json_obj() for event in self.events]
         return data
@@ -369,6 +497,87 @@ class MultiRelayCollectionResult:
         return data
 
 
+@dataclass(frozen=True)
+class LateGradientCollectionResult:
+    relay_url: str
+    run_name: str
+    current_round: int
+    events: tuple[CollectedGradientEvent, ...]
+    duplicates_discarded: int
+    invalid_events: int
+    notices: tuple[str, ...] = ()
+
+    @property
+    def worker_ids(self) -> tuple[str, ...]:
+        return tuple(event.parsed.metadata.worker_id for event in self.events)
+
+    @property
+    def round_indices(self) -> tuple[int, ...]:
+        return tuple(dict.fromkeys(event.parsed.metadata.round_index for event in self.events))
+
+    def to_json_obj(self, *, include_events: bool = True) -> dict[str, Any]:
+        data = {
+            "relay": self.relay_url,
+            "run": self.run_name,
+            "current_round": self.current_round,
+            "event_count": len(self.events),
+            "workers": list(self.worker_ids),
+            "rounds": list(self.round_indices),
+            "duplicates_discarded": self.duplicates_discarded,
+            "invalid_events": self.invalid_events,
+            "notices": list(self.notices),
+        }
+        if include_events:
+            data["events"] = [event.to_json_obj() for event in self.events]
+        return data
+
+
+@dataclass(frozen=True)
+class MultiRelayLateGradientCollectionResult:
+    relay_urls: tuple[str, ...]
+    run_name: str
+    current_round: int
+    events: tuple[CollectedGradientEvent, ...]
+    duplicates_discarded: int
+    invalid_events: int
+    notices: tuple[str, ...] = ()
+    failed_relays: tuple[RelayOperationError, ...] = ()
+    relay_results: tuple[LateGradientCollectionResult, ...] = ()
+
+    @property
+    def worker_ids(self) -> tuple[str, ...]:
+        return tuple(event.parsed.metadata.worker_id for event in self.events)
+
+    @property
+    def round_indices(self) -> tuple[int, ...]:
+        return tuple(dict.fromkeys(event.parsed.metadata.round_index for event in self.events))
+
+    @property
+    def successful_relays(self) -> tuple[str, ...]:
+        return tuple(result.relay_url for result in self.relay_results)
+
+    def to_json_obj(self, *, include_events: bool = True) -> dict[str, Any]:
+        data = {
+            "relays": list(self.relay_urls),
+            "successful_relays": list(self.successful_relays),
+            "run": self.run_name,
+            "current_round": self.current_round,
+            "event_count": len(self.events),
+            "workers": list(self.worker_ids),
+            "rounds": list(self.round_indices),
+            "duplicates_discarded": self.duplicates_discarded,
+            "invalid_events": self.invalid_events,
+            "failed_relays": [failure.to_json_obj() for failure in self.failed_relays],
+            "notices": list(self.notices),
+            "relay_results": [
+                result.to_json_obj(include_events=False) for result in self.relay_results
+            ],
+        }
+        if include_events:
+            data["events"] = [event.to_json_obj() for event in self.events]
+        return data
+
+
 def _prefer_candidate(
     existing: CollectedGradientEvent,
     candidate: CollectedGradientEvent,
@@ -408,6 +617,25 @@ async def publish_heartbeat_event(
 
     nostrain_event = event if isinstance(event, NostrainEvent) else NostrainEvent.from_json_obj(event)
     parse_heartbeat_event(nostrain_event)
+    return await _publish_validated_event(
+        relay_url,
+        nostrain_event,
+        open_timeout=open_timeout,
+        reply_timeout=reply_timeout,
+    )
+
+
+async def publish_checkpoint_event(
+    relay_url: str,
+    event: NostrainEvent | dict[str, Any],
+    *,
+    open_timeout: float = 10.0,
+    reply_timeout: float = 10.0,
+) -> RelayPublishResult:
+    _require_websocket_support()
+
+    nostrain_event = event if isinstance(event, NostrainEvent) else NostrainEvent.from_json_obj(event)
+    parse_checkpoint_event(nostrain_event)
     return await _publish_validated_event(
         relay_url,
         nostrain_event,
@@ -765,6 +993,214 @@ async def collect_heartbeat_events_across_relays(
     )
 
 
+async def collect_checkpoint_events(
+    relay_url: str,
+    *,
+    run_name: str,
+    min_round: int | None = None,
+    worker_id: str | None = None,
+    idle_timeout: float = 2.0,
+    open_timeout: float = 10.0,
+    since: int | None = None,
+) -> CheckpointCollectionResult:
+    _require_websocket_support()
+
+    if min_round is not None and min_round < 0:
+        raise ValueError("min_round must be non-negative when provided")
+    if idle_timeout <= 0:
+        raise ValueError("idle_timeout must be positive")
+
+    subscription_id = _subscription_id()
+    relay_filter: dict[str, Any] = {
+        "kinds": [NOSTRAIN_CHECKPOINT_KIND],
+        "#t": [NOSTRAIN_MARKER],
+    }
+    if since is not None:
+        relay_filter["since"] = since
+
+    selected: dict[str, CollectedCheckpointEvent] = {}
+    duplicates_discarded = 0
+    invalid_events = 0
+    notices: list[str] = []
+
+    async with websockets.connect(  # type: ignore[union-attr]
+        relay_url,
+        open_timeout=open_timeout,
+        close_timeout=idle_timeout,
+    ) as websocket:
+        await websocket.send(_encode_frame(["REQ", subscription_id, relay_filter]))
+        try:
+            while True:
+                try:
+                    raw_message = await asyncio.wait_for(websocket.recv(), timeout=idle_timeout)
+                except asyncio.TimeoutError:
+                    break
+
+                frame = _decode_frame(raw_message)
+                message_type = frame[0]
+
+                if message_type == "EVENT":
+                    if len(frame) < 3 or frame[1] != subscription_id:
+                        continue
+                    try:
+                        parsed = parse_checkpoint_event(frame[2])
+                    except ValueError:
+                        invalid_events += 1
+                        continue
+                    if parsed.metadata.run_name != run_name:
+                        continue
+                    if min_round is not None and parsed.metadata.round_index < min_round:
+                        continue
+                    if worker_id is not None and parsed.metadata.worker_id != worker_id:
+                        continue
+
+                    collected_event = CollectedCheckpointEvent(
+                        event_id=parsed.event.fingerprint(),
+                        parsed=parsed,
+                    )
+                    identity = parsed.metadata.parameterized_identifier
+                    existing = selected.get(identity)
+                    if existing is None:
+                        selected[identity] = collected_event
+                    else:
+                        duplicates_discarded += 1
+                        if _prefer_candidate(existing, collected_event):
+                            selected[identity] = collected_event
+                    continue
+
+                if message_type == "EOSE" and len(frame) > 1 and frame[1] == subscription_id:
+                    break
+
+                if message_type == "NOTICE":
+                    if len(frame) > 1:
+                        notices.append(str(frame[1]))
+                    continue
+
+                if message_type == "CLOSED" and len(frame) > 1 and frame[1] == subscription_id:
+                    break
+        finally:
+            try:
+                await websocket.send(_encode_frame(["CLOSE", subscription_id]))
+            except Exception:
+                pass
+
+    ordered_events = tuple(
+        sorted(
+            selected.values(),
+            key=lambda event: (
+                event.parsed.metadata.round_index,
+                event.parsed.metadata.worker_id,
+                event.parsed.event.created_at,
+                event.event_id,
+            ),
+        )
+    )
+    return CheckpointCollectionResult(
+        relay_url=relay_url,
+        run_name=run_name,
+        events=ordered_events,
+        duplicates_discarded=duplicates_discarded,
+        invalid_events=invalid_events,
+        notices=tuple(notices),
+    )
+
+
+def _merge_checkpoint_results(
+    relay_urls: tuple[str, ...],
+    *,
+    run_name: str,
+    relay_results: Sequence[CheckpointCollectionResult],
+    failed_relays: Sequence[RelayOperationError],
+) -> MultiRelayCheckpointCollectionResult:
+    selected: dict[str, CollectedCheckpointEvent] = {}
+    duplicates_discarded = sum(result.duplicates_discarded for result in relay_results)
+    invalid_events = sum(result.invalid_events for result in relay_results)
+    notices: list[str] = []
+
+    for result in relay_results:
+        notices.extend(result.notices)
+        for event in result.events:
+            identity = event.parsed.metadata.parameterized_identifier
+            existing = selected.get(identity)
+            if existing is None:
+                selected[identity] = event
+            else:
+                duplicates_discarded += 1
+                if _prefer_candidate(existing, event):
+                    selected[identity] = event
+
+    ordered_events = tuple(
+        sorted(
+            selected.values(),
+            key=lambda event: (
+                event.parsed.metadata.round_index,
+                event.parsed.metadata.worker_id,
+                event.parsed.event.created_at,
+                event.event_id,
+            ),
+        )
+    )
+    return MultiRelayCheckpointCollectionResult(
+        relay_urls=relay_urls,
+        run_name=run_name,
+        events=ordered_events,
+        duplicates_discarded=duplicates_discarded,
+        invalid_events=invalid_events,
+        notices=tuple(notices),
+        failed_relays=tuple(failed_relays),
+        relay_results=tuple(relay_results),
+    )
+
+
+async def collect_checkpoint_events_across_relays(
+    relay_urls: Sequence[str],
+    *,
+    run_name: str,
+    min_round: int | None = None,
+    worker_id: str | None = None,
+    idle_timeout: float = 2.0,
+    open_timeout: float = 10.0,
+    since: int | None = None,
+) -> MultiRelayCheckpointCollectionResult:
+    normalized_relays = _normalize_relay_urls(relay_urls)
+    results = await asyncio.gather(
+        *[
+            collect_checkpoint_events(
+                relay_url,
+                run_name=run_name,
+                min_round=min_round,
+                worker_id=worker_id,
+                idle_timeout=idle_timeout,
+                open_timeout=open_timeout,
+                since=since,
+            )
+            for relay_url in normalized_relays
+        ],
+        return_exceptions=True,
+    )
+
+    relay_results: list[CheckpointCollectionResult] = []
+    failed_relays: list[RelayOperationError] = []
+    for relay_url, result in zip(normalized_relays, results):
+        if isinstance(result, Exception):
+            failed_relays.append(
+                RelayOperationError(
+                    relay_url=relay_url,
+                    operation="collect-checkpoints",
+                    message=f"{type(result).__name__}: {result}",
+                )
+            )
+            continue
+        relay_results.append(result)
+
+    return _merge_checkpoint_results(
+        normalized_relays,
+        run_name=run_name,
+        relay_results=relay_results,
+        failed_relays=failed_relays,
+    )
+
+
 def _completion_reason(
     *,
     selected_count: int,
@@ -1106,4 +1542,220 @@ async def collect_gradient_events_across_relays(
         known_workers=known_workers,
         failed_relays=failed_relays,
         notices=notices,
+    )
+
+
+async def collect_late_gradient_events(
+    relay_url: str,
+    *,
+    run_name: str,
+    current_round: int,
+    idle_timeout: float = 0.2,
+    open_timeout: float = 10.0,
+    since: int | None = None,
+) -> LateGradientCollectionResult:
+    _require_websocket_support()
+
+    if current_round < 0:
+        raise ValueError("current_round must be non-negative")
+    if idle_timeout <= 0:
+        raise ValueError("idle_timeout must be positive")
+    if current_round == 0:
+        return LateGradientCollectionResult(
+            relay_url=relay_url,
+            run_name=run_name,
+            current_round=current_round,
+            events=(),
+            duplicates_discarded=0,
+            invalid_events=0,
+        )
+
+    subscription_id = _subscription_id()
+    relay_filter: dict[str, Any] = {
+        "kinds": [NOSTRAIN_GRADIENT_KIND],
+        "#t": [NOSTRAIN_MARKER],
+    }
+    if since is not None:
+        relay_filter["since"] = since
+
+    selected: dict[str, CollectedGradientEvent] = {}
+    duplicates_discarded = 0
+    invalid_events = 0
+    notices: list[str] = []
+
+    async with websockets.connect(  # type: ignore[union-attr]
+        relay_url,
+        open_timeout=open_timeout,
+        close_timeout=idle_timeout,
+    ) as websocket:
+        await websocket.send(_encode_frame(["REQ", subscription_id, relay_filter]))
+        try:
+            while True:
+                try:
+                    raw_message = await asyncio.wait_for(websocket.recv(), timeout=idle_timeout)
+                except asyncio.TimeoutError:
+                    break
+
+                frame = _decode_frame(raw_message)
+                message_type = frame[0]
+
+                if message_type == "EVENT":
+                    if len(frame) < 3 or frame[1] != subscription_id:
+                        continue
+                    try:
+                        parsed = parse_gradient_event(frame[2])
+                    except ValueError:
+                        invalid_events += 1
+                        continue
+                    if parsed.metadata.run_name != run_name:
+                        continue
+                    if parsed.metadata.round_index >= current_round:
+                        continue
+
+                    collected_event = CollectedGradientEvent(
+                        event_id=parsed.event.fingerprint(),
+                        parsed=parsed,
+                    )
+                    identity = parsed.metadata.parameterized_identifier
+                    existing = selected.get(identity)
+                    if existing is None:
+                        selected[identity] = collected_event
+                    else:
+                        duplicates_discarded += 1
+                        if _prefer_candidate(existing, collected_event):
+                            selected[identity] = collected_event
+                    continue
+
+                if message_type == "EOSE" and len(frame) > 1 and frame[1] == subscription_id:
+                    break
+
+                if message_type == "NOTICE":
+                    if len(frame) > 1:
+                        notices.append(str(frame[1]))
+                    continue
+
+                if message_type == "CLOSED" and len(frame) > 1 and frame[1] == subscription_id:
+                    break
+        finally:
+            try:
+                await websocket.send(_encode_frame(["CLOSE", subscription_id]))
+            except Exception:
+                pass
+
+    ordered_events = tuple(
+        sorted(
+            selected.values(),
+            key=lambda event: (
+                event.parsed.metadata.round_index,
+                event.parsed.metadata.worker_id,
+                event.parsed.event.created_at,
+                event.event_id,
+            ),
+        )
+    )
+    return LateGradientCollectionResult(
+        relay_url=relay_url,
+        run_name=run_name,
+        current_round=current_round,
+        events=ordered_events,
+        duplicates_discarded=duplicates_discarded,
+        invalid_events=invalid_events,
+        notices=tuple(notices),
+    )
+
+
+def _merge_late_gradient_results(
+    relay_urls: tuple[str, ...],
+    *,
+    run_name: str,
+    current_round: int,
+    relay_results: Sequence[LateGradientCollectionResult],
+    failed_relays: Sequence[RelayOperationError],
+) -> MultiRelayLateGradientCollectionResult:
+    selected: dict[str, CollectedGradientEvent] = {}
+    duplicates_discarded = sum(result.duplicates_discarded for result in relay_results)
+    invalid_events = sum(result.invalid_events for result in relay_results)
+    notices: list[str] = []
+
+    for result in relay_results:
+        notices.extend(result.notices)
+        for event in result.events:
+            identity = event.parsed.metadata.parameterized_identifier
+            existing = selected.get(identity)
+            if existing is None:
+                selected[identity] = event
+            else:
+                duplicates_discarded += 1
+                if _prefer_candidate(existing, event):
+                    selected[identity] = event
+
+    ordered_events = tuple(
+        sorted(
+            selected.values(),
+            key=lambda event: (
+                event.parsed.metadata.round_index,
+                event.parsed.metadata.worker_id,
+                event.parsed.event.created_at,
+                event.event_id,
+            ),
+        )
+    )
+    return MultiRelayLateGradientCollectionResult(
+        relay_urls=relay_urls,
+        run_name=run_name,
+        current_round=current_round,
+        events=ordered_events,
+        duplicates_discarded=duplicates_discarded,
+        invalid_events=invalid_events,
+        notices=tuple(notices),
+        failed_relays=tuple(failed_relays),
+        relay_results=tuple(relay_results),
+    )
+
+
+async def collect_late_gradient_events_across_relays(
+    relay_urls: Sequence[str],
+    *,
+    run_name: str,
+    current_round: int,
+    idle_timeout: float = 0.2,
+    open_timeout: float = 10.0,
+    since: int | None = None,
+) -> MultiRelayLateGradientCollectionResult:
+    normalized_relays = _normalize_relay_urls(relay_urls)
+    results = await asyncio.gather(
+        *[
+            collect_late_gradient_events(
+                relay_url,
+                run_name=run_name,
+                current_round=current_round,
+                idle_timeout=idle_timeout,
+                open_timeout=open_timeout,
+                since=since,
+            )
+            for relay_url in normalized_relays
+        ],
+        return_exceptions=True,
+    )
+
+    relay_results: list[LateGradientCollectionResult] = []
+    failed_relays: list[RelayOperationError] = []
+    for relay_url, result in zip(normalized_relays, results):
+        if isinstance(result, Exception):
+            failed_relays.append(
+                RelayOperationError(
+                    relay_url=relay_url,
+                    operation="collect-late-gradients",
+                    message=f"{type(result).__name__}: {result}",
+                )
+            )
+            continue
+        relay_results.append(result)
+
+    return _merge_late_gradient_results(
+        normalized_relays,
+        run_name=run_name,
+        current_round=current_round,
+        relay_results=relay_results,
+        failed_relays=failed_relays,
     )

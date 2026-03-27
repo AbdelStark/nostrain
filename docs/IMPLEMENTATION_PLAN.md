@@ -87,15 +87,27 @@ Delivered in the current repository state:
 
 This moves the project from a single-relay prototype to a more fault-tolerant training system that can survive relay loss and resume worker progress without manual state reconstruction.
 
-## Next milestone: late-gradient handling + checkpoint distribution
+## Completed milestone: late-gradient handling + checkpoint distribution
 
-Goal: keep workers coordinated when network timing gets messy and workers need shared recovery points.
+Delivered in the current repository state:
+
+- signed checkpoint events (kind `33335`) carrying the latest recoverable training state
+- relay checkpoint discovery plus `run-training --resume-latest-checkpoint` for rejoining workers
+- per-round checkpoint publication artifacts alongside the existing local checkpoint files
+- explicit late-gradient scans that surface/discard stale updates from already-completed rounds
+- checkpoint/session summaries that persist previously observed late gradients across resume boundaries
+- protocol, relay, CLI, and training tests covering checkpoint publish/discovery, relay resume, and late-gradient accounting
+
+This moves the project from local-only checkpoint recovery to distributed checkpoint recovery with explicit stale-update handling when workers advance at different times.
+
+## Next milestone: retention policy + richer runtimes
+
+Goal: keep relay history bounded and prepare the transport/runtime boundary for larger models.
 
 Deliverables:
 
-- explicit handling for late gradients that arrive after a worker has advanced to the next round
-- checkpoint advertisement/distribution semantics so rejoining workers can discover the latest recoverable state
 - retention/pruning rules for checkpoint artifacts and relay history
+- a clearer reconciliation story for discarded late gradients
 - compatibility story for richer runtimes such as PyTorch/MLX on top of the resilient transport layer
 
 ## Deferred polish

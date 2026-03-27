@@ -10,12 +10,18 @@ from .aggregation import nesterov_outer_step
 from .compression import CompressionCodec, compress_delta
 from .model import ModelState, TensorState, compute_delta, state_digest
 from .protocol import (
+    CheckpointEventMetadata,
     GradientEventMetadata,
     HeartbeatEventMetadata,
+    build_checkpoint_event,
     build_gradient_event,
     build_heartbeat_event,
 )
-from .relay import collect_gradient_events_across_relays, publish_nostrain_events
+from .relay import (
+    collect_gradient_events_across_relays,
+    collect_late_gradient_events_across_relays,
+    publish_nostrain_events,
+)
 
 LINEAR_WEIGHT_PARAMETER = "linear.weight"
 LINEAR_BIAS_PARAMETER = "linear.bias"
@@ -307,6 +313,7 @@ class TrainingWorkerConfig:
     open_timeout: float = 10.0
     heartbeat_interval: int = 60
     max_missed_heartbeats: int = 3
+    late_gradient_timeout: float = 0.2
     advertised_relays: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -340,6 +347,8 @@ class TrainingWorkerConfig:
             raise ValueError("heartbeat interval must be positive")
         if self.max_missed_heartbeats <= 0:
             raise ValueError("max missed heartbeats must be positive")
+        if self.late_gradient_timeout <= 0:
+            raise ValueError("late gradient timeout must be positive")
         normalized_relays = tuple(
             dict.fromkeys(str(relay).strip() for relay in self.relay_urls if str(relay).strip())
         )
@@ -358,6 +367,36 @@ class TrainingWorkerConfig:
 
 
 @dataclass(frozen=True)
+class LateGradientRecord:
+    round_index: int
+    worker_id: str
+    event_id: str
+    created_at: int
+    model_hash: str
+
+    def to_json_obj(self) -> dict[str, Any]:
+        return {
+            "round": self.round_index,
+            "worker": self.worker_id,
+            "event_id": self.event_id,
+            "created_at": self.created_at,
+            "model_hash": self.model_hash,
+        }
+
+    @classmethod
+    def from_json_obj(cls, data: Any) -> "LateGradientRecord":
+        if not isinstance(data, dict):
+            raise ValueError("late gradient record JSON must be an object")
+        return cls(
+            round_index=int(data["round"]),
+            worker_id=str(data["worker"]),
+            event_id=str(data["event_id"]),
+            created_at=int(data["created_at"]),
+            model_hash=str(data["model_hash"]),
+        )
+
+
+@dataclass(frozen=True)
 class TrainingRoundSummary:
     round_index: int
     model_hash_before: str
@@ -371,9 +410,11 @@ class TrainingRoundSummary:
     completion_reason: str
     published_gradient_event_id: str
     published_heartbeat_event_id: str
+    published_checkpoint_event_id: str
     configured_relays: tuple[str, ...]
     published_heartbeat_relays: tuple[str, ...]
     published_gradient_relays: tuple[str, ...]
+    published_checkpoint_relays: tuple[str, ...]
     collected_from_relays: tuple[str, ...]
     failed_relays: tuple[str, ...]
 
@@ -396,9 +437,11 @@ class TrainingRoundSummary:
             "completion_reason": self.completion_reason,
             "published_gradient_event_id": self.published_gradient_event_id,
             "published_heartbeat_event_id": self.published_heartbeat_event_id,
+            "published_checkpoint_event_id": self.published_checkpoint_event_id,
             "configured_relays": list(self.configured_relays),
             "published_heartbeat_relays": list(self.published_heartbeat_relays),
             "published_gradient_relays": list(self.published_gradient_relays),
+            "published_checkpoint_relays": list(self.published_checkpoint_relays),
             "collected_from_relays": list(self.collected_from_relays),
             "failed_relays": list(self.failed_relays),
         }
@@ -420,12 +463,16 @@ class TrainingRoundSummary:
             completion_reason=str(data["completion_reason"]),
             published_gradient_event_id=str(data["published_gradient_event_id"]),
             published_heartbeat_event_id=str(data["published_heartbeat_event_id"]),
+            published_checkpoint_event_id=str(data.get("published_checkpoint_event_id", "")),
             configured_relays=tuple(str(relay) for relay in data.get("configured_relays", [])),
             published_heartbeat_relays=tuple(
                 str(relay) for relay in data.get("published_heartbeat_relays", [])
             ),
             published_gradient_relays=tuple(
                 str(relay) for relay in data.get("published_gradient_relays", [])
+            ),
+            published_checkpoint_relays=tuple(
+                str(relay) for relay in data.get("published_checkpoint_relays", [])
             ),
             collected_from_relays=tuple(
                 str(relay) for relay in data.get("collected_from_relays", [])
@@ -444,6 +491,7 @@ class TrainingSessionResult:
     final_state: ModelState
     final_momentum_state: ModelState | None
     rounds: tuple[TrainingRoundSummary, ...]
+    late_gradients: tuple[LateGradientRecord, ...] = ()
 
     @property
     def final_model_hash(self) -> str:
@@ -463,9 +511,14 @@ class TrainingSessionResult:
             "start_round": self.start_round,
             "rounds_completed": self.rounds_completed,
             "final_model_hash": self.final_model_hash,
+            "late_gradient_count": len(self.late_gradients),
         }
         if include_rounds:
             data["rounds"] = [round_summary.to_json_obj() for round_summary in self.rounds]
+        if self.late_gradients:
+            data["late_gradients"] = [
+                late_gradient.to_json_obj() for late_gradient in self.late_gradients
+            ]
         if include_final_state:
             data["final_state"] = self.final_state.to_json_obj()
         if include_final_momentum and self.final_momentum_state is not None:
@@ -482,6 +535,7 @@ class TrainingCheckpoint:
     current_state: ModelState
     momentum_state: ModelState | None
     rounds: tuple[TrainingRoundSummary, ...]
+    late_gradients: tuple[LateGradientRecord, ...]
     updated_at: int
 
     @property
@@ -507,6 +561,7 @@ class TrainingCheckpoint:
             "current_model_hash": state_digest(self.current_state),
             "current_state": self.current_state.to_json_obj(),
             "rounds": [round_summary.to_json_obj() for round_summary in self.rounds],
+            "late_gradients": [late_gradient.to_json_obj() for late_gradient in self.late_gradients],
         }
         if self.momentum_state is not None:
             data["momentum_state"] = self.momentum_state.to_json_obj()
@@ -531,6 +586,10 @@ class TrainingCheckpoint:
             rounds=tuple(
                 TrainingRoundSummary.from_json_obj(round_data)
                 for round_data in data.get("rounds", [])
+            ),
+            late_gradients=tuple(
+                LateGradientRecord.from_json_obj(record)
+                for record in data.get("late_gradients", [])
             ),
             updated_at=int(data.get("updated_at", 0)),
         )
@@ -568,17 +627,47 @@ async def run_training_session(
     previous_momentum: ModelState | None = None,
     artifact_dir: str | Path | None = None,
     prior_rounds: tuple[TrainingRoundSummary, ...] = (),
+    prior_late_gradients: tuple[LateGradientRecord, ...] = (),
+    late_gradient_since: int | None = None,
     checkpoint_out: str | Path | None = None,
 ) -> TrainingSessionResult:
     adapter = adapter or LinearModelAdapter()
     current_state = initial_state
     current_momentum = previous_momentum
     round_summaries: list[TrainingRoundSummary] = list(prior_rounds)
+    late_gradients: list[LateGradientRecord] = list(prior_late_gradients)
+    late_scan_since = late_gradient_since
     artifact_root = Path(artifact_dir) if artifact_dir is not None else None
 
     for round_offset in range(config.rounds):
         round_index = config.start_round + round_offset
         round_start = int(time.time())
+        round_dir = (
+            artifact_root / f"round-{round_index:04d}" if artifact_root is not None else None
+        )
+        late_collection = None
+
+        if late_scan_since is not None:
+            late_collection = await collect_late_gradient_events_across_relays(
+                config.relay_urls,
+                run_name=config.run_name,
+                current_round=round_index,
+                idle_timeout=min(config.late_gradient_timeout, config.round_timeout),
+                open_timeout=config.open_timeout,
+                since=late_scan_since,
+            )
+            late_gradients.extend(
+                LateGradientRecord(
+                    round_index=event.parsed.metadata.round_index,
+                    worker_id=event.parsed.metadata.worker_id,
+                    event_id=event.event_id,
+                    created_at=event.parsed.event.created_at,
+                    model_hash=event.parsed.metadata.model_hash,
+                )
+                for event in late_collection.events
+            )
+            if round_dir is not None:
+                _write_json(round_dir / "late-gradients.json", late_collection.to_json_obj())
 
         heartbeat_event = build_heartbeat_event(
             HeartbeatEventMetadata(
@@ -672,8 +761,7 @@ async def run_training_session(
             adapter=adapter,
         )
 
-        if artifact_root is not None:
-            round_dir = artifact_root / f"round-{round_index:04d}"
+        if round_dir is not None:
             _write_model_state(round_dir / "base-state.json", current_state)
             _write_model_state(round_dir / "local-state.json", local_training.trained_state)
             _write_model_state(round_dir / "local-delta.json", local_delta)
@@ -688,19 +776,77 @@ async def run_training_session(
             _write_model_state(round_dir / "momentum-state.json", outer_result.momentum_state)
             _write_json(round_dir / "local-training.json", local_training.to_json_obj())
 
+        current_state = outer_result.next_state
+        current_momentum = outer_result.momentum_state
+
+        checkpoint_round_summary = TrainingRoundSummary(
+            round_index=round_index,
+            model_hash_before=state_digest(local_training.initial_state),
+            model_hash_after=state_digest(outer_result.next_state),
+            local_loss_before=local_training.loss_before,
+            local_loss_after_inner=local_training.loss_after,
+            local_loss_after_outer=local_loss_after_outer,
+            collected_event_count=len(collection.events),
+            known_workers=collection.known_workers,
+            collected_workers=collection.worker_ids,
+            completion_reason=collection.completion_reason,
+            published_gradient_event_id=gradient_publish.event_id,
+            published_heartbeat_event_id=heartbeat_publish.event_id,
+            published_checkpoint_event_id="",
+            configured_relays=config.relay_urls,
+            published_heartbeat_relays=heartbeat_publish.accepted_relays,
+            published_gradient_relays=gradient_publish.accepted_relays,
+            published_checkpoint_relays=(),
+            collected_from_relays=collection.successful_relays,
+            failed_relays=(),
+        )
+        checkpoint_rounds = tuple((*round_summaries, checkpoint_round_summary))
+        checkpoint = TrainingCheckpoint(
+            run_name=config.run_name,
+            worker_id=config.worker_id,
+            relay_urls=config.relay_urls,
+            next_round=round_index + 1,
+            current_state=current_state,
+            momentum_state=current_momentum,
+            rounds=checkpoint_rounds,
+            late_gradients=tuple(late_gradients),
+            updated_at=int(time.time()),
+        )
+        checkpoint_event = build_checkpoint_event(
+            CheckpointEventMetadata(
+                run_name=config.run_name,
+                worker_id=config.worker_id,
+                round_index=round_index,
+                next_round=checkpoint.next_round,
+                model_hash=state_digest(checkpoint.current_state),
+                rounds_completed=checkpoint.rounds_completed,
+                created_at=checkpoint.updated_at,
+            ),
+            checkpoint.to_json_obj(),
+            secret_key_hex=config.secret_key_hex,
+        )
+        checkpoint_publish = await publish_nostrain_events(
+            config.relay_urls,
+            checkpoint_event,
+            open_timeout=config.open_timeout,
+            reply_timeout=config.open_timeout,
+        )
+
         failed_relay_urls = {
             failure.relay_url
             for failure in (
                 *heartbeat_publish.failed_relays,
                 *gradient_publish.failed_relays,
                 *collection.failed_relays,
+                *checkpoint_publish.failed_relays,
+                *(late_collection.failed_relays if late_collection is not None else ()),
             )
         }
 
         round_summaries.append(
             TrainingRoundSummary(
                 round_index=round_index,
-                model_hash_before=state_digest(current_state),
+                model_hash_before=state_digest(local_training.initial_state),
                 model_hash_after=state_digest(outer_result.next_state),
                 local_loss_before=local_training.loss_before,
                 local_loss_after_inner=local_training.loss_after,
@@ -711,9 +857,11 @@ async def run_training_session(
                 completion_reason=collection.completion_reason,
                 published_gradient_event_id=gradient_publish.event_id,
                 published_heartbeat_event_id=heartbeat_publish.event_id,
+                published_checkpoint_event_id=checkpoint_publish.event_id,
                 configured_relays=config.relay_urls,
                 published_heartbeat_relays=heartbeat_publish.accepted_relays,
                 published_gradient_relays=gradient_publish.accepted_relays,
+                published_checkpoint_relays=checkpoint_publish.accepted_relays,
                 collected_from_relays=collection.successful_relays,
                 failed_relays=tuple(
                     relay_url for relay_url in config.relay_urls if relay_url in failed_relay_urls
@@ -721,24 +869,15 @@ async def run_training_session(
             )
         )
 
-        current_state = outer_result.next_state
-        current_momentum = outer_result.momentum_state
-
-        checkpoint = TrainingCheckpoint(
-            run_name=config.run_name,
-            worker_id=config.worker_id,
-            relay_urls=config.relay_urls,
-            next_round=round_index + 1,
-            current_state=current_state,
-            momentum_state=current_momentum,
-            rounds=tuple(round_summaries),
-            updated_at=int(time.time()),
-        )
         if artifact_root is not None:
             _write_json(artifact_root / "checkpoint.json", checkpoint.to_json_obj())
+            _write_json(artifact_root / "checkpoint-event.json", checkpoint_event.to_json_obj())
             _write_json(round_dir / "checkpoint.json", checkpoint.to_json_obj())
+            _write_json(round_dir / "checkpoint-event.json", checkpoint_event.to_json_obj())
+            _write_json(round_dir / "checkpoint-publish.json", checkpoint_publish.to_json_obj())
         if checkpoint_out is not None:
             _write_json(Path(checkpoint_out), checkpoint.to_json_obj())
+        late_scan_since = checkpoint.updated_at
 
     return TrainingSessionResult(
         run_name=config.run_name,
@@ -749,4 +888,5 @@ async def run_training_session(
         final_state=current_state,
         final_momentum_state=current_momentum,
         rounds=tuple(round_summaries),
+        late_gradients=tuple(late_gradients),
     )

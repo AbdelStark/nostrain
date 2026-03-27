@@ -7,13 +7,17 @@ from nostrain.compression import compress_delta
 from nostrain.crypto import secret_key_to_public_key
 from nostrain.model import ModelState, compute_delta, state_digest
 from nostrain.protocol import (
+    CheckpointEventMetadata,
     GradientEventMetadata,
     HeartbeatEventMetadata,
+    build_checkpoint_event,
     build_gradient_event,
     build_heartbeat_event,
+    parse_checkpoint_event,
     parse_gradient_event,
     parse_heartbeat_event,
 )
+from nostrain.training import TrainingCheckpoint, TrainingRoundSummary
 
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -118,6 +122,67 @@ class ProtocolTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             parse_heartbeat_event(event)
+
+    def test_checkpoint_event_roundtrip_preserves_embedded_checkpoint(self) -> None:
+        state = ModelState.from_path(FIXTURES / "linear_initial_state.json")
+        checkpoint = TrainingCheckpoint(
+            run_name="demo-run",
+            worker_id="worker-pubkey",
+            relay_urls=("ws://127.0.0.1:8765",),
+            next_round=1,
+            current_state=state,
+            momentum_state=None,
+            rounds=(
+                TrainingRoundSummary(
+                    round_index=0,
+                    model_hash_before=state_digest(state),
+                    model_hash_after=state_digest(state),
+                    local_loss_before=1.0,
+                    local_loss_after_inner=0.5,
+                    local_loss_after_outer=0.5,
+                    collected_event_count=1,
+                    known_workers=("worker-pubkey",),
+                    collected_workers=("worker-pubkey",),
+                    completion_reason="timeout",
+                    published_gradient_event_id="a" * 64,
+                    published_heartbeat_event_id="b" * 64,
+                    published_checkpoint_event_id="",
+                    configured_relays=("ws://127.0.0.1:8765",),
+                    published_heartbeat_relays=("ws://127.0.0.1:8765",),
+                    published_gradient_relays=("ws://127.0.0.1:8765",),
+                    published_checkpoint_relays=(),
+                    collected_from_relays=("ws://127.0.0.1:8765",),
+                    failed_relays=(),
+                ),
+            ),
+            late_gradients=(),
+            updated_at=1_700_000_200,
+        )
+        event = build_checkpoint_event(
+            CheckpointEventMetadata(
+                run_name="demo-run",
+                worker_id="worker-pubkey",
+                round_index=0,
+                next_round=1,
+                model_hash=state_digest(state),
+                rounds_completed=1,
+                created_at=1_700_000_250,
+            ),
+            checkpoint.to_json_obj(),
+            secret_key_hex=TEST_SECRET_KEY,
+        )
+        parsed = parse_checkpoint_event(event.to_json_obj())
+
+        self.assertTrue(parsed.event.is_signed)
+        self.assertEqual(parsed.metadata.run_name, "demo-run")
+        self.assertEqual(parsed.metadata.worker_id, "worker-pubkey")
+        self.assertEqual(parsed.metadata.round_index, 0)
+        self.assertEqual(parsed.metadata.next_round, 1)
+        self.assertEqual(parsed.metadata.model_hash, state_digest(state))
+        self.assertEqual(parsed.metadata.rounds_completed, 1)
+        self.assertEqual(parsed.checkpoint_data["next_round"], 1)
+        self.assertEqual(parsed.checkpoint_data["updated_at"], 1_700_000_200)
+        self.assertEqual(parsed.event.event_id, parsed.event.fingerprint())
 
 
 if __name__ == "__main__":

@@ -11,15 +11,20 @@ from .compression import CompressionCodec, compress_delta, decompress_payload, i
 from .crypto import secret_key_to_public_key
 from .model import ModelState, apply_delta, compute_delta, state_digest
 from .protocol import (
+    CheckpointEventMetadata,
     GradientEventMetadata,
     HeartbeatEventMetadata,
+    ParsedCheckpointEvent,
     ParsedGradientEvent,
+    build_checkpoint_event,
     build_gradient_event,
     build_heartbeat_event,
     parse_gradient_event,
     parse_nostrain_event,
 )
 from .relay import (
+    collect_checkpoint_events,
+    collect_checkpoint_events_across_relays,
     collect_gradient_events,
     collect_gradient_events_across_relays,
     collect_heartbeat_events,
@@ -65,6 +70,17 @@ def _resolve_worker_id(args: argparse.Namespace) -> str:
     if worker_id is None:
         raise ValueError("--worker is required unless --sec-key or --pubkey is provided")
     return worker_id
+
+
+def _resolve_checkpoint_worker(
+    args: argparse.Namespace,
+    checkpoint: TrainingCheckpoint,
+) -> str:
+    if getattr(args, "worker", None) is not None:
+        return _resolve_worker_id(args)
+    if getattr(args, "sec_key", None) or getattr(args, "pubkey", None):
+        return _resolve_worker_id(args)
+    return checkpoint.worker_id
 
 
 def _resolve_relay_urls(relay_args: str | list[str]) -> tuple[str, ...]:
@@ -163,6 +179,31 @@ def _handle_build_heartbeat(args: argparse.Namespace) -> int:
     )
     event = build_heartbeat_event(
         metadata,
+        secret_key_hex=args.sec_key,
+        public_key_hex=args.pubkey,
+        signature_hex=args.sig,
+        event_id=args.event_id,
+    )
+    _write_json(args.output, event.to_json_obj())
+    return 0
+
+
+def _handle_build_checkpoint(args: argparse.Namespace) -> int:
+    checkpoint = TrainingCheckpoint.from_path(args.checkpoint)
+    if checkpoint.next_round <= 0:
+        raise ValueError("checkpoints must have next_round > 0 before they can be advertised")
+    publisher = _resolve_checkpoint_worker(args, checkpoint)
+    event = build_checkpoint_event(
+        CheckpointEventMetadata(
+            run_name=checkpoint.run_name,
+            worker_id=publisher,
+            round_index=checkpoint.next_round - 1,
+            next_round=checkpoint.next_round,
+            model_hash=state_digest(checkpoint.current_state),
+            rounds_completed=checkpoint.rounds_completed,
+            created_at=args.created_at,
+        ),
+        checkpoint.to_json_obj(),
         secret_key_hex=args.sec_key,
         public_key_hex=args.pubkey,
         signature_hex=args.sig,
@@ -293,13 +334,32 @@ def _handle_run_training(args: argparse.Namespace) -> int:
     dataset = LinearRegressionDataset.from_path(args.dataset)
     relay_urls = _resolve_relay_urls(args.relay)
     worker_id = _resolve_worker_id(args)
-    checkpoint = TrainingCheckpoint.from_path(args.resume_from) if args.resume_from else None
+    if args.resume_from and args.resume_latest_checkpoint:
+        raise ValueError("--resume-from cannot be combined with --resume-latest-checkpoint")
+    checkpoint = None
+    if args.resume_from:
+        checkpoint = TrainingCheckpoint.from_path(args.resume_from)
+    elif args.resume_latest_checkpoint:
+        checkpoint_collection = asyncio.run(
+            collect_checkpoint_events_across_relays(
+                relay_urls,
+                run_name=args.run,
+                worker_id=args.checkpoint_worker,
+                idle_timeout=args.checkpoint_idle_timeout or args.round_timeout,
+                open_timeout=args.timeout,
+                since=args.checkpoint_since,
+            )
+        )
+        latest_event = checkpoint_collection.latest_event
+        if latest_event is None:
+            raise ValueError(f"no relay checkpoint found for run {args.run!r}")
+        checkpoint = TrainingCheckpoint.from_json_obj(latest_event.parsed.checkpoint_data)
     if checkpoint is not None:
         if checkpoint.run_name != args.run:
             raise ValueError(
                 f"checkpoint run {checkpoint.run_name!r} does not match --run {args.run!r}"
             )
-        if checkpoint.worker_id != worker_id:
+        if args.resume_from and checkpoint.worker_id != worker_id:
             raise ValueError(
                 f"checkpoint worker {checkpoint.worker_id!r} does not match worker {worker_id!r}"
             )
@@ -307,6 +367,8 @@ def _handle_run_training(args: argparse.Namespace) -> int:
         previous_momentum = checkpoint.momentum_state
         start_round = checkpoint.next_round
         prior_rounds = checkpoint.rounds
+        prior_late_gradients = checkpoint.late_gradients
+        late_gradient_since = checkpoint.updated_at
     else:
         initial_state = ModelState.from_path(args.state)
         previous_momentum = (
@@ -314,8 +376,10 @@ def _handle_run_training(args: argparse.Namespace) -> int:
         )
         start_round = args.start_round
         prior_rounds = ()
-    if args.resume_from and args.momentum_state:
-        raise ValueError("--momentum-state cannot be combined with --resume-from")
+        prior_late_gradients = ()
+        late_gradient_since = None
+    if (args.resume_from or args.resume_latest_checkpoint) and args.momentum_state:
+        raise ValueError("--momentum-state cannot be combined with checkpoint-based resume")
     session = asyncio.run(
         run_training_session(
             initial_state,
@@ -338,11 +402,14 @@ def _handle_run_training(args: argparse.Namespace) -> int:
                 open_timeout=args.timeout,
                 heartbeat_interval=args.heartbeat_interval,
                 max_missed_heartbeats=args.max_missed_heartbeats,
+                late_gradient_timeout=args.late_gradient_timeout,
                 advertised_relays=tuple(args.advertise_relay or ()),
             ),
             previous_momentum=previous_momentum,
             artifact_dir=args.artifact_dir,
             prior_rounds=prior_rounds,
+            prior_late_gradients=prior_late_gradients,
+            late_gradient_since=late_gradient_since,
             checkpoint_out=args.checkpoint_out,
         )
     )
@@ -393,6 +460,29 @@ def _heartbeat_collection_summary(collection: Any) -> str:
     )
 
 
+def _checkpoint_collection_summary(collection: Any) -> str:
+    relays = getattr(collection, "relay_urls", (collection.relay_url,))
+    relay_label = ", ".join(relays)
+    workers = ", ".join(collection.worker_ids) if collection.worker_ids else "-"
+    latest = collection.latest_event
+    latest_label = (
+        f"round {latest.parsed.metadata.round_index} -> next {latest.parsed.metadata.next_round}"
+        if latest is not None
+        else "-"
+    )
+    return "\n".join(
+        [
+            f"relays: {relay_label}",
+            f"run: {collection.run_name}",
+            f"events: {len(collection.events)}",
+            f"workers: {workers}",
+            f"latest: {latest_label}",
+            f"duplicates_discarded: {collection.duplicates_discarded}",
+            f"invalid_events: {collection.invalid_events}",
+        ]
+    )
+
+
 def _handle_discover_workers(args: argparse.Namespace) -> int:
     relay_urls = _resolve_relay_urls(args.relay)
     if len(relay_urls) == 1:
@@ -423,6 +513,39 @@ def _handle_discover_workers(args: argparse.Namespace) -> int:
         _write_json(args.output, collection.to_json_obj())
     else:
         _write_text(args.output, _heartbeat_collection_summary(collection))
+    return 0
+
+
+def _handle_discover_checkpoints(args: argparse.Namespace) -> int:
+    relay_urls = _resolve_relay_urls(args.relay)
+    if len(relay_urls) == 1:
+        collection = asyncio.run(
+            collect_checkpoint_events(
+                relay_urls[0],
+                run_name=args.run,
+                min_round=args.min_round,
+                worker_id=args.worker,
+                idle_timeout=args.idle_timeout,
+                open_timeout=args.timeout,
+                since=args.since,
+            )
+        )
+    else:
+        collection = asyncio.run(
+            collect_checkpoint_events_across_relays(
+                relay_urls,
+                run_name=args.run,
+                min_round=args.min_round,
+                worker_id=args.worker,
+                idle_timeout=args.idle_timeout,
+                open_timeout=args.timeout,
+                since=args.since,
+            )
+        )
+    if args.json:
+        _write_json(args.output, collection.to_json_obj())
+    else:
+        _write_text(args.output, _checkpoint_collection_summary(collection))
     return 0
 
 
@@ -515,9 +638,15 @@ def _handle_aggregate_round(args: argparse.Namespace) -> int:
 def _event_summary(path: str | Path) -> dict[str, Any]:
     event = _load_json(path)
     parsed = parse_nostrain_event(event)
+    if isinstance(parsed, ParsedGradientEvent):
+        event_type = "gradient"
+    elif isinstance(parsed, ParsedCheckpointEvent):
+        event_type = "checkpoint"
+    else:
+        event_type = "heartbeat"
     summary = {
         "event_id": parsed.event.fingerprint(),
-        "type": "gradient" if isinstance(parsed, ParsedGradientEvent) else "heartbeat",
+        "type": event_type,
         "kind": parsed.event.kind,
         "created_at": parsed.event.created_at,
         "signed": parsed.event.is_signed,
@@ -539,6 +668,17 @@ def _event_summary(path: str | Path) -> dict[str, Any]:
                 "density": parsed.payload.density,
                 "wire_bytes": parsed.payload.wire_bytes,
                 "compression_ratio": parsed.payload.compression_ratio,
+            }
+        )
+    elif isinstance(parsed, ParsedCheckpointEvent):
+        summary.update(
+            {
+                "run": parsed.metadata.run_name,
+                "round": parsed.metadata.round_index,
+                "next_round": parsed.metadata.next_round,
+                "model": parsed.metadata.model_hash,
+                "rounds_completed": parsed.metadata.rounds_completed,
+                "checkpoint_updated_at": int(parsed.checkpoint_data.get("updated_at", 0)),
             }
         )
     else:
@@ -583,6 +723,15 @@ def _handle_inspect_event(args: argparse.Namespace) -> int:
                 f"density: {summary['density']:.4f}",
                 f"wire_bytes: {summary['wire_bytes']}",
                 f"compression_ratio: {summary['compression_ratio']:.2f}",
+            ]
+        )
+    elif summary["type"] == "checkpoint":
+        lines.extend(
+            [
+                f"next_round: {summary['next_round']}",
+                f"model: {summary['model']}",
+                f"rounds_completed: {summary['rounds_completed']}",
+                f"checkpoint_updated_at: {summary['checkpoint_updated_at']}",
             ]
         )
     else:
@@ -770,9 +919,45 @@ def build_parser() -> argparse.ArgumentParser:
     build_heartbeat.add_argument("-o", "--output", help="Optional output path.")
     build_heartbeat.set_defaults(handler=_handle_build_heartbeat)
 
+    build_checkpoint = subparsers.add_parser(
+        "build-checkpoint",
+        help="Wrap a training checkpoint JSON file in a signed nostrain checkpoint event envelope.",
+    )
+    build_checkpoint.add_argument(
+        "checkpoint",
+        help="Path to a training checkpoint JSON file produced by run-training.",
+    )
+    build_checkpoint.add_argument(
+        "--worker",
+        help="Publisher identity tag. Defaults to the checkpoint worker or the derived/provided pubkey.",
+    )
+    build_checkpoint.add_argument(
+        "--sec-key",
+        help="Lowercase hex-encoded 32-byte secret key used to sign the event locally.",
+    )
+    build_checkpoint.add_argument(
+        "--pubkey",
+        help="Lowercase hex-encoded x-only public key for delegated signing workflows.",
+    )
+    build_checkpoint.add_argument(
+        "--sig",
+        help="Lowercase hex-encoded Schnorr signature to attach to a delegated-signing event.",
+    )
+    build_checkpoint.add_argument(
+        "--event-id",
+        help="Optional explicit event id to verify against the canonical serialized event.",
+    )
+    build_checkpoint.add_argument(
+        "--created-at",
+        type=int,
+        help="Optional explicit Unix timestamp for the Nostr event.",
+    )
+    build_checkpoint.add_argument("-o", "--output", help="Optional output path.")
+    build_checkpoint.set_defaults(handler=_handle_build_checkpoint)
+
     publish_event = subparsers.add_parser(
         "publish-event",
-        help="Publish a nostrain gradient or heartbeat event JSON file to a websocket relay.",
+        help="Publish a nostrain gradient, heartbeat, or checkpoint event JSON file to a websocket relay.",
     )
     publish_event.add_argument("event", help="Path to a nostrain event JSON file.")
     publish_event.add_argument(
@@ -833,6 +1018,47 @@ def build_parser() -> argparse.ArgumentParser:
     discover_workers.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
     discover_workers.add_argument("-o", "--output", help="Optional output path.")
     discover_workers.set_defaults(handler=_handle_discover_workers)
+
+    discover_checkpoints = subparsers.add_parser(
+        "discover-checkpoints",
+        help="Collect distributed training checkpoints for a run and surface the latest recoverable state.",
+    )
+    discover_checkpoints.add_argument(
+        "--relay",
+        action="append",
+        required=True,
+        help="Websocket relay URL. Can be provided multiple times for cross-relay discovery.",
+    )
+    discover_checkpoints.add_argument("--run", required=True, help="Training run name.")
+    discover_checkpoints.add_argument(
+        "--worker",
+        help="Optional checkpoint publisher filter.",
+    )
+    discover_checkpoints.add_argument(
+        "--min-round",
+        type=int,
+        help="Only include checkpoints at or after this completed round.",
+    )
+    discover_checkpoints.add_argument(
+        "--since",
+        type=int,
+        help="Optional lower bound for checkpoint timestamps.",
+    )
+    discover_checkpoints.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=2.0,
+        help="Stop after this many idle seconds without relay messages (default: 2).",
+    )
+    discover_checkpoints.add_argument(
+        "--timeout",
+        type=float,
+        default=10.0,
+        help="Connection timeout in seconds (default: 10).",
+    )
+    discover_checkpoints.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+    discover_checkpoints.add_argument("-o", "--output", help="Optional output path.")
+    discover_checkpoints.set_defaults(handler=_handle_discover_checkpoints)
 
     outer_step = subparsers.add_parser(
         "outer-step",
@@ -905,7 +1131,10 @@ def build_parser() -> argparse.ArgumentParser:
         "run-training",
         help="Run local training rounds, publish updates to one or more relays, and apply relay-aggregated outer steps.",
     )
-    run_training.add_argument("state", help="Path to the initial global model state JSON.")
+    run_training.add_argument(
+        "state",
+        help="Path to the initial global model state JSON. Ignored when resuming from a checkpoint.",
+    )
     run_training.add_argument("dataset", help="Path to a linear regression dataset JSON file.")
     run_training.add_argument(
         "--relay",
@@ -987,6 +1216,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional training checkpoint JSON file written by a prior run-training session.",
     )
     run_training.add_argument(
+        "--resume-latest-checkpoint",
+        action="store_true",
+        help="Resume from the latest distributed relay checkpoint for this run.",
+    )
+    run_training.add_argument(
+        "--checkpoint-worker",
+        help="Optional relay checkpoint publisher filter used with --resume-latest-checkpoint.",
+    )
+    run_training.add_argument(
+        "--checkpoint-since",
+        type=int,
+        help="Optional lower bound for relay checkpoint timestamps when resuming from relays.",
+    )
+    run_training.add_argument(
+        "--checkpoint-idle-timeout",
+        type=float,
+        help="Optional idle timeout override for relay checkpoint discovery.",
+    )
+    run_training.add_argument(
         "--momentum-out",
         help="Optional path to write the final momentum state JSON.",
     )
@@ -1017,6 +1265,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=3,
         help="Discard discovered workers missing more than this many heartbeats (default: 3).",
+    )
+    run_training.add_argument(
+        "--late-gradient-timeout",
+        type=float,
+        default=0.2,
+        help="Idle timeout for scanning late gradients from older rounds (default: 0.2).",
     )
     run_training.add_argument(
         "--advertise-relay",

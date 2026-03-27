@@ -35,9 +35,9 @@ Implementation status: heartbeat events, active-worker discovery, stale-worker f
 
 # RFC-005: Fault Tolerance
 
-Worker crash: other workers detect via missing heartbeat (>3 missed = considered offline). Training continues with remaining workers. Crashed worker can rejoin by downloading the latest model checkpoint from the relay and joining the current round. Relay failure: retry with exponential backoff, then fail over across configured relays. Stale gradients that arrive after the outer step are discarded.
+Worker crash: other workers detect via missing heartbeat (>3 missed = considered offline). Training continues with remaining workers. Crashed workers can now rejoin by discovering the latest signed checkpoint event on the relay and resuming from `next_round`. Relay failure currently fails over across configured relays; richer retry/backoff policy is still pending. Stale gradients that arrive after the outer step are collected as late arrivals and discarded from the current update path.
 
-Implementation status: planned.
+Implementation status: distributed checkpoint discovery/resume and late-gradient discard tracking are implemented; richer retry/backoff policy remains planned.
 
 # RFC-006: CLI and User Interface
 
@@ -51,9 +51,11 @@ Implemented commands:
 - `outer-step`
 - `build-event`
 - `build-heartbeat`
+- `build-checkpoint`
 - `inspect-event`
 - `publish-event`
 - `discover-workers`
+- `discover-checkpoints`
 - `collect-events`
 - `aggregate-round`
 - `train-local`

@@ -16,9 +16,11 @@ from .crypto import (
     schnorr_verify,
     secret_key_to_public_key,
 )
+from .model import ModelState, state_digest
 
 NOSTRAIN_GRADIENT_KIND = 33333
 NOSTRAIN_HEARTBEAT_KIND = 33334
+NOSTRAIN_CHECKPOINT_KIND = 33335
 NOSTRAIN_MARKER = "nostrain"
 
 
@@ -87,6 +89,39 @@ class HeartbeatEventMetadata:
     @property
     def parameterized_identifier(self) -> str:
         return f"run:{self.run_name}:worker:{self.worker_id}"
+
+    @property
+    def resolved_created_at(self) -> int:
+        return self.created_at if self.created_at is not None else int(time.time())
+
+
+@dataclass(frozen=True)
+class CheckpointEventMetadata:
+    run_name: str
+    worker_id: str
+    round_index: int
+    next_round: int
+    model_hash: str
+    rounds_completed: int
+    created_at: int | None = None
+
+    def __post_init__(self) -> None:
+        if not self.run_name:
+            raise ValueError("run name cannot be empty")
+        if not self.worker_id:
+            raise ValueError("worker id cannot be empty")
+        if self.round_index < 0:
+            raise ValueError("checkpoint round must be non-negative")
+        if self.next_round <= self.round_index:
+            raise ValueError("checkpoint next_round must be greater than the completed round")
+        if not self.model_hash:
+            raise ValueError("model hash cannot be empty")
+        if self.rounds_completed <= 0:
+            raise ValueError("rounds_completed must be positive")
+
+    @property
+    def parameterized_identifier(self) -> str:
+        return f"run:{self.run_name}:worker:{self.worker_id}:checkpoint:round:{self.round_index}"
 
     @property
     def resolved_created_at(self) -> int:
@@ -242,6 +277,13 @@ class ParsedHeartbeatEvent:
     metadata: HeartbeatEventMetadata
 
 
+@dataclass(frozen=True)
+class ParsedCheckpointEvent:
+    event: NostrainEvent
+    metadata: CheckpointEventMetadata
+    checkpoint_data: dict[str, Any]
+
+
 def _normalize_repeated_tag_values(
     values: Iterable[str],
     *,
@@ -258,6 +300,19 @@ def _normalize_repeated_tag_values(
         seen.add(value)
         normalized.append(value)
     return tuple(normalized)
+
+
+def _canonicalize_checkpoint_data(
+    checkpoint: str | dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    if isinstance(checkpoint, str):
+        parsed = json.loads(checkpoint)
+    else:
+        parsed = checkpoint
+    if not isinstance(parsed, dict):
+        raise ValueError("checkpoint JSON must be an object")
+    content = json.dumps(parsed, separators=(",", ":"), sort_keys=True, ensure_ascii=False)
+    return content, parsed
 
 
 def _build_signable_event(
@@ -388,6 +443,54 @@ def build_heartbeat_event(
     )
 
 
+def build_checkpoint_event(
+    metadata: CheckpointEventMetadata,
+    checkpoint: str | dict[str, Any],
+    *,
+    secret_key_hex: str | None = None,
+    public_key_hex: str | None = None,
+    signature_hex: str | None = None,
+    event_id: str | None = None,
+    aux_rand: bytes | None = None,
+) -> NostrainEvent:
+    content, checkpoint_data = _canonicalize_checkpoint_data(checkpoint)
+    checkpoint_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+    if str(checkpoint_data.get("run", metadata.run_name)) != metadata.run_name:
+        raise ValueError("checkpoint run does not match checkpoint event metadata")
+    if int(checkpoint_data.get("next_round", metadata.next_round)) != metadata.next_round:
+        raise ValueError("checkpoint next_round does not match checkpoint event metadata")
+    if int(
+        checkpoint_data.get("rounds_completed", len(checkpoint_data.get("rounds", [])))
+    ) != metadata.rounds_completed:
+        raise ValueError("checkpoint rounds_completed does not match checkpoint event metadata")
+    if state_digest(ModelState.from_json_obj(checkpoint_data["current_state"])) != metadata.model_hash:
+        raise ValueError("checkpoint model hash does not match checkpoint event metadata")
+
+    tags: tuple[NostrTag, ...] = (
+        ("d", metadata.parameterized_identifier),
+        ("t", NOSTRAIN_MARKER),
+        ("run", metadata.run_name),
+        ("worker", metadata.worker_id),
+        ("round", str(metadata.round_index)),
+        ("next-round", str(metadata.next_round)),
+        ("model", metadata.model_hash),
+        ("rounds-completed", str(metadata.rounds_completed)),
+        ("checkpoint", checkpoint_hash),
+    )
+    return _build_signable_event(
+        kind=NOSTRAIN_CHECKPOINT_KIND,
+        created_at=metadata.resolved_created_at,
+        tags=tags,
+        content=content,
+        secret_key_hex=secret_key_hex,
+        public_key_hex=public_key_hex,
+        signature_hex=signature_hex,
+        event_id=event_id,
+        aux_rand=aux_rand,
+    )
+
+
 def parse_gradient_event(data: NostrainEvent | dict[str, Any]) -> ParsedGradientEvent:
     event = data if isinstance(data, NostrainEvent) else NostrainEvent.from_json_obj(data)
     if event.kind != NOSTRAIN_GRADIENT_KIND:
@@ -475,17 +578,86 @@ def parse_heartbeat_event(data: NostrainEvent | dict[str, Any]) -> ParsedHeartbe
     return ParsedHeartbeatEvent(event=event, metadata=metadata)
 
 
+def parse_checkpoint_event(data: NostrainEvent | dict[str, Any]) -> ParsedCheckpointEvent:
+    event = data if isinstance(data, NostrainEvent) else NostrainEvent.from_json_obj(data)
+    if event.kind != NOSTRAIN_CHECKPOINT_KIND:
+        raise ValueError(
+            f"nostrain checkpoint events must use kind {NOSTRAIN_CHECKPOINT_KIND}, got {event.kind}"
+        )
+
+    _validate_signing_fields(event)
+
+    tags = event.tag_map()
+    required = [
+        "d",
+        "t",
+        "run",
+        "worker",
+        "round",
+        "next-round",
+        "model",
+        "rounds-completed",
+        "checkpoint",
+    ]
+    missing = [tag for tag in required if tag not in tags]
+    if missing:
+        raise ValueError(f"event is missing required tags: {', '.join(missing)}")
+    if tags["t"] != NOSTRAIN_MARKER:
+        raise ValueError(f"event marker tag must be {NOSTRAIN_MARKER!r}")
+    if not event.content:
+        raise ValueError("checkpoint events must include checkpoint JSON content")
+
+    content, checkpoint_data = _canonicalize_checkpoint_data(event.content)
+    checkpoint_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    if tags["checkpoint"] != checkpoint_hash:
+        raise ValueError("event checkpoint tag does not match the embedded checkpoint content")
+
+    metadata = CheckpointEventMetadata(
+        run_name=tags["run"],
+        worker_id=tags["worker"],
+        round_index=int(tags["round"]),
+        next_round=int(tags["next-round"]),
+        model_hash=tags["model"],
+        rounds_completed=int(tags["rounds-completed"]),
+        created_at=event.created_at,
+    )
+    if tags["d"] != metadata.parameterized_identifier:
+        raise ValueError("event d tag does not match the checkpoint identity")
+    if str(checkpoint_data.get("run", "")) != metadata.run_name:
+        raise ValueError("checkpoint JSON run does not match checkpoint event tags")
+    if int(checkpoint_data.get("next_round", -1)) != metadata.next_round:
+        raise ValueError("checkpoint JSON next_round does not match checkpoint event tags")
+    if int(
+        checkpoint_data.get("rounds_completed", len(checkpoint_data.get("rounds", [])))
+    ) != metadata.rounds_completed:
+        raise ValueError("checkpoint JSON rounds_completed does not match checkpoint event tags")
+
+    current_state = ModelState.from_json_obj(checkpoint_data["current_state"])
+    if state_digest(current_state) != metadata.model_hash:
+        raise ValueError("checkpoint JSON current_state does not match checkpoint model hash tag")
+
+    return ParsedCheckpointEvent(
+        event=event,
+        metadata=metadata,
+        checkpoint_data=checkpoint_data,
+    )
+
+
 def parse_nostrain_event(
     data: NostrainEvent | dict[str, Any],
-) -> ParsedGradientEvent | ParsedHeartbeatEvent:
+) -> ParsedGradientEvent | ParsedHeartbeatEvent | ParsedCheckpointEvent:
     event = data if isinstance(data, NostrainEvent) else NostrainEvent.from_json_obj(data)
     if event.kind == NOSTRAIN_GRADIENT_KIND:
         return parse_gradient_event(event)
     if event.kind == NOSTRAIN_HEARTBEAT_KIND:
         return parse_heartbeat_event(event)
+    if event.kind == NOSTRAIN_CHECKPOINT_KIND:
+        return parse_checkpoint_event(event)
     raise ValueError(
         "unsupported nostrain event kind: "
-        f"expected {NOSTRAIN_GRADIENT_KIND} or {NOSTRAIN_HEARTBEAT_KIND}, got {event.kind}"
+        "expected "
+        f"{NOSTRAIN_GRADIENT_KIND}, {NOSTRAIN_HEARTBEAT_KIND}, or {NOSTRAIN_CHECKPOINT_KIND}, "
+        f"got {event.kind}"
     )
 
 
