@@ -2,6 +2,16 @@
 
 Distributed ML training over [Nostr](https://nostr.com) relays. No coordinator, no central server — workers exchange compressed pseudo-gradients through public WebSocket relays using [DiLoCo](https://arxiv.org/abs/2311.08105)-style outer optimization.
 
+<div align="center">
+<img src="docs/assets/img/tui-workers.png" width="100%" alt="4 workers training in parallel over a local Nostr relay" />
+<p><em>4 workers exchanging gradients through a local relay — each pane shows live round progress</em></p>
+</div>
+
+<div align="center">
+<img src="docs/assets/img/tui-summary.png" width="100%" alt="Training summary showing convergence results" />
+<p><em>All workers converge to the same model — loss reduced 97-99% across shards</em></p>
+</div>
+
 ## How it works
 
 ```
