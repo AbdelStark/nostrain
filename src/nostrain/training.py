@@ -31,6 +31,7 @@ from .relay import (
 )
 from .retry import RelayRetryPolicy
 from .runtime import (
+    DEFAULT_TRAINING_BACKEND,
     DEFAULT_TRAINING_RUNTIME,
     LINEAR_BIAS_PARAMETER,
     LINEAR_WEIGHT_PARAMETER,
@@ -48,8 +49,11 @@ from .runtime import (
     LinearModelAdapter,
     LinearRegressionDataset,
     MLP_REGRESSION_RUNTIME,
+    NUMPY_TRAINING_BACKEND,
     LINEAR_REGRESSION_RUNTIME,
+    PYTHON_TRAINING_BACKEND,
     RuntimeAdapter,
+    SUPPORTED_TRAINING_BACKENDS,
     SUPPORTED_TRAINING_RUNTIMES,
     evaluate_linear_regression,
     evaluate_mlp_regression,
@@ -58,6 +62,7 @@ from .runtime import (
     initialize_linear_regression_state,
     initialize_mlp_regression_state,
     initialize_training_state,
+    resolve_training_backend,
     resolve_training_runtime,
     train_linear_regression,
     train_mlp_regression,
@@ -74,6 +79,7 @@ class TrainingWorkerConfig:
     worker_id: str
     secret_key_hex: str
     runtime_name: str | None = None
+    backend_name: str = DEFAULT_TRAINING_BACKEND
     rounds: int = 1
     start_round: int = 0
     inner_steps: int = 500
@@ -106,6 +112,10 @@ class TrainingWorkerConfig:
         if self.runtime_name is not None and self.runtime_name not in SUPPORTED_TRAINING_RUNTIMES:
             raise ValueError(
                 "runtime must be one of: " + ", ".join(SUPPORTED_TRAINING_RUNTIMES)
+            )
+        if self.backend_name not in SUPPORTED_TRAINING_BACKENDS:
+            raise ValueError(
+                "backend must be one of: " + ", ".join(SUPPORTED_TRAINING_BACKENDS)
             )
         if self.rounds <= 0:
             raise ValueError("round count must be positive")
@@ -164,6 +174,7 @@ class TrainingWorkerConfig:
             raise ValueError("at least one relay URL is required")
         if self.runtime_name is not None:
             object.__setattr__(self, "runtime_name", resolve_training_runtime(self.runtime_name))
+        object.__setattr__(self, "backend_name", resolve_training_backend(self.backend_name))
         object.__setattr__(self, "relay_urls", normalized_relays)
         object.__setattr__(
             self,
@@ -443,6 +454,7 @@ class TrainingSessionResult:
     final_momentum_state: ModelState | None
     rounds: tuple[TrainingRoundSummary, ...]
     runtime_name: str = DEFAULT_TRAINING_RUNTIME
+    backend_name: str = DEFAULT_TRAINING_BACKEND
     checkpoint_history: int = 1
     artifact_retention_rounds: int | None = None
     late_gradients: tuple[LateGradientRecord, ...] = ()
@@ -496,6 +508,7 @@ class TrainingSessionResult:
             "worker": self.worker_id,
             "relays": list(self.relay_urls),
             "runtime": self.runtime_name,
+            "backend": self.backend_name,
             "start_round": self.start_round,
             "rounds_completed": self.rounds_completed,
             "final_model_hash": self.final_model_hash,
@@ -938,6 +951,7 @@ async def run_training_session(
         state=initial_state,
         adapter=adapter,
     )
+    backend_name = resolve_training_backend(config.backend_name)
     current_state = initial_state
     current_momentum = previous_momentum
     round_summaries: list[TrainingRoundSummary] = list(prior_rounds)
@@ -1039,6 +1053,7 @@ async def run_training_session(
             ),
             runtime_name=runtime_name,
             adapter=adapter,
+            backend_name=backend_name,
         )
         local_delta = compute_delta(current_state, local_training.trained_state)
         payload = compress_delta(local_delta, topk_ratio=config.topk_ratio, codec=config.codec)
@@ -1099,6 +1114,7 @@ async def run_training_session(
             dataset,
             runtime_name=runtime_name,
             adapter=adapter,
+            backend_name=backend_name,
         )
 
         if round_dir is not None:
@@ -1331,6 +1347,7 @@ async def run_training_session(
         final_momentum_state=current_momentum,
         rounds=tuple(round_summaries),
         runtime_name=runtime_name,
+        backend_name=backend_name,
         checkpoint_history=config.checkpoint_history,
         artifact_retention_rounds=config.artifact_retention_rounds,
         late_gradients=tuple(late_gradients),

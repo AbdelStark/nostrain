@@ -2,7 +2,7 @@
 
 Distributed ML training over Nostr relays.
 
-The project vision is still the same: no coordinator, no central server, just workers exchanging sparse pseudo-gradients through Nostr. The repository now ships the protocol/payload toolkit, a signed relay transport slice, and a resilient end-to-end training runner: model snapshots, DiLoCo-style deltas, sparse transport payloads, NIP-01-compatible nostrain gradient/heartbeat/checkpoint events, relay collection with active-worker discovery, cross-relay deduplication, resumable checkpoints, relay-visible checkpoint distribution, deferred late-gradient reconciliation, configurable relay retry/backoff, plus runtime-pluggable built-in workers for both linear and non-linear regression over one or more relays.
+The project vision is still the same: no coordinator, no central server, just workers exchanging sparse pseudo-gradients through Nostr. The repository now ships the protocol/payload toolkit, a signed relay transport slice, and a resilient end-to-end training runner: model snapshots, DiLoCo-style deltas, sparse transport payloads, NIP-01-compatible nostrain gradient/heartbeat/checkpoint events, relay collection with active-worker discovery, cross-relay deduplication, resumable checkpoints, relay-visible checkpoint distribution, deferred late-gradient reconciliation, configurable relay retry/backoff, runtime-pluggable built-in workers for both linear and non-linear regression over one or more relays, plus a NumPy edge-runtime path for model-state interchange and local optimization.
 
 ## Current status
 
@@ -25,7 +25,9 @@ The project vision is still the same: no coordinator, no central server, just wo
 - round sync strategies (`timeout`, `strict`, `quorum`, `async`) driven by discovered workers
 - a deterministic JSON dataset format for built-in regression workloads
 - pluggable built-in runtimes for `linear-regression` and `mlp-regression`
-- pure-Python local SGD inner-loop training for both runtimes
+- backend-selectable local SGD/evaluation paths (`python`, `numpy`) for both runtimes
+- canonical model-state interchange between JSON and `numpy-npz`
+- CLI state-format auto-detection plus `convert-state` for explicit format conversion
 - a relay-backed training runner that publishes heartbeats and gradients to one or more relays, tolerates partial relay outages, and applies the outer step locally
 - resumable training checkpoints carrying model state, momentum state, and prior round history
 - signed checkpoint distribution events carrying the latest recoverable training state
@@ -35,9 +37,9 @@ The project vision is still the same: no coordinator, no central server, just wo
 - configurable `run-training --late-gradient-strategy discard` accounting for record-only stale updates
 - bounded checkpoint artifacts plus optional per-round artifact pruning under `run-training`
 - deterministic `init-state` generation for supported built-in runtimes
-- a CLI for encoding, decoding, applying, publishing, collecting, and inspecting payloads
+- a CLI for converting, encoding, decoding, applying, publishing, collecting, and inspecting payloads
 
-It does **not** yet implement external runtime adapters such as PyTorch/MLX. The signed transport path now targets public NIP-01 relays as well as local/mock websocket endpoints, and the built-in runners stay dependency-light and testable while exercising a shared runtime boundary.
+It does **not** yet implement framework-specific adapters such as PyTorch/MLX modules or state-dicts. The signed transport path now targets public NIP-01 relays as well as local/mock websocket endpoints, and the built-in runners stay dependency-light and testable while exercising a real external runtime boundary through NumPy state interchange and backend execution.
 
 ## Install
 
@@ -49,6 +51,12 @@ Optional `zstd` support:
 
 ```bash
 python3 -m pip install -e ".[zstd]"
+```
+
+Optional `numpy` support for `numpy-npz` state interchange and the NumPy training backend:
+
+```bash
+python3 -m pip install -e ".[numpy]"
 ```
 
 ## Model state format
@@ -70,7 +78,7 @@ The current toolchain uses a deterministic JSON representation for model snapsho
 }
 ```
 
-This keeps the protocol testable today without depending on PyTorch serialization. The built-in runtimes and future PyTorch/MLX adapters can export/import this structure at the edge.
+This keeps the protocol testable today without depending on framework-specific serialization. Built-in runtimes, the current NumPy edge adapter, and future PyTorch/MLX adapters can export/import this structure at the edge.
 
 The built-in `linear-regression` runtime expects this minimal state:
 
@@ -114,6 +122,22 @@ The built-in `mlp-regression` runtime uses a one-hidden-layer state:
 }
 ```
 
+## NumPy state interop
+
+`nostrain` can also read and write model states as `numpy-npz` archives. Each parameter is stored as a named array in a `.npz` file, with small metadata entries describing the nostrain schema and optional runtime.
+
+Convert a canonical JSON state into an archive:
+
+```bash
+nostrain convert-state linear-initial.json -o linear-initial.npz
+```
+
+Round-trip it back to JSON:
+
+```bash
+nostrain convert-state linear-initial.npz -o linear-initial-roundtrip.json
+```
+
 ## Dataset format
 
 The built-in worker loop consumes deterministic JSON regression datasets:
@@ -143,6 +167,7 @@ Initialize a deterministic built-in model state:
 ```bash
 nostrain init-state --runtime linear-regression --features 2 -o linear-initial.json
 nostrain init-state --runtime mlp-regression --features 2 --hidden-size 4 -o mlp-initial.json
+nostrain init-state --runtime linear-regression --features 2 -o linear-initial.npz
 ```
 
 Hash a model snapshot:
@@ -194,6 +219,18 @@ nostrain train-local linear-initial.json worker-a-dataset.json \
   --batch-size 2 \
   --metrics-out local-training.json \
   -o local-state.json
+```
+
+Run the same local training loop through the NumPy backend and emit `.npz` weights:
+
+```bash
+nostrain train-local linear-initial.npz worker-a-dataset.json \
+  --backend numpy \
+  --steps 50 \
+  --learning-rate 0.05 \
+  --batch-size 2 \
+  --metrics-out local-training.json \
+  -o local-state.npz
 ```
 
 Run the non-linear MLP runtime against an `mlp-regression` dataset:
@@ -335,6 +372,8 @@ nostrain run-training linear-initial.json worker-a-dataset.json \
   --summary-out session-summary.json \
   -o final-state.json
 ```
+
+The same command accepts `.npz` model states and `--backend numpy` while keeping checkpoints, payloads, and relay envelopes in the canonical nostrain formats.
 
 Resume a worker from its last saved checkpoint:
 

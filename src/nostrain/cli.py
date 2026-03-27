@@ -34,10 +34,21 @@ from .relay import (
 )
 from .retry import RelayRetryPolicy
 from .runtime import (
+    DEFAULT_TRAINING_BACKEND,
     DEFAULT_TRAINING_RUNTIME,
     RegressionDataset,
+    SUPPORTED_TRAINING_BACKENDS,
     SUPPORTED_TRAINING_RUNTIMES,
+    infer_training_runtime_from_state,
     initialize_training_state,
+)
+from .stateio import (
+    JSON_STATE_FORMAT,
+    STATE_FORMAT_CHOICES,
+    load_model_state,
+    load_model_state_document,
+    resolve_state_format,
+    write_model_state,
 )
 from .training import (
     LocalTrainingConfig,
@@ -65,6 +76,39 @@ def _write_text(path: str | Path | None, data: str) -> None:
         print(data)
         return
     Path(path).write_text(data + "\n", encoding="utf-8")
+
+
+def _infer_runtime_name(state: ModelState) -> str | None:
+    try:
+        return infer_training_runtime_from_state(state)
+    except ValueError:
+        return None
+
+
+def _load_state(path: str | Path, state_format: str | None) -> ModelState:
+    return load_model_state(path, state_format=state_format)
+
+
+def _write_state(
+    path: str | Path | None,
+    state: ModelState,
+    *,
+    state_format: str | None,
+    runtime_name: str | None = None,
+) -> None:
+    resolved_format = resolve_state_format(state_format, path)
+    runtime_name = runtime_name or _infer_runtime_name(state)
+    if path is None:
+        if resolved_format != JSON_STATE_FORMAT:
+            raise ValueError("binary model state output requires -o/--output")
+        _write_json(None, state.to_json_obj())
+        return
+    write_model_state(
+        path,
+        state,
+        state_format=resolved_format,
+        runtime_name=runtime_name,
+    )
 
 
 def _resolve_worker_id(args: argparse.Namespace) -> str:
@@ -139,6 +183,49 @@ def _add_relay_retry_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_state_format_argument(
+    parser: argparse.ArgumentParser,
+    *,
+    flag_name: str = "--state-format",
+    destination: str = "state_format",
+    scope: str = "model state inputs",
+) -> None:
+    parser.add_argument(
+        flag_name,
+        dest=destination,
+        choices=STATE_FORMAT_CHOICES,
+        default="auto",
+        help=(
+            f"Interpret {scope} using this format. "
+            "Defaults to auto-detection from the file extension."
+        ),
+    )
+
+
+def _add_output_state_format_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--output-format",
+        choices=STATE_FORMAT_CHOICES,
+        default="auto",
+        help=(
+            "Write model-state outputs using this format. "
+            "Defaults to stdout JSON or infers from the output path extension."
+        ),
+    )
+
+
+def _add_backend_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--backend",
+        choices=SUPPORTED_TRAINING_BACKENDS,
+        default=DEFAULT_TRAINING_BACKEND,
+        help=(
+            "Training backend used for local evaluation and optimization "
+            f"(default: {DEFAULT_TRAINING_BACKEND})."
+        ),
+    )
+
+
 def _format_retry_delays(delays: tuple[float, ...]) -> str:
     if not delays:
         return "-"
@@ -181,7 +268,7 @@ def _load_payload_string(path: str | Path) -> str:
 
 
 def _handle_hash_state(args: argparse.Namespace) -> int:
-    state = ModelState.from_path(args.state)
+    state = _load_state(args.state, args.state_format)
     _write_text(args.output, state_digest(state))
     return 0
 
@@ -199,13 +286,18 @@ def _handle_init_state(args: argparse.Namespace) -> int:
         seed=args.seed,
         weight_scale=args.weight_scale,
     )
-    _write_json(args.output, state.to_json_obj())
+    _write_state(
+        args.output,
+        state,
+        state_format=args.output_format,
+        runtime_name=args.runtime,
+    )
     return 0
 
 
 def _handle_encode_delta(args: argparse.Namespace) -> int:
-    initial = ModelState.from_path(args.initial)
-    current = ModelState.from_path(args.current)
+    initial = _load_state(args.initial, args.state_format)
+    current = _load_state(args.current, args.state_format)
     delta = compute_delta(initial, current)
     payload = compress_delta(delta, topk_ratio=args.topk, codec=args.codec)
     if args.raw:
@@ -223,11 +315,15 @@ def _handle_decode_payload(args: argparse.Namespace) -> int:
 
 
 def _handle_apply_payload(args: argparse.Namespace) -> int:
-    base = ModelState.from_path(args.base)
+    base = _load_state(args.base, args.state_format)
     payload = _load_payload_string(args.payload)
     delta = decompress_payload(payload)
     reconstructed = apply_delta(base, delta)
-    _write_json(args.output, reconstructed.to_json_obj())
+    _write_state(
+        args.output,
+        reconstructed,
+        state_format=args.output_format,
+    )
     return 0
 
 
@@ -375,10 +471,10 @@ def _handle_aggregate_payloads(args: argparse.Namespace) -> int:
 
 
 def _handle_outer_step(args: argparse.Namespace) -> int:
-    base = ModelState.from_path(args.base)
+    base = _load_state(args.base, args.state_format)
     aggregated_delta = _load_delta_input(args.delta)
     previous_momentum = (
-        ModelState.from_path(args.momentum_state) if args.momentum_state else None
+        _load_state(args.momentum_state, args.state_format) if args.momentum_state else None
     )
     result = nesterov_outer_step(
         base,
@@ -387,9 +483,17 @@ def _handle_outer_step(args: argparse.Namespace) -> int:
         momentum=args.momentum,
         previous_momentum=previous_momentum,
     )
-    _write_json(args.output, result.next_state.to_json_obj())
+    _write_state(
+        args.output,
+        result.next_state,
+        state_format=args.output_format,
+    )
     if args.momentum_out:
-        _write_json(args.momentum_out, result.momentum_state.to_json_obj())
+        _write_state(
+            args.momentum_out,
+            result.momentum_state,
+            state_format=args.output_format,
+        )
     if args.summary_out:
         _write_json(
             args.summary_out,
@@ -404,7 +508,7 @@ def _handle_outer_step(args: argparse.Namespace) -> int:
 
 
 def _handle_train_local(args: argparse.Namespace) -> int:
-    initial_state = ModelState.from_path(args.state)
+    initial_state = _load_state(args.state, args.state_format)
     dataset = RegressionDataset.from_path(args.dataset)
     result = train_regression(
         initial_state,
@@ -415,10 +519,27 @@ def _handle_train_local(args: argparse.Namespace) -> int:
             batch_size=args.batch_size,
         ),
         runtime_name=args.runtime,
+        backend_name=args.backend,
     )
-    _write_json(args.output, result.trained_state.to_json_obj())
+    _write_state(
+        args.output,
+        result.trained_state,
+        state_format=args.output_format,
+        runtime_name=result.runtime_name,
+    )
     if args.metrics_out:
         _write_json(args.metrics_out, result.to_json_obj())
+    return 0
+
+
+def _handle_convert_state(args: argparse.Namespace) -> int:
+    document = load_model_state_document(args.state, state_format=args.input_format)
+    _write_state(
+        args.output,
+        document.state,
+        state_format=args.output_format,
+        runtime_name=document.runtime_name,
+    )
     return 0
 
 
@@ -467,9 +588,9 @@ def _handle_run_training(args: argparse.Namespace) -> int:
         late_gradient_since = checkpoint.late_gradient_since or checkpoint.updated_at
         runtime_name = runtime_name or checkpoint.runtime_name
     else:
-        initial_state = ModelState.from_path(args.state)
+        initial_state = _load_state(args.state, args.state_format)
         previous_momentum = (
-            ModelState.from_path(args.momentum_state) if args.momentum_state else None
+            _load_state(args.momentum_state, args.state_format) if args.momentum_state else None
         )
         start_round = args.start_round
         prior_rounds = ()
@@ -488,6 +609,7 @@ def _handle_run_training(args: argparse.Namespace) -> int:
                 worker_id=worker_id,
                 secret_key_hex=args.sec_key,
                 runtime_name=runtime_name,
+                backend_name=args.backend,
                 rounds=args.rounds,
                 start_round=start_round,
                 inner_steps=args.inner_steps,
@@ -519,9 +641,19 @@ def _handle_run_training(args: argparse.Namespace) -> int:
             checkpoint_out=args.checkpoint_out,
         )
     )
-    _write_json(args.output, session.final_state.to_json_obj())
+    _write_state(
+        args.output,
+        session.final_state,
+        state_format=args.output_format,
+        runtime_name=session.runtime_name,
+    )
     if args.momentum_out and session.final_momentum_state is not None:
-        _write_json(args.momentum_out, session.final_momentum_state.to_json_obj())
+        _write_state(
+            args.momentum_out,
+            session.final_momentum_state,
+            state_format=args.output_format,
+            runtime_name=session.runtime_name,
+        )
     if args.summary_out:
         _write_json(args.summary_out, session.to_json_obj())
     return 0
@@ -896,9 +1028,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     hash_state = subparsers.add_parser(
         "hash-state",
-        help="Compute a deterministic SHA-256 digest for a model state JSON file.",
+        help="Compute a deterministic SHA-256 digest for a model state file.",
     )
-    hash_state.add_argument("state", help="Path to a model state JSON file.")
+    hash_state.add_argument("state", help="Path to a model state file.")
+    _add_state_format_argument(hash_state, scope="the model state input")
     hash_state.add_argument("-o", "--output", help="Optional output path.")
     hash_state.set_defaults(handler=_handle_hash_state)
 
@@ -912,7 +1045,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     init_state = subparsers.add_parser(
         "init-state",
-        help="Generate a deterministic initial model state JSON for a supported training runtime.",
+        help="Generate a deterministic initial model state for a supported training runtime.",
     )
     init_state.add_argument(
         "--runtime",
@@ -943,15 +1076,32 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.1,
         help="Base initialization scale for mlp-regression weights (default: 0.1).",
     )
+    _add_output_state_format_argument(init_state)
     init_state.add_argument("-o", "--output", help="Optional output path.")
     init_state.set_defaults(handler=_handle_init_state)
+
+    convert_state = subparsers.add_parser(
+        "convert-state",
+        help="Convert a model state between canonical JSON and numpy-npz formats.",
+    )
+    convert_state.add_argument("state", help="Path to the source model state file.")
+    _add_state_format_argument(
+        convert_state,
+        flag_name="--input-format",
+        destination="input_format",
+        scope="the source model state",
+    )
+    _add_output_state_format_argument(convert_state)
+    convert_state.add_argument("-o", "--output", help="Optional output path.")
+    convert_state.set_defaults(handler=_handle_convert_state)
 
     encode_delta = subparsers.add_parser(
         "encode-delta",
         help="Compute a pseudo-gradient between two model state snapshots and compress it.",
     )
-    encode_delta.add_argument("initial", help="Path to the initial model state JSON.")
-    encode_delta.add_argument("current", help="Path to the current model state JSON.")
+    encode_delta.add_argument("initial", help="Path to the initial model state file.")
+    encode_delta.add_argument("current", help="Path to the current model state file.")
+    _add_state_format_argument(encode_delta)
     encode_delta.add_argument(
         "--topk",
         type=float,
@@ -993,8 +1143,10 @@ def build_parser() -> argparse.ArgumentParser:
         "apply-payload",
         help="Apply a pseudo-gradient payload to a base model state to reconstruct the next state.",
     )
-    apply_payload.add_argument("base", help="Path to the base model state JSON.")
+    apply_payload.add_argument("base", help="Path to the base model state file.")
     apply_payload.add_argument("payload", help="Path to a raw payload or payload JSON file.")
+    _add_state_format_argument(apply_payload, scope="the base model state")
+    _add_output_state_format_argument(apply_payload)
     apply_payload.add_argument("-o", "--output", help="Optional output path.")
     apply_payload.set_defaults(handler=_handle_apply_payload)
 
@@ -1243,11 +1395,12 @@ def build_parser() -> argparse.ArgumentParser:
         "outer-step",
         help="Apply a local DiLoCo-style outer update using an aggregated delta and optional momentum state.",
     )
-    outer_step.add_argument("base", help="Path to the base model state JSON.")
+    outer_step.add_argument("base", help="Path to the base model state file.")
     outer_step.add_argument(
         "delta",
         help="Path to an aggregated delta JSON file, payload JSON file, or raw payload file.",
     )
+    _add_state_format_argument(outer_step, scope="the base and momentum model states")
     outer_step.add_argument(
         "--learning-rate",
         type=float,
@@ -1262,30 +1415,34 @@ def build_parser() -> argparse.ArgumentParser:
     )
     outer_step.add_argument(
         "--momentum-state",
-        help="Optional prior momentum state JSON file.",
+        help="Optional prior momentum state file.",
     )
     outer_step.add_argument(
         "--momentum-out",
-        help="Optional path to write the next momentum state JSON.",
+        help="Optional path to write the next momentum state.",
     )
     outer_step.add_argument(
         "--summary-out",
         help="Optional path to write a small JSON summary of the outer step.",
     )
+    _add_output_state_format_argument(outer_step)
     outer_step.add_argument("-o", "--output", help="Optional output path.")
     outer_step.set_defaults(handler=_handle_outer_step)
 
     train_local = subparsers.add_parser(
         "train-local",
-        help="Run a pure-Python training inner loop against a runtime-compatible model state and dataset JSON.",
+        help="Run a local training inner loop against a runtime-compatible model state and dataset JSON.",
     )
-    train_local.add_argument("state", help="Path to the initial model state JSON.")
+    train_local.add_argument("state", help="Path to the initial model state file.")
     train_local.add_argument("dataset", help="Path to a regression dataset JSON file.")
+    _add_state_format_argument(train_local, scope="the initial model state")
+    _add_output_state_format_argument(train_local)
     train_local.add_argument(
         "--runtime",
         choices=SUPPORTED_TRAINING_RUNTIMES,
         help="Optional runtime override. Defaults to the dataset task or the model state layout.",
     )
+    _add_backend_argument(train_local)
     train_local.add_argument(
         "--steps",
         type=int,
@@ -1317,14 +1474,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_training.add_argument(
         "state",
-        help="Path to the initial global model state JSON. Ignored when resuming from a checkpoint.",
+        help="Path to the initial global model state file. Ignored when resuming from a checkpoint.",
     )
     run_training.add_argument("dataset", help="Path to a regression dataset JSON file.")
+    _add_state_format_argument(run_training, scope="the initial and momentum model states")
+    _add_output_state_format_argument(run_training)
     run_training.add_argument(
         "--runtime",
         choices=SUPPORTED_TRAINING_RUNTIMES,
         help="Optional runtime override. Defaults to the dataset task or checkpoint/model state layout.",
     )
+    _add_backend_argument(run_training)
     run_training.add_argument(
         "--relay",
         action="append",
@@ -1398,7 +1558,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_training.add_argument(
         "--momentum-state",
-        help="Optional prior momentum state JSON file.",
+        help="Optional prior momentum state file.",
     )
     run_training.add_argument(
         "--resume-from",
@@ -1425,7 +1585,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_training.add_argument(
         "--momentum-out",
-        help="Optional path to write the final momentum state JSON.",
+        help="Optional path to write the final momentum state.",
     )
     run_training.add_argument(
         "--checkpoint-out",

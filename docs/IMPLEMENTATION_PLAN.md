@@ -148,14 +148,26 @@ Delivered in the current repository state:
 
 This moves the project from partial-relay fault tolerance to transport flows that can recover from transient websocket failures without hiding what happened.
 
-## Next milestone: external runtime adapters
+## Completed milestone: NumPy runtime boundary
 
-Goal: connect the current deterministic built-in training loop to real framework runtimes without losing the protocol guarantees.
+Delivered in the current repository state:
+
+- canonical model-state interchange between JSON and `numpy-npz`
+- CLI support for `convert-state` plus auto-detected state formats across initialization, hashing, payload application, local training, and relay-backed training
+- backend-selectable local training/evaluation through `python` and `numpy`
+- relay-backed `run-training` support for NumPy-backed workers without changing protocol/checkpoint formats
+- conformance tests that compare NumPy-vs-Python training behavior plus CLI/relay coverage for `.npz` state I/O
+
+This moves the project from built-in-only runtime execution to a real external runtime boundary that can exchange and optimize model states outside the canonical JSON edge without weakening the protocol contracts.
+
+## Next milestone: framework-specific adapters
+
+Goal: connect the new external runtime boundary to widely used framework objects such as PyTorch or MLX modules/state-dicts without losing the protocol guarantees.
 
 Deliverables:
 
-- adapter boundary for importing/exporting framework weights through the shared `ModelState` schema
-- at least one concrete external runtime path with conformance tests against the built-in runner contracts
+- import/export paths for real framework-native module/state-dict layouts through the shared `ModelState` schema
+- at least one framework-specific adapter with conformance coverage against the existing Python/NumPy training contracts
 
 ## Deferred polish
 

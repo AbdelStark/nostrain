@@ -2,7 +2,7 @@
 
 ## Overview
 
-nostrain is a protocol for distributed ML training over Nostr relays. The implemented repository milestone now covers the payload layer, a signed transport slice, and a resilient end-to-end runner: deterministic model snapshots, pseudo-gradient generation, sparse quantized wire encoding, NIP-01-compatible gradient/heartbeat/checkpoint event envelopes, websocket discovery/collection across one or more relays, resumable checkpoints, rolling checkpoint-slot retention, deferred late-gradient reconciliation, configurable relay retry/backoff, and a runtime-aware built-in worker loop that trains both linear and non-linear regression models through relays.
+nostrain is a protocol for distributed ML training over Nostr relays. The implemented repository milestone now covers the payload layer, a signed transport slice, and a resilient end-to-end runner: deterministic model snapshots, pseudo-gradient generation, sparse quantized wire encoding, NIP-01-compatible gradient/heartbeat/checkpoint event envelopes, websocket discovery/collection across one or more relays, resumable checkpoints, rolling checkpoint-slot retention, deferred late-gradient reconciliation, configurable relay retry/backoff, runtime-aware worker loops for both linear and non-linear regression, plus a NumPy-backed edge/runtime path for state interchange and local optimization.
 
 ## Implemented core
 
@@ -43,6 +43,9 @@ nostrain is a protocol for distributed ML training over Nostr relays. The implem
 35. Generate deterministic built-in initial states for supported runtimes from the CLI
 36. Train a one-hidden-layer `mlp-regression` runtime end to end through the same relay/checkpoint path
 37. Retry transient relay publish/discovery/collection failures with configurable backoff and expose retry telemetry in CLI/training artifacts
+38. Convert model states between canonical JSON and `numpy-npz` archives
+39. Run local evaluation and inner-loop training through either the pure-Python or NumPy backend
+40. Auto-detect model-state formats across CLI training/state commands and preserve runtime metadata when possible
 
 ## Model state schema
 
@@ -250,14 +253,15 @@ Reconstruction is exact with respect to the sparse support and approximate with 
 Implemented commands:
 
 ```bash
-nostrain hash-state <state.json>
-nostrain init-state --runtime linear-regression|mlp-regression --features <n> [--hidden-size <h>]
+nostrain hash-state <state.{json|npz}> [--state-format auto|json|numpy-npz]
+nostrain init-state --runtime linear-regression|mlp-regression --features <n> [--hidden-size <h>] [--output-format auto|json|numpy-npz]
+nostrain convert-state <state.{json|npz}> [--input-format auto|json|numpy-npz] [--output-format auto|json|numpy-npz]
 nostrain derive-pubkey <sec-key>
-nostrain encode-delta <initial.json> <current.json> [--topk 0.01] [--codec zlib|zstd]
+nostrain encode-delta <initial.{json|npz}> <current.{json|npz}> [--state-format auto|json|numpy-npz] [--topk 0.01] [--codec zlib|zstd]
 nostrain decode-payload <payload.json>
 nostrain aggregate-payloads <payload-a.json> <payload-b.json> [...]
-nostrain apply-payload <base.json> <payload.json>
-nostrain outer-step <base.json> <aggregated.json> [--learning-rate 0.7] [--momentum 0.9]
+nostrain apply-payload <base.{json|npz}> <payload.json> [--state-format auto|json|numpy-npz] [--output-format auto|json|numpy-npz]
+nostrain outer-step <base.{json|npz}> <aggregated.json> [--state-format auto|json|numpy-npz] [--output-format auto|json|numpy-npz] [--learning-rate 0.7] [--momentum 0.9]
 nostrain build-event <payload.json> --run <name> --round <n> --worker <id> --model <sha256> [--sec-key <hex> | --pubkey <hex> [--sig <hex>]]
 nostrain build-heartbeat --run <name> --round <n> --worker <id> [--capability gradient-event] [--advertise-relay ws://...]
 nostrain build-checkpoint <checkpoint.json> [--worker <id>] [--history-slot <n>] [--sec-key <hex> | --pubkey <hex> [--sig <hex>]]
@@ -266,8 +270,8 @@ nostrain discover-workers --relay <ws://...> [--relay <ws://...> ...] --run <nam
 nostrain discover-checkpoints --relay <ws://...> [--relay <ws://...> ...] --run <name> [--worker <id>]
 nostrain collect-events --relay <ws://...> [--relay <ws://...> ...] --run <name> --round <n> [--sync timeout|strict|quorum|async] [--discover-workers]
 nostrain aggregate-round --relay <ws://...> [--relay <ws://...> ...] --run <name> --round <n> [--sync timeout|strict|quorum|async] [--discover-workers]
-nostrain train-local <state.json> <dataset.json> [--runtime linear-regression|mlp-regression] [--steps 500] [--learning-rate 0.01] [--batch-size 1]
-nostrain run-training <state.json> <dataset.json> [--runtime linear-regression|mlp-regression] --relay <ws://...> [--relay <ws://...> ...] --run <name> --sec-key <hex> [--rounds 1] [--checkpoint-out path.json] [--checkpoint-history 4] [--artifact-retention-rounds N] [--late-gradient-strategy deferred|discard] [--late-gradient-learning-rate X] [--late-gradient-momentum Y] [--resume-from checkpoint.json | --resume-latest-checkpoint]
+nostrain train-local <state.{json|npz}> <dataset.json> [--state-format auto|json|numpy-npz] [--output-format auto|json|numpy-npz] [--runtime linear-regression|mlp-regression] [--backend python|numpy] [--steps 500] [--learning-rate 0.01] [--batch-size 1]
+nostrain run-training <state.{json|npz}> <dataset.json> [--state-format auto|json|numpy-npz] [--output-format auto|json|numpy-npz] [--runtime linear-regression|mlp-regression] [--backend python|numpy] --relay <ws://...> [--relay <ws://...> ...] --run <name> --sec-key <hex> [--rounds 1] [--checkpoint-out path.json] [--checkpoint-history 4] [--artifact-retention-rounds N] [--late-gradient-strategy deferred|discard] [--late-gradient-learning-rate X] [--late-gradient-momentum Y] [--resume-from checkpoint.json | --resume-latest-checkpoint]
 nostrain inspect-event <event.json> [--json]
 ```
 
@@ -316,5 +320,5 @@ Fault-tolerance boundary:
 
 ## Deferred from v0.9.0
 
-- External runtime adapters for PyTorch or MLX
+- Framework-native adapters for PyTorch or MLX modules/state-dicts
 - live dashboarding

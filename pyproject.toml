@@ -23,6 +23,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+numpy = ["numpy>=1.26"]
 zstd = ["zstandard>=0.22"]
 
 [project.scripts]

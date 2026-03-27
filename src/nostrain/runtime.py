@@ -23,6 +23,13 @@ SUPPORTED_TRAINING_RUNTIMES = (
     LINEAR_REGRESSION_RUNTIME,
     MLP_REGRESSION_RUNTIME,
 )
+PYTHON_TRAINING_BACKEND = "python"
+NUMPY_TRAINING_BACKEND = "numpy"
+DEFAULT_TRAINING_BACKEND = PYTHON_TRAINING_BACKEND
+SUPPORTED_TRAINING_BACKENDS = (
+    PYTHON_TRAINING_BACKEND,
+    NUMPY_TRAINING_BACKEND,
+)
 
 
 def _normalize_runtime_name(runtime_name: str) -> str:
@@ -32,6 +39,44 @@ def _normalize_runtime_name(runtime_name: str) -> str:
             "runtime must be one of: " + ", ".join(SUPPORTED_TRAINING_RUNTIMES)
         )
     return normalized
+
+
+def resolve_training_backend(backend_name: str | None) -> str:
+    normalized = (
+        DEFAULT_TRAINING_BACKEND
+        if backend_name is None
+        else str(backend_name).strip().lower() or DEFAULT_TRAINING_BACKEND
+    )
+    if normalized not in SUPPORTED_TRAINING_BACKENDS:
+        raise ValueError(
+            "training backend must be one of: "
+            + ", ".join(SUPPORTED_TRAINING_BACKENDS)
+        )
+    return normalized
+
+
+def _require_numpy(feature_name: str):
+    try:
+        import numpy as np
+    except ImportError as exc:  # pragma: no cover - exercised in environments without numpy.
+        raise RuntimeError(
+            f"{feature_name} requires the optional numpy dependency; "
+            'install it with `python3 -m pip install -e ".[numpy]"`'
+        ) from exc
+    return np
+
+
+def _dataset_arrays(dataset: RegressionDataset):
+    np = _require_numpy("numpy training backend")
+    inputs = np.asarray(
+        [example.inputs for example in dataset.examples],
+        dtype=np.float64,
+    )
+    targets = np.asarray(
+        [example.target for example in dataset.examples],
+        dtype=np.float64,
+    )
+    return np, inputs, targets
 
 
 @dataclass(frozen=True)
@@ -496,10 +541,18 @@ def evaluate_linear_regression(
     dataset: RegressionDataset,
     *,
     adapter: LinearModelAdapter | None = None,
+    backend_name: str | None = None,
 ) -> float:
     resolve_training_runtime(LINEAR_REGRESSION_RUNTIME, dataset, state=state, adapter=adapter)
+    resolved_backend = resolve_training_backend(backend_name)
     adapter = adapter or LinearModelAdapter()
     model = adapter.import_state(state, feature_count=dataset.feature_count)
+    if resolved_backend == NUMPY_TRAINING_BACKEND:
+        np, inputs, targets = _dataset_arrays(dataset)
+        weights = np.asarray(model.weights, dtype=np.float64)
+        predictions = inputs @ weights + float(model.bias)
+        errors = predictions - targets
+        return float(np.mean(errors * errors))
     total_squared_error = 0.0
     for example in dataset.examples:
         error = model.predict(example.inputs) - example.target
@@ -512,10 +565,24 @@ def evaluate_mlp_regression(
     dataset: RegressionDataset,
     *,
     adapter: MLPModelAdapter | None = None,
+    backend_name: str | None = None,
 ) -> float:
     resolve_training_runtime(MLP_REGRESSION_RUNTIME, dataset, state=state, adapter=adapter)
+    resolved_backend = resolve_training_backend(backend_name)
     adapter = adapter or MLPModelAdapter()
     model = adapter.import_state(state, feature_count=dataset.feature_count)
+    if resolved_backend == NUMPY_TRAINING_BACKEND:
+        np, inputs, targets = _dataset_arrays(dataset)
+        hidden_weights = np.asarray(model.hidden_weights, dtype=np.float64).reshape(
+            model.hidden_size,
+            model.feature_count,
+        )
+        hidden_bias = np.asarray(model.hidden_bias, dtype=np.float64)
+        output_weights = np.asarray(model.output_weights, dtype=np.float64)
+        hidden_activations = np.tanh(inputs @ hidden_weights.T + hidden_bias)
+        predictions = hidden_activations @ output_weights + float(model.output_bias)
+        errors = predictions - targets
+        return float(np.mean(errors * errors))
     total_squared_error = 0.0
     for example in dataset.examples:
         error = model.predict(example.inputs) - example.target
@@ -529,6 +596,7 @@ def evaluate_regression(
     *,
     runtime_name: str | None = None,
     adapter: RuntimeAdapter | None = None,
+    backend_name: str | None = None,
 ) -> float:
     resolved_runtime = resolve_training_runtime(
         runtime_name,
@@ -541,11 +609,13 @@ def evaluate_regression(
             state,
             dataset,
             adapter=adapter if isinstance(adapter, LinearModelAdapter) else None,
+            backend_name=backend_name,
         )
     return evaluate_mlp_regression(
         state,
         dataset,
         adapter=adapter if isinstance(adapter, MLPModelAdapter) else None,
+        backend_name=backend_name,
     )
 
 
@@ -576,11 +646,13 @@ class LocalTrainingResult:
     example_count: int
     feature_count: int
     runtime_name: str = DEFAULT_TRAINING_RUNTIME
+    backend_name: str = DEFAULT_TRAINING_BACKEND
 
     def to_json_obj(self) -> dict[str, Any]:
         return {
             "task": self.runtime_name,
             "runtime": self.runtime_name,
+            "backend": self.backend_name,
             "steps": self.steps,
             "learning_rate": self.learning_rate,
             "batch_size": self.batch_size,
@@ -597,41 +669,85 @@ def train_linear_regression(
     *,
     config: LocalTrainingConfig | None = None,
     adapter: LinearModelAdapter | None = None,
+    backend_name: str | None = None,
 ) -> LocalTrainingResult:
     config = config or LocalTrainingConfig()
     resolve_training_runtime(LINEAR_REGRESSION_RUNTIME, dataset, state=initial_state, adapter=adapter)
+    resolved_backend = resolve_training_backend(backend_name)
     adapter = adapter or LinearModelAdapter()
 
     model = adapter.import_state(initial_state, feature_count=dataset.feature_count)
-    weights = list(model.weights)
-    bias = model.bias
-    loss_before = evaluate_linear_regression(initial_state, dataset, adapter=adapter)
-    example_index = 0
+    loss_before = evaluate_linear_regression(
+        initial_state,
+        dataset,
+        adapter=adapter,
+        backend_name=resolved_backend,
+    )
 
-    for _ in range(config.steps):
-        batch: list[RegressionExample] = []
-        for offset in range(config.batch_size):
-            batch.append(dataset.examples[(example_index + offset) % dataset.example_count])
-        example_index = (example_index + config.batch_size) % dataset.example_count
+    if resolved_backend == NUMPY_TRAINING_BACKEND:
+        np, all_inputs, all_targets = _dataset_arrays(dataset)
+        weights = np.asarray(model.weights, dtype=np.float64)
+        bias = float(model.bias)
+        example_index = 0
 
-        gradients = [0.0 for _ in weights]
-        bias_gradient = 0.0
-        batch_scale = 1.0 / len(batch)
+        for _ in range(config.steps):
+            batch_indexes = [
+                (example_index + offset) % dataset.example_count
+                for offset in range(config.batch_size)
+            ]
+            example_index = (example_index + config.batch_size) % dataset.example_count
+            batch_inputs = all_inputs[batch_indexes]
+            batch_targets = all_targets[batch_indexes]
 
-        for example in batch:
-            prediction = sum(weight * value for weight, value in zip(weights, example.inputs)) + bias
-            error = prediction - example.target
-            factor = 2.0 * error * batch_scale
-            for index, feature_value in enumerate(example.inputs):
-                gradients[index] += factor * feature_value
-            bias_gradient += factor
+            errors = batch_inputs @ weights + bias - batch_targets
+            factors = (2.0 / len(batch_indexes)) * errors
+            gradients = batch_inputs.T @ factors
+            bias_gradient = float(factors.sum())
 
-        for index, gradient in enumerate(gradients):
-            weights[index] -= config.learning_rate * gradient
-        bias -= config.learning_rate * bias_gradient
+            weights = weights - config.learning_rate * gradients
+            bias -= config.learning_rate * bias_gradient
 
-    trained_state = adapter.export_state(LinearModel(weights=tuple(weights), bias=bias))
-    loss_after = evaluate_linear_regression(trained_state, dataset, adapter=adapter)
+        trained_state = adapter.export_state(
+            LinearModel(
+                weights=tuple(float(value) for value in weights.tolist()),
+                bias=float(bias),
+            )
+        )
+    else:
+        weights = list(model.weights)
+        bias = model.bias
+        example_index = 0
+
+        for _ in range(config.steps):
+            batch: list[RegressionExample] = []
+            for offset in range(config.batch_size):
+                batch.append(dataset.examples[(example_index + offset) % dataset.example_count])
+            example_index = (example_index + config.batch_size) % dataset.example_count
+
+            gradients = [0.0 for _ in weights]
+            bias_gradient = 0.0
+            batch_scale = 1.0 / len(batch)
+
+            for example in batch:
+                prediction = sum(weight * value for weight, value in zip(weights, example.inputs)) + bias
+                error = prediction - example.target
+                factor = 2.0 * error * batch_scale
+                for index, feature_value in enumerate(example.inputs):
+                    gradients[index] += factor * feature_value
+                bias_gradient += factor
+
+            for index, gradient in enumerate(gradients):
+                weights[index] -= config.learning_rate * gradient
+            bias -= config.learning_rate * bias_gradient
+
+        trained_state = adapter.export_state(LinearModel(weights=tuple(weights), bias=bias))
+
+    loss_after = evaluate_linear_regression(
+        trained_state,
+        dataset,
+        adapter=adapter,
+        backend_name=resolved_backend,
+    )
     return LocalTrainingResult(
         initial_state=initial_state,
         trained_state=trained_state,
@@ -643,6 +759,7 @@ def train_linear_regression(
         example_count=dataset.example_count,
         feature_count=dataset.feature_count,
         runtime_name=LINEAR_REGRESSION_RUNTIME,
+        backend_name=resolved_backend,
     )
 
 
@@ -652,77 +769,148 @@ def train_mlp_regression(
     *,
     config: LocalTrainingConfig | None = None,
     adapter: MLPModelAdapter | None = None,
+    backend_name: str | None = None,
 ) -> LocalTrainingResult:
     config = config or LocalTrainingConfig()
     resolve_training_runtime(MLP_REGRESSION_RUNTIME, dataset, state=initial_state, adapter=adapter)
+    resolved_backend = resolve_training_backend(backend_name)
     adapter = adapter or MLPModelAdapter()
 
     model = adapter.import_state(initial_state, feature_count=dataset.feature_count)
-    hidden_weights = list(model.hidden_weights)
-    hidden_bias = list(model.hidden_bias)
-    output_weights = list(model.output_weights)
-    output_bias = model.output_bias
-    loss_before = evaluate_mlp_regression(initial_state, dataset, adapter=adapter)
-    example_index = 0
-
-    for _ in range(config.steps):
-        batch: list[RegressionExample] = []
-        for offset in range(config.batch_size):
-            batch.append(dataset.examples[(example_index + offset) % dataset.example_count])
-        example_index = (example_index + config.batch_size) % dataset.example_count
-
-        hidden_weight_gradients = [0.0 for _ in hidden_weights]
-        hidden_bias_gradients = [0.0 for _ in hidden_bias]
-        output_weight_gradients = [0.0 for _ in output_weights]
-        output_bias_gradient = 0.0
-        batch_scale = 1.0 / len(batch)
-
-        for example in batch:
-            hidden_activations: list[float] = []
-            for hidden_index in range(model.hidden_size):
-                offset = hidden_index * model.feature_count
-                total = hidden_bias[hidden_index]
-                for feature_index, feature_value in enumerate(example.inputs):
-                    total += hidden_weights[offset + feature_index] * feature_value
-                hidden_activations.append(math.tanh(total))
-
-            prediction = output_bias + sum(
-                weight * activation
-                for weight, activation in zip(output_weights, hidden_activations)
-            )
-            error = prediction - example.target
-            output_delta = 2.0 * error * batch_scale
-
-            for hidden_index, activation in enumerate(hidden_activations):
-                output_weight_gradients[hidden_index] += output_delta * activation
-            output_bias_gradient += output_delta
-
-            for hidden_index, activation in enumerate(hidden_activations):
-                hidden_delta = output_delta * output_weights[hidden_index] * (1.0 - activation * activation)
-                hidden_bias_gradients[hidden_index] += hidden_delta
-                offset = hidden_index * model.feature_count
-                for feature_index, feature_value in enumerate(example.inputs):
-                    hidden_weight_gradients[offset + feature_index] += hidden_delta * feature_value
-
-        for index, gradient in enumerate(hidden_weight_gradients):
-            hidden_weights[index] -= config.learning_rate * gradient
-        for index, gradient in enumerate(hidden_bias_gradients):
-            hidden_bias[index] -= config.learning_rate * gradient
-        for index, gradient in enumerate(output_weight_gradients):
-            output_weights[index] -= config.learning_rate * gradient
-        output_bias -= config.learning_rate * output_bias_gradient
-
-    trained_state = adapter.export_state(
-        MLPModel(
-            feature_count=model.feature_count,
-            hidden_size=model.hidden_size,
-            hidden_weights=tuple(hidden_weights),
-            hidden_bias=tuple(hidden_bias),
-            output_weights=tuple(output_weights),
-            output_bias=output_bias,
-        )
+    loss_before = evaluate_mlp_regression(
+        initial_state,
+        dataset,
+        adapter=adapter,
+        backend_name=resolved_backend,
     )
-    loss_after = evaluate_mlp_regression(trained_state, dataset, adapter=adapter)
+
+    if resolved_backend == NUMPY_TRAINING_BACKEND:
+        np, all_inputs, all_targets = _dataset_arrays(dataset)
+        hidden_weights = np.asarray(model.hidden_weights, dtype=np.float64).reshape(
+            model.hidden_size,
+            model.feature_count,
+        )
+        hidden_bias = np.asarray(model.hidden_bias, dtype=np.float64)
+        output_weights = np.asarray(model.output_weights, dtype=np.float64)
+        output_bias = float(model.output_bias)
+        example_index = 0
+
+        for _ in range(config.steps):
+            batch_indexes = [
+                (example_index + offset) % dataset.example_count
+                for offset in range(config.batch_size)
+            ]
+            example_index = (example_index + config.batch_size) % dataset.example_count
+            batch_inputs = all_inputs[batch_indexes]
+            batch_targets = all_targets[batch_indexes]
+
+            hidden_activations = np.tanh(batch_inputs @ hidden_weights.T + hidden_bias)
+            predictions = hidden_activations @ output_weights + output_bias
+            errors = predictions - batch_targets
+            output_delta = (2.0 / len(batch_indexes)) * errors
+
+            output_weight_gradients = hidden_activations.T @ output_delta
+            output_bias_gradient = float(output_delta.sum())
+            hidden_delta = (
+                output_delta[:, None] * output_weights[None, :]
+            ) * (1.0 - hidden_activations * hidden_activations)
+            hidden_bias_gradients = hidden_delta.sum(axis=0)
+            hidden_weight_gradients = hidden_delta.T @ batch_inputs
+
+            hidden_weights = hidden_weights - config.learning_rate * hidden_weight_gradients
+            hidden_bias = hidden_bias - config.learning_rate * hidden_bias_gradients
+            output_weights = output_weights - config.learning_rate * output_weight_gradients
+            output_bias -= config.learning_rate * output_bias_gradient
+
+        trained_state = adapter.export_state(
+            MLPModel(
+                feature_count=model.feature_count,
+                hidden_size=model.hidden_size,
+                hidden_weights=tuple(
+                    float(value) for value in hidden_weights.reshape(-1).tolist()
+                ),
+                hidden_bias=tuple(float(value) for value in hidden_bias.tolist()),
+                output_weights=tuple(float(value) for value in output_weights.tolist()),
+                output_bias=float(output_bias),
+            )
+        )
+    else:
+        hidden_weights = list(model.hidden_weights)
+        hidden_bias = list(model.hidden_bias)
+        output_weights = list(model.output_weights)
+        output_bias = model.output_bias
+        example_index = 0
+
+        for _ in range(config.steps):
+            batch: list[RegressionExample] = []
+            for offset in range(config.batch_size):
+                batch.append(dataset.examples[(example_index + offset) % dataset.example_count])
+            example_index = (example_index + config.batch_size) % dataset.example_count
+
+            hidden_weight_gradients = [0.0 for _ in hidden_weights]
+            hidden_bias_gradients = [0.0 for _ in hidden_bias]
+            output_weight_gradients = [0.0 for _ in output_weights]
+            output_bias_gradient = 0.0
+            batch_scale = 1.0 / len(batch)
+
+            for example in batch:
+                hidden_activations: list[float] = []
+                for hidden_index in range(model.hidden_size):
+                    offset = hidden_index * model.feature_count
+                    total = hidden_bias[hidden_index]
+                    for feature_index, feature_value in enumerate(example.inputs):
+                        total += hidden_weights[offset + feature_index] * feature_value
+                    hidden_activations.append(math.tanh(total))
+
+                prediction = output_bias + sum(
+                    weight * activation
+                    for weight, activation in zip(output_weights, hidden_activations)
+                )
+                error = prediction - example.target
+                output_delta = 2.0 * error * batch_scale
+
+                for hidden_index, activation in enumerate(hidden_activations):
+                    output_weight_gradients[hidden_index] += output_delta * activation
+                output_bias_gradient += output_delta
+
+                for hidden_index, activation in enumerate(hidden_activations):
+                    hidden_delta = (
+                        output_delta
+                        * output_weights[hidden_index]
+                        * (1.0 - activation * activation)
+                    )
+                    hidden_bias_gradients[hidden_index] += hidden_delta
+                    offset = hidden_index * model.feature_count
+                    for feature_index, feature_value in enumerate(example.inputs):
+                        hidden_weight_gradients[offset + feature_index] += (
+                            hidden_delta * feature_value
+                        )
+
+            for index, gradient in enumerate(hidden_weight_gradients):
+                hidden_weights[index] -= config.learning_rate * gradient
+            for index, gradient in enumerate(hidden_bias_gradients):
+                hidden_bias[index] -= config.learning_rate * gradient
+            for index, gradient in enumerate(output_weight_gradients):
+                output_weights[index] -= config.learning_rate * gradient
+            output_bias -= config.learning_rate * output_bias_gradient
+
+        trained_state = adapter.export_state(
+            MLPModel(
+                feature_count=model.feature_count,
+                hidden_size=model.hidden_size,
+                hidden_weights=tuple(hidden_weights),
+                hidden_bias=tuple(hidden_bias),
+                output_weights=tuple(output_weights),
+                output_bias=output_bias,
+            )
+        )
+
+    loss_after = evaluate_mlp_regression(
+        trained_state,
+        dataset,
+        adapter=adapter,
+        backend_name=resolved_backend,
+    )
     return LocalTrainingResult(
         initial_state=initial_state,
         trained_state=trained_state,
@@ -734,6 +922,7 @@ def train_mlp_regression(
         example_count=dataset.example_count,
         feature_count=dataset.feature_count,
         runtime_name=MLP_REGRESSION_RUNTIME,
+        backend_name=resolved_backend,
     )
 
 
@@ -744,6 +933,7 @@ def train_regression(
     config: LocalTrainingConfig | None = None,
     runtime_name: str | None = None,
     adapter: RuntimeAdapter | None = None,
+    backend_name: str | None = None,
 ) -> LocalTrainingResult:
     resolved_runtime = resolve_training_runtime(
         runtime_name,
@@ -757,10 +947,12 @@ def train_regression(
             dataset,
             config=config,
             adapter=adapter if isinstance(adapter, LinearModelAdapter) else None,
+            backend_name=backend_name,
         )
     return train_mlp_regression(
         initial_state,
         dataset,
         config=config,
         adapter=adapter if isinstance(adapter, MLPModelAdapter) else None,
+        backend_name=backend_name,
     )
