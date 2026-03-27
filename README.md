@@ -49,8 +49,8 @@ sequenceDiagram
         R-->>A: Peer gradients
         R-->>B: Peer gradients
 
-        A->>A: aggregate(mean) → Nesterov outer step
-        B->>B: aggregate(mean) → Nesterov outer step
+        A->>A: aggregate(weighted mean) → Nesterov outer step
+        B->>B: aggregate(weighted mean) → Nesterov outer step
     end
 ```
 
@@ -139,9 +139,9 @@ This is [DiLoCo](https://arxiv.org/abs/2311.08105) (Distributed Low-Communicatio
 
 Result: ~580KB per gradient event. This gets published as a Nostr event.
 
-**Transport.** The compressed pseudo-gradient is packed into a NIP-01 event (kind `33333`), signed with a BIP340 Schnorr signature, and published to the relay. Workers also publish heartbeat events (kind `33334`) so they can discover each other. All standard Nostr — any relay works.
+**Transport.** The compressed pseudo-gradient is packed into a NIP-01 event (kind `33333`), signed with a BIP340 Schnorr signature, and published to the relay. Gradient and heartbeat events can also advertise the local example count so peers can weight uneven shards correctly. All standard Nostr — any relay works.
 
-**Outer loop (aggregation).** Each worker subscribes to the relay, collects all peer gradients for the current round, decompresses them, and computes the **mean** across all workers. This averaged pseudo-gradient is applied using **Nesterov momentum** — a second-order update that looks ahead before stepping, converging faster than plain SGD.
+**Outer loop (aggregation).** Each worker subscribes to the relay, collects all peer gradients for the current round, decompresses them, and computes an **example-weighted mean** when peers advertise example counts, otherwise falling back to a plain worker mean. This aggregated pseudo-gradient is applied using **Nesterov momentum** — a second-order update that looks ahead before stepping, converging faster than plain SGD.
 
 Then the cycle repeats.
 
@@ -256,10 +256,12 @@ Three NIP-01 event kinds, all BIP340 Schnorr signed:
 | Kind | Type | Content |
 |:---:|---|---|
 | `33333` | Gradient | Compressed pseudo-gradient payload (base64) |
-| `33334` | Heartbeat | Empty — capabilities and relay hints in tags |
+| `33334` | Heartbeat | Empty — capabilities, relay hints, and optional example counts in tags |
 | `33335` | Checkpoint | Serialized training state for recovery |
 
 Works with any relay that indexes on `kind` and `#t` tags.
+
+Gradient and heartbeat tags may include `examples=<count>`. When present on gradients, `nostrain` uses those counts for weighted aggregation across uneven worker shards.
 
 ## Configuration
 
@@ -318,7 +320,7 @@ nostrain convert-state          Convert between JSON / npz / pt formats
 nostrain encode-delta           Compress a pseudo-gradient
 nostrain decode-payload         Decompress a payload
 nostrain apply-payload          Reconstruct state from base + payload
-nostrain aggregate-payloads     Average multiple worker payloads
+nostrain aggregate-payloads     Aggregate multiple worker payloads
 
 nostrain outer-step             Apply DiLoCo outer step with momentum
 nostrain train-local            Run inner SGD loop locally

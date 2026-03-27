@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass, replace
 from typing import Any, Awaitable, Callable, Iterable, Sequence, TypeVar
 
-from .aggregation import aggregate_deltas
+from .aggregation import aggregate_weighted_deltas
 from .compression import decompress_payload
 from .model import ModelState
 from .protocol import (
@@ -327,6 +327,10 @@ class CollectedGradientEvent:
     event_id: str
     parsed: ParsedGradientEvent
 
+    @property
+    def aggregation_weight(self) -> int:
+        return self.parsed.metadata.example_count or 1
+
     def to_summary_obj(self) -> dict[str, Any]:
         return {
             "event_id": self.event_id,
@@ -339,6 +343,8 @@ class CollectedGradientEvent:
             "worker": self.parsed.metadata.worker_id,
             "model": self.parsed.metadata.model_hash,
             "steps": self.parsed.metadata.inner_steps,
+            "example_count": self.parsed.metadata.example_count,
+            "aggregation_weight": self.aggregation_weight,
             "compression": self.parsed.payload.compression_label,
             "parameter_count": self.parsed.payload.parameter_count,
             "total_values": self.parsed.payload.total_values,
@@ -370,6 +376,7 @@ class CollectedHeartbeatEvent:
             "worker": self.parsed.metadata.worker_id,
             "current_round": self.parsed.metadata.current_round,
             "heartbeat_interval": self.parsed.metadata.heartbeat_interval,
+            "example_count": self.parsed.metadata.example_count,
             "capabilities": list(self.parsed.metadata.capabilities),
             "advertised_relays": list(self.parsed.metadata.advertised_relays),
         }
@@ -713,11 +720,20 @@ class RelayCollectionResult:
             )
         )
 
+    @property
+    def aggregation_weighted(self) -> bool:
+        return any(event.parsed.metadata.example_count is not None for event in self.events)
+
+    @property
+    def total_aggregation_weight(self) -> int:
+        return sum(event.aggregation_weight for event in self.events)
+
     def aggregate_delta(self) -> ModelState:
         if not self.events:
             raise ValueError("cannot aggregate an empty relay collection")
-        return aggregate_deltas(
-            decompress_payload(event.parsed.payload) for event in self.events
+        return aggregate_weighted_deltas(
+            (decompress_payload(event.parsed.payload), float(event.aggregation_weight))
+            for event in self.events
         )
 
     def to_json_obj(self, *, include_events: bool = True) -> dict[str, Any]:
@@ -732,6 +748,8 @@ class RelayCollectionResult:
             "invalid_events": self.invalid_events,
             "sync_strategy": self.sync_strategy,
             "completion_reason": self.completion_reason,
+            "aggregation_weighted": self.aggregation_weighted,
+            "total_aggregation_weight": self.total_aggregation_weight,
             "retried_relays": list(self.retried_relays),
             "total_retry_count": self.total_retry_count,
             "max_attempt_count": self.max_attempt_count,
@@ -809,11 +827,20 @@ class MultiRelayCollectionResult:
             )
         )
 
+    @property
+    def aggregation_weighted(self) -> bool:
+        return any(event.parsed.metadata.example_count is not None for event in self.events)
+
+    @property
+    def total_aggregation_weight(self) -> int:
+        return sum(event.aggregation_weight for event in self.events)
+
     def aggregate_delta(self) -> ModelState:
         if not self.events:
             raise ValueError("cannot aggregate an empty relay collection")
-        return aggregate_deltas(
-            decompress_payload(event.parsed.payload) for event in self.events
+        return aggregate_weighted_deltas(
+            (decompress_payload(event.parsed.payload), float(event.aggregation_weight))
+            for event in self.events
         )
 
     def to_json_obj(self, *, include_events: bool = True) -> dict[str, Any]:
@@ -829,6 +856,8 @@ class MultiRelayCollectionResult:
             "invalid_events": self.invalid_events,
             "sync_strategy": self.sync_strategy,
             "completion_reason": self.completion_reason,
+            "aggregation_weighted": self.aggregation_weighted,
+            "total_aggregation_weight": self.total_aggregation_weight,
             "retried_relays": list(self.retried_relays),
             "total_retry_count": self.total_retry_count,
             "max_attempt_count": self.max_attempt_count,

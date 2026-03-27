@@ -63,6 +63,7 @@ def _build_event(
     created_at: int,
     run_name: str = "demo-run",
     round_index: int = 7,
+    example_count: int | None = None,
 ) -> dict[str, Any]:
     initial = ModelState.from_path(FIXTURES / "initial_state.json")
     current = ModelState.from_path(FIXTURES / current_fixture)
@@ -75,6 +76,7 @@ def _build_event(
             worker_id=worker_id,
             model_hash=state_digest(initial),
             inner_steps=500,
+            example_count=example_count,
             created_at=created_at,
         ),
         payload,
@@ -89,6 +91,7 @@ def _build_linear_event(
     created_at: int,
     run_name: str = "demo-run",
     round_index: int = 0,
+    example_count: int | None = None,
 ) -> dict[str, Any]:
     initial = ModelState.from_path(FIXTURES / "linear_initial_state.json")
     current = ModelState.from_json_obj(
@@ -114,6 +117,7 @@ def _build_linear_event(
             worker_id=worker_id,
             model_hash=state_digest(initial),
             inner_steps=20,
+            example_count=example_count,
             created_at=created_at,
         ),
         payload,
@@ -129,6 +133,7 @@ def _build_heartbeat(
     current_round: int = 7,
     run_name: str = "demo-run",
     heartbeat_interval: int = 60,
+    example_count: int | None = None,
     capabilities: tuple[str, ...] = ("gradient-event",),
     advertised_relays: tuple[str, ...] = (),
 ) -> dict[str, Any]:
@@ -138,6 +143,7 @@ def _build_heartbeat(
             worker_id=worker_id,
             current_round=current_round,
             heartbeat_interval=heartbeat_interval,
+            example_count=example_count,
             capabilities=capabilities,
             advertised_relays=advertised_relays,
             created_at=created_at,
@@ -615,15 +621,15 @@ class RelayTransportTests(unittest.TestCase):
             "parameters": {
                 "encoder.bias": {
                     "shape": [3],
-                    "values": [0.0115, -0.0225, 0.0325],
+                    "values": [0.00975, -0.02625, 0.03875],
                 },
                 "encoder.weight": {
                     "shape": [2, 3],
-                    "values": [0.17, -0.11, 0.295, 0.435, -0.535, 0.615],
+                    "values": [0.155, -0.14, 0.2875, 0.4675, -0.4925, 0.6325],
                 },
                 "head.weight": {
                     "shape": [1, 3],
-                    "values": [0.625, -0.25, 0.77],
+                    "values": [0.5875, -0.225, 0.795],
                 },
             }
         }
@@ -673,6 +679,8 @@ class RelayTransportTests(unittest.TestCase):
                 "worker-a",
                 "--model",
                 digest,
+                "--examples",
+                "1",
                 "--created-at",
                 "1700000001",
                 "--sec-key",
@@ -691,6 +699,8 @@ class RelayTransportTests(unittest.TestCase):
                 "worker-b",
                 "--model",
                 digest,
+                "--examples",
+                "3",
                 "--created-at",
                 "1700000002",
                 "--sec-key",
@@ -744,7 +754,14 @@ class RelayTransportTests(unittest.TestCase):
             self.assertEqual(sorted(collected_json["workers"]), ["worker-a", "worker-b"])
             self.assertEqual(collected_json["duplicates_discarded"], 0)
             self.assertEqual(collected_json["invalid_events"], 0)
+            self.assertTrue(collected_json["aggregation_weighted"])
+            self.assertEqual(collected_json["total_aggregation_weight"], 4)
             self.assertTrue(all(event["signed"] for event in collected_json["events"]))
+            weights_by_worker = {
+                event["worker"]: event["aggregation_weight"]
+                for event in collected_json["events"]
+            }
+            self.assertEqual(weights_by_worker, {"worker-a": 1, "worker-b": 3})
 
             self._run(
                 "aggregate-payloads",
@@ -790,6 +807,8 @@ class RelayTransportTests(unittest.TestCase):
             self.assertEqual(sorted(aggregation_summary_json["workers"]), ["worker-a", "worker-b"])
             self.assertEqual(aggregation_summary_json["completion_reason"], "limit")
             self.assertEqual(aggregation_summary_json["sync_strategy"], "timeout")
+            self.assertTrue(aggregation_summary_json["aggregation_weighted"])
+            self.assertEqual(aggregation_summary_json["total_aggregation_weight"], 4)
 
     def test_cli_collect_events_retry_flags_surface_retry_telemetry(self) -> None:
         event = _build_event(

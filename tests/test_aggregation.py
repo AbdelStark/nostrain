@@ -3,7 +3,11 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
-from nostrain.aggregation import aggregate_deltas, nesterov_outer_step
+from nostrain.aggregation import (
+    aggregate_deltas,
+    aggregate_weighted_deltas,
+    nesterov_outer_step,
+)
 from nostrain.model import ModelState, compute_delta
 from tests.helpers import assert_model_state_almost_equal
 
@@ -35,6 +39,43 @@ class AggregationTests(unittest.TestCase):
                         "head.weight": {
                             "shape": [1, 3],
                             "values": [0.625, -0.25, 0.77],
+                        },
+                    }
+                }
+            ),
+        )
+
+        assert_model_state_almost_equal(self, aggregated, expected, places=12)
+
+    def test_aggregate_weighted_deltas_respects_example_counts(self) -> None:
+        initial = ModelState.from_path(FIXTURES / "initial_state.json")
+        worker_a = ModelState.from_path(FIXTURES / "current_state.json")
+        worker_b = ModelState.from_path(FIXTURES / "current_state_peer.json")
+
+        delta_a = compute_delta(initial, worker_a)
+        delta_b = compute_delta(initial, worker_b)
+        aggregated = aggregate_weighted_deltas(
+            [
+                (delta_a, 1.0),
+                (delta_b, 3.0),
+            ]
+        )
+        expected = compute_delta(
+            initial,
+            ModelState.from_json_obj(
+                {
+                    "parameters": {
+                        "encoder.bias": {
+                            "shape": [3],
+                            "values": [0.00975, -0.02625, 0.03875],
+                        },
+                        "encoder.weight": {
+                            "shape": [2, 3],
+                            "values": [0.155, -0.14, 0.2875, 0.4675, -0.4925, 0.6325],
+                        },
+                        "head.weight": {
+                            "shape": [1, 3],
+                            "values": [0.5875, -0.225, 0.795],
                         },
                     }
                 }

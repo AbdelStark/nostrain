@@ -1,6 +1,11 @@
 """Core protocol tooling for nostrain."""
 
-from .aggregation import OuterStepResult, aggregate_deltas, nesterov_outer_step
+from .aggregation import (
+    OuterStepResult,
+    aggregate_deltas,
+    aggregate_weighted_deltas,
+    nesterov_outer_step,
+)
 from .compression import (
     CompressedGradientPayload,
     CompressionCodec,
@@ -233,6 +238,7 @@ __all__ = [
     "TrainingWorkerConfig",
     "add_states",
     "aggregate_deltas",
+    "aggregate_weighted_deltas",
     "apply_delta",
     "build_checkpoint_event",
     "build_gradient_event",

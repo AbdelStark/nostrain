@@ -36,6 +36,7 @@ class ProtocolTests(unittest.TestCase):
             worker_id="worker-pubkey",
             model_hash=state_digest(initial),
             inner_steps=250,
+            example_count=128,
             created_at=1_700_000_000,
         )
         event = build_gradient_event(
@@ -51,8 +52,10 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(parsed.metadata.round_index, metadata.round_index)
         self.assertEqual(parsed.metadata.worker_id, metadata.worker_id)
         self.assertEqual(parsed.metadata.model_hash, metadata.model_hash)
+        self.assertEqual(parsed.metadata.example_count, 128)
         self.assertEqual(parsed.payload.selected_values, payload.selected_values)
         self.assertEqual(parsed.event.tag_map()["compression"], payload.compression_label)
+        self.assertEqual(parsed.event.tag_map()["examples"], "128")
         self.assertEqual(parsed.event.event_id, parsed.event.fingerprint())
 
     def test_signed_heartbeat_roundtrip_preserves_worker_metadata(self) -> None:
@@ -62,6 +65,7 @@ class ProtocolTests(unittest.TestCase):
                 worker_id="worker-pubkey",
                 current_round=7,
                 heartbeat_interval=45,
+                example_count=64,
                 capabilities=("gradient-event", "signed-events"),
                 advertised_relays=("ws://127.0.0.1:8765",),
                 created_at=1_700_000_100,
@@ -76,6 +80,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(parsed.metadata.worker_id, "worker-pubkey")
         self.assertEqual(parsed.metadata.current_round, 7)
         self.assertEqual(parsed.metadata.heartbeat_interval, 45)
+        self.assertEqual(parsed.metadata.example_count, 64)
         self.assertEqual(
             parsed.metadata.capabilities,
             ("gradient-event", "signed-events"),

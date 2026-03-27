@@ -15,14 +15,26 @@ class OuterStepResult:
 
 
 def aggregate_deltas(deltas: Iterable[ModelState]) -> ModelState:
-    delta_list = list(deltas)
-    if not delta_list:
-        raise ValueError("at least one delta is required for aggregation")
+    return aggregate_weighted_deltas((delta, 1.0) for delta in deltas)
 
-    running = delta_list[0]
-    for delta in delta_list[1:]:
-        running = add_states(running, delta)
-    return scale_state(running, 1.0 / len(delta_list))
+
+def aggregate_weighted_deltas(
+    weighted_deltas: Iterable[tuple[ModelState, float]],
+) -> ModelState:
+    running: ModelState | None = None
+    total_weight = 0.0
+
+    for delta, raw_weight in weighted_deltas:
+        weight = float(raw_weight)
+        if weight <= 0:
+            raise ValueError("aggregation weights must be positive")
+        total_weight += weight
+        weighted_delta = scale_state(delta, weight)
+        running = weighted_delta if running is None else add_states(running, weighted_delta)
+
+    if running is None:
+        raise ValueError("at least one delta is required for aggregation")
+    return scale_state(running, 1.0 / total_weight)
 
 
 def nesterov_outer_step(

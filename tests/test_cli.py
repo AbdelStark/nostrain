@@ -141,6 +141,8 @@ class CliWorkflowTests(unittest.TestCase):
                 digest,
                 "--steps",
                 "500",
+                "--examples",
+                "11",
                 "--created-at",
                 "1700000000",
                 "--sec-key",
@@ -158,6 +160,8 @@ class CliWorkflowTests(unittest.TestCase):
             self.assertTrue(summary["signed"])
             self.assertEqual(summary["signing_state"], "signed")
             self.assertEqual(summary["pubkey"], TEST_PUBLIC_KEY)
+            self.assertEqual(summary["example_count"], 11)
+            self.assertEqual(summary["aggregation_weight"], 11)
             self.assertEqual(len(summary["event_id"]), 64)
 
             self._run(
@@ -168,6 +172,8 @@ class CliWorkflowTests(unittest.TestCase):
                 "7",
                 "--worker",
                 "worker-pubkey",
+                "--examples",
+                "13",
                 "--capability",
                 "gradient-event",
                 "--advertise-relay",
@@ -192,6 +198,7 @@ class CliWorkflowTests(unittest.TestCase):
             self.assertEqual(heartbeat_summary["round"], 7)
             self.assertEqual(heartbeat_summary["worker"], "worker-pubkey")
             self.assertEqual(heartbeat_summary["heartbeat_interval"], 60)
+            self.assertEqual(heartbeat_summary["example_count"], 13)
             self.assertEqual(heartbeat_summary["capabilities"], ["gradient-event"])
             self.assertEqual(
                 heartbeat_summary["advertised_relays"],

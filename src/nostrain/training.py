@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .aggregation import aggregate_deltas, nesterov_outer_step
+from .aggregation import aggregate_weighted_deltas, nesterov_outer_step
 from .compression import CompressionCodec, compress_delta, decompress_payload
 from .model import (
     ModelState,
@@ -254,6 +254,7 @@ class LateGradientRecord:
     event_id: str
     created_at: int
     model_hash: str
+    example_count: int | None = None
     payload: str | None = None
     reconciliation_round: int | None = None
     reconciliation_model_hash_before: str | None = None
@@ -280,6 +281,8 @@ class LateGradientRecord:
             "created_at": self.created_at,
             "model_hash": self.model_hash,
         }
+        if self.example_count is not None:
+            data["example_count"] = self.example_count
         if self.payload is not None:
             data["payload"] = self.payload
         if self.reconciliation_round is not None:
@@ -302,6 +305,7 @@ class LateGradientRecord:
             event_id=str(data["event_id"]),
             created_at=int(data["created_at"]),
             model_hash=str(data["model_hash"]),
+            example_count=int(data["example_count"]) if data.get("example_count") is not None else None,
             payload=str(data["payload"]) if data.get("payload") is not None else None,
             reconciliation_round=(
                 int(data["reconciliation_round"])
@@ -338,6 +342,8 @@ class LateGradientReconciliationSummary:
     model_hash_before: str
     model_hash_after: str
     applied_at: int
+    total_aggregation_weight: int = 0
+    aggregation_weighted: bool = False
 
     def to_json_obj(self) -> dict[str, Any]:
         return {
@@ -350,6 +356,8 @@ class LateGradientReconciliationSummary:
             "momentum": self.momentum,
             "model_hash_before": self.model_hash_before,
             "model_hash_after": self.model_hash_after,
+            "total_aggregation_weight": self.total_aggregation_weight,
+            "aggregation_weighted": self.aggregation_weighted,
             "applied_at": self.applied_at,
         }
 
@@ -367,6 +375,8 @@ class LateGradientReconciliationSummary:
             momentum=float(data["momentum"]),
             model_hash_before=str(data["model_hash_before"]),
             model_hash_after=str(data["model_hash_after"]),
+            total_aggregation_weight=int(data.get("total_aggregation_weight", 0)),
+            aggregation_weighted=bool(data.get("aggregation_weighted", False)),
             applied_at=int(data["applied_at"]),
         )
 
@@ -392,10 +402,14 @@ class TrainingRoundSummary:
     published_checkpoint_relays: tuple[str, ...]
     collected_from_relays: tuple[str, ...]
     failed_relays: tuple[str, ...]
+    local_example_count: int = 0
+    total_aggregation_weight: int = 0
+    aggregation_weighted: bool = False
     relay_retry_count: int = 0
     max_relay_attempt_count: int = 1
     retried_relays: tuple[str, ...] = ()
     reconciled_late_gradient_count: int = 0
+    reconciled_late_aggregation_weight: int = 0
     reconciled_late_workers: tuple[str, ...] = ()
     reconciled_late_rounds: tuple[int, ...] = ()
     late_reconciliation_model_hash_before: str = ""
@@ -428,10 +442,14 @@ class TrainingRoundSummary:
             "published_checkpoint_relays": list(self.published_checkpoint_relays),
             "collected_from_relays": list(self.collected_from_relays),
             "failed_relays": list(self.failed_relays),
+            "local_example_count": self.local_example_count,
+            "total_aggregation_weight": self.total_aggregation_weight,
+            "aggregation_weighted": self.aggregation_weighted,
             "relay_retry_count": self.relay_retry_count,
             "max_relay_attempt_count": self.max_relay_attempt_count,
             "retried_relays": list(self.retried_relays),
             "reconciled_late_gradient_count": self.reconciled_late_gradient_count,
+            "reconciled_late_aggregation_weight": self.reconciled_late_aggregation_weight,
             "reconciled_late_workers": list(self.reconciled_late_workers),
             "reconciled_late_rounds": list(self.reconciled_late_rounds),
             "late_reconciliation_model_hash_before": self.late_reconciliation_model_hash_before,
@@ -471,10 +489,16 @@ class TrainingRoundSummary:
                 str(relay) for relay in data.get("collected_from_relays", [])
             ),
             failed_relays=tuple(str(relay) for relay in data.get("failed_relays", [])),
+            local_example_count=int(data.get("local_example_count", 0)),
+            total_aggregation_weight=int(data.get("total_aggregation_weight", 0)),
+            aggregation_weighted=bool(data.get("aggregation_weighted", False)),
             relay_retry_count=int(data.get("relay_retry_count", 0)),
             max_relay_attempt_count=int(data.get("max_relay_attempt_count", 1)),
             retried_relays=tuple(str(relay) for relay in data.get("retried_relays", [])),
             reconciled_late_gradient_count=int(data.get("reconciled_late_gradient_count", 0)),
+            reconciled_late_aggregation_weight=int(
+                data.get("reconciled_late_aggregation_weight", 0)
+            ),
             reconciled_late_workers=tuple(
                 str(worker) for worker in data.get("reconciled_late_workers", [])
             ),
@@ -814,6 +838,11 @@ def _merge_late_gradient_record(
         event_id=existing.event_id,
         created_at=max(existing.created_at, incoming.created_at),
         model_hash=existing.model_hash or incoming.model_hash,
+        example_count=(
+            existing.example_count
+            if existing.example_count is not None
+            else incoming.example_count
+        ),
         payload=existing.payload if existing.payload is not None else incoming.payload,
         reconciliation_round=(
             existing.reconciliation_round
@@ -895,7 +924,7 @@ def _reconcile_late_gradients(
         record.event_id: index for index, record in enumerate(updated_records)
     }
     validated_records: list[LateGradientRecord] = []
-    validated_deltas: list[ModelState] = []
+    validated_deltas: list[tuple[LateGradientRecord, ModelState]] = []
     error_count = 0
 
     for record in pending_records:
@@ -910,6 +939,7 @@ def _reconcile_late_gradients(
                 event_id=record.event_id,
                 created_at=record.created_at,
                 model_hash=record.model_hash,
+                example_count=record.example_count,
                 payload=record.payload,
                 reconciliation_round=record.reconciliation_round,
                 reconciliation_model_hash_before=record.reconciliation_model_hash_before,
@@ -918,7 +948,7 @@ def _reconcile_late_gradients(
             )
             continue
         validated_records.append(record)
-        validated_deltas.append(delta)
+        validated_deltas.append((record, delta))
 
     if not validated_records:
         return _LateGradientReconciliationOutcome(
@@ -932,9 +962,14 @@ def _reconcile_late_gradients(
     learning_rate = config.effective_late_reconciliation_learning_rate
     momentum = config.effective_late_reconciliation_momentum
     model_hash_before = state_digest(current_state)
+    total_aggregation_weight = sum(record.example_count or 1 for record, _ in validated_deltas)
+    aggregation_weighted = any(record.example_count is not None for record, _ in validated_deltas)
     outer_result = nesterov_outer_step(
         current_state,
-        aggregate_deltas(validated_deltas),
+        aggregate_weighted_deltas(
+            (delta, float(record.example_count or 1))
+            for record, delta in validated_deltas
+        ),
         learning_rate=learning_rate,
         momentum=momentum,
         previous_momentum=current_momentum,
@@ -948,6 +983,7 @@ def _reconcile_late_gradients(
             event_id=record.event_id,
             created_at=record.created_at,
             model_hash=record.model_hash,
+            example_count=record.example_count,
             payload=record.payload,
             reconciliation_round=current_round,
             reconciliation_model_hash_before=model_hash_before,
@@ -973,6 +1009,8 @@ def _reconcile_late_gradients(
             momentum=momentum,
             model_hash_before=model_hash_before,
             model_hash_after=model_hash_after,
+            total_aggregation_weight=total_aggregation_weight,
+            aggregation_weighted=aggregation_weighted,
             applied_at=int(time.time()),
         ),
         error_count=error_count,
@@ -1039,6 +1077,7 @@ async def run_training_session(
                         event_id=event.event_id,
                         created_at=event.parsed.event.created_at,
                         model_hash=event.parsed.metadata.model_hash,
+                        example_count=event.parsed.metadata.example_count,
                         payload=event.parsed.event.content,
                     )
                     for event in late_collection.events
@@ -1072,6 +1111,7 @@ async def run_training_session(
                 worker_id=config.worker_id,
                 current_round=round_index,
                 heartbeat_interval=config.heartbeat_interval,
+                example_count=dataset.example_count,
                 capabilities=("gradient-event", runtime_name),
                 advertised_relays=config.advertised_relays or config.relay_urls,
                 created_at=round_start,
@@ -1112,6 +1152,7 @@ async def run_training_session(
                 worker_id=config.worker_id,
                 model_hash=state_digest(current_state),
                 inner_steps=config.inner_steps,
+                example_count=local_training.example_count,
                 created_at=max(round_start, int(time.time())),
             ),
             payload,
@@ -1209,11 +1250,19 @@ async def run_training_session(
             published_checkpoint_relays=(),
             collected_from_relays=collection.successful_relays,
             failed_relays=(),
+            local_example_count=local_training.example_count,
+            total_aggregation_weight=collection.total_aggregation_weight,
+            aggregation_weighted=collection.aggregation_weighted,
             relay_retry_count=round_retry_count,
             max_relay_attempt_count=round_max_attempt_count,
             retried_relays=round_retried_relays,
             reconciled_late_gradient_count=(
                 late_reconciliation.summary.event_count
+                if late_reconciliation.summary is not None
+                else 0
+            ),
+            reconciled_late_aggregation_weight=(
+                late_reconciliation.summary.total_aggregation_weight
                 if late_reconciliation.summary is not None
                 else 0
             ),
@@ -1329,11 +1378,19 @@ async def run_training_session(
                 failed_relays=tuple(
                     relay_url for relay_url in config.relay_urls if relay_url in failed_relay_urls
                 ),
+                local_example_count=local_training.example_count,
+                total_aggregation_weight=collection.total_aggregation_weight,
+                aggregation_weighted=collection.aggregation_weighted,
                 relay_retry_count=final_round_retry_count,
                 max_relay_attempt_count=final_max_attempt_count,
                 retried_relays=final_retried_relays,
                 reconciled_late_gradient_count=(
                     late_reconciliation.summary.event_count
+                    if late_reconciliation.summary is not None
+                    else 0
+                ),
+                reconciled_late_aggregation_weight=(
+                    late_reconciliation.summary.total_aggregation_weight
                     if late_reconciliation.summary is not None
                     else 0
                 ),

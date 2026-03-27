@@ -31,6 +31,7 @@ class GradientEventMetadata:
     worker_id: str
     model_hash: str
     inner_steps: int = 500
+    example_count: int | None = None
     created_at: int | None = None
 
     def __post_init__(self) -> None:
@@ -44,6 +45,8 @@ class GradientEventMetadata:
             raise ValueError("model hash cannot be empty")
         if self.inner_steps <= 0:
             raise ValueError("inner step count must be positive")
+        if self.example_count is not None and self.example_count <= 0:
+            raise ValueError("example count must be positive when provided")
 
     @property
     def parameterized_identifier(self) -> str:
@@ -62,6 +65,7 @@ class HeartbeatEventMetadata:
     worker_id: str
     current_round: int
     heartbeat_interval: int = 60
+    example_count: int | None = None
     capabilities: tuple[str, ...] = ()
     advertised_relays: tuple[str, ...] = ()
     created_at: int | None = None
@@ -75,6 +79,8 @@ class HeartbeatEventMetadata:
             raise ValueError("current round must be non-negative")
         if self.heartbeat_interval <= 0:
             raise ValueError("heartbeat interval must be positive")
+        if self.example_count is not None and self.example_count <= 0:
+            raise ValueError("example count must be positive when provided")
         object.__setattr__(
             self,
             "capabilities",
@@ -392,7 +398,7 @@ def build_gradient_event(
     aux_rand: bytes | None = None,
 ) -> NostrainEvent:
     payload_metadata = payload if isinstance(payload, CompressedGradientPayload) else inspect_payload(payload)
-    tags: tuple[NostrTag, ...] = (
+    tags: list[NostrTag] = [
         ("d", metadata.parameterized_identifier),
         ("t", NOSTRAIN_MARKER),
         ("run", metadata.run_name),
@@ -404,11 +410,13 @@ def build_gradient_event(
         ("params", str(payload_metadata.parameter_count)),
         ("values", str(payload_metadata.total_values)),
         ("selected", str(payload_metadata.selected_values)),
-    )
+    ]
+    if metadata.example_count is not None:
+        tags.append(("examples", str(metadata.example_count)))
     return _build_signable_event(
         kind=NOSTRAIN_GRADIENT_KIND,
         created_at=metadata.resolved_created_at,
-        tags=tags,
+        tags=tuple(tags),
         content=payload_metadata.payload,
         secret_key_hex=secret_key_hex,
         public_key_hex=public_key_hex,
@@ -435,6 +443,8 @@ def build_heartbeat_event(
         ("round", str(metadata.current_round)),
         ("heartbeat", str(metadata.heartbeat_interval)),
     ]
+    if metadata.example_count is not None:
+        tags.append(("examples", str(metadata.example_count)))
     tags.extend(("capability", capability) for capability in metadata.capabilities)
     tags.extend(("relay", relay_url) for relay_url in metadata.advertised_relays)
     return _build_signable_event(
@@ -549,6 +559,7 @@ def parse_gradient_event(data: NostrainEvent | dict[str, Any]) -> ParsedGradient
         worker_id=tags["worker"],
         model_hash=tags["model"],
         inner_steps=int(tags["steps"]),
+        example_count=int(tags["examples"]) if "examples" in tags else None,
         created_at=event.created_at,
     )
     if tags["d"] != metadata.parameterized_identifier:
@@ -581,6 +592,7 @@ def parse_heartbeat_event(data: NostrainEvent | dict[str, Any]) -> ParsedHeartbe
         worker_id=tags["worker"],
         current_round=int(tags["round"]),
         heartbeat_interval=int(tags["heartbeat"]),
+        example_count=int(tags["examples"]) if "examples" in tags else None,
         capabilities=event.tag_values("capability"),
         advertised_relays=event.tag_values("relay"),
         created_at=event.created_at,

@@ -7,7 +7,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from nostrain.model import ModelState
+from nostrain.compression import compress_delta
+from nostrain.model import ModelState, compute_delta, state_digest
 from nostrain.runtime import (
     NUMPY_TRAINING_BACKEND,
     PYTHON_TRAINING_BACKEND,
@@ -22,6 +23,8 @@ from nostrain.training import (
     RegressionDataset,
     TrainingCheckpoint,
     TrainingRoundSummary,
+    TrainingWorkerConfig,
+    _reconcile_late_gradients,
     evaluate_linear_regression,
     evaluate_regression,
     initialize_mlp_regression_state,
@@ -537,6 +540,10 @@ class TrainingRuntimeTests(unittest.TestCase):
                     published_checkpoint_relays=(),
                     collected_from_relays=("ws://127.0.0.1:8765",),
                     failed_relays=(),
+                    local_example_count=4,
+                    total_aggregation_weight=4,
+                    aggregation_weighted=True,
+                    reconciled_late_aggregation_weight=3,
                 ),
             ),
             late_gradients=(
@@ -546,6 +553,7 @@ class TrainingRuntimeTests(unittest.TestCase):
                     event_id="e" * 64,
                     created_at=1_700_000_000,
                     model_hash="f" * 64,
+                    example_count=3,
                     payload="payload-1",
                     reconciliation_round=1,
                     reconciliation_model_hash_before="1" * 64,
@@ -563,6 +571,8 @@ class TrainingRuntimeTests(unittest.TestCase):
                     momentum=0.9,
                     model_hash_before="1" * 64,
                     model_hash_after="2" * 64,
+                    total_aggregation_weight=3,
+                    aggregation_weighted=True,
                     applied_at=1_700_000_050,
                 ),
             ),
@@ -576,13 +586,112 @@ class TrainingRuntimeTests(unittest.TestCase):
         self.assertEqual(restored.rounds_completed, 1)
         self.assertEqual(len(restored.late_gradients), 1)
         self.assertEqual(restored.late_gradients[0].worker_id, "worker-b")
+        self.assertEqual(restored.late_gradients[0].example_count, 3)
         self.assertEqual(restored.late_gradients[0].payload, "payload-1")
         self.assertEqual(restored.late_gradients[0].reconciliation_round, 1)
         self.assertEqual(restored.late_gradients[0].reconciliation_model_hash_after, "2" * 64)
         self.assertEqual(len(restored.late_reconciliations), 1)
         self.assertEqual(restored.late_reconciliations[0].event_count, 1)
         self.assertEqual(restored.late_reconciliations[0].worker_ids, ("worker-b",))
+        self.assertEqual(restored.late_reconciliations[0].total_aggregation_weight, 3)
+        self.assertTrue(restored.late_reconciliations[0].aggregation_weighted)
+        self.assertEqual(restored.rounds[0].local_example_count, 4)
+        self.assertEqual(restored.rounds[0].total_aggregation_weight, 4)
+        self.assertTrue(restored.rounds[0].aggregation_weighted)
+        self.assertEqual(restored.rounds[0].reconciled_late_aggregation_weight, 3)
         self.assertEqual(restored.runtime_name, "mlp-regression")
+
+    def test_reconcile_late_gradients_weights_by_example_count(self) -> None:
+        initial = ModelState.from_path(FIXTURES / "initial_state.json")
+        delta_a = compute_delta(initial, ModelState.from_path(FIXTURES / "current_state.json"))
+        delta_b = compute_delta(initial, ModelState.from_path(FIXTURES / "current_state_peer.json"))
+        records = [
+            LateGradientRecord(
+                round_index=0,
+                worker_id="worker-a",
+                event_id="a" * 64,
+                created_at=1_700_000_000,
+                model_hash=state_digest(initial),
+                example_count=1,
+                payload=compress_delta(delta_a, topk_ratio=1.0).payload,
+            ),
+            LateGradientRecord(
+                round_index=0,
+                worker_id="worker-b",
+                event_id="b" * 64,
+                created_at=1_700_000_001,
+                model_hash=state_digest(initial),
+                example_count=3,
+                payload=compress_delta(delta_b, topk_ratio=1.0).payload,
+            ),
+        ]
+
+        outcome = _reconcile_late_gradients(
+            initial,
+            None,
+            records,
+            current_round=1,
+            config=TrainingWorkerConfig(
+                run_name="demo-run",
+                relay_urls=("ws://127.0.0.1:8765",),
+                worker_id="worker-z",
+                secret_key_hex="1" * 64,
+                late_gradient_strategy="deferred",
+                late_reconciliation_learning_rate=1.0,
+                late_reconciliation_momentum=0.0,
+            ),
+        )
+
+        expected_state = ModelState.from_json_obj(
+            {
+                "parameters": {
+                    "encoder.bias": {
+                        "shape": [3],
+                        "values": [0.00975, -0.02625, 0.03875],
+                    },
+                    "encoder.weight": {
+                        "shape": [2, 3],
+                        "values": [0.155, -0.14, 0.2875, 0.4675, -0.4925, 0.6325],
+                    },
+                    "head.weight": {
+                        "shape": [1, 3],
+                        "values": [0.5875, -0.225, 0.795],
+                    },
+                }
+            }
+        )
+        equal_weight_state = ModelState.from_json_obj(
+            {
+                "parameters": {
+                    "encoder.bias": {
+                        "shape": [3],
+                        "values": [0.0115, -0.0225, 0.0325],
+                    },
+                    "encoder.weight": {
+                        "shape": [2, 3],
+                        "values": [0.17, -0.11, 0.295, 0.435, -0.535, 0.615],
+                    },
+                    "head.weight": {
+                        "shape": [1, 3],
+                        "values": [0.625, -0.25, 0.77],
+                    },
+                }
+            }
+        )
+
+        assert_model_state_almost_equal(self, outcome.current_state, expected_state, places=3)
+        self.assertIsNotNone(outcome.summary)
+        self.assertEqual(outcome.summary.total_aggregation_weight, 4)
+        self.assertTrue(outcome.summary.aggregation_weighted)
+        head_weight = outcome.current_state.parameter_map()["head.weight"].values[0]
+        self.assertLess(
+            abs(head_weight - expected_state.parameter_map()["head.weight"].values[0]),
+            abs(head_weight - equal_weight_state.parameter_map()["head.weight"].values[0]),
+        )
+        self.assertEqual(
+            [record.reconciliation_round for record in outcome.late_gradients],
+            [1, 1],
+        )
 
 
 if __name__ == "__main__":

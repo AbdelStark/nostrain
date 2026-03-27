@@ -45,6 +45,9 @@ flowchart LR
   double-precision values.
 - Every accepted gradient, heartbeat, and checkpoint event must parse and
   validate before it is admitted into collection results.
+- Gradient aggregation uses an example-weighted mean when events advertise
+  example counts, otherwise it falls back to one vote per worker for backward
+  compatibility with older publishers.
 - A collection keeps only one event per worker identity for a run/round
   identity, preferring newer events and then smaller event IDs as a tiebreaker.
 - Checkpoint content must agree with checkpoint tags and model hashes.

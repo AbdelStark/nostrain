@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .aggregation import aggregate_deltas, nesterov_outer_step
+from .aggregation import aggregate_weighted_deltas, nesterov_outer_step
 from .compression import CompressionCodec, compress_delta, decompress_payload
 from .crypto import secret_key_to_public_key
 from .model import ModelState, apply_delta, compute_delta, state_digest
@@ -352,6 +352,7 @@ def _handle_build_event(args: argparse.Namespace) -> int:
         worker_id=_resolve_worker_id(args),
         model_hash=args.model,
         inner_steps=args.steps,
+        example_count=args.examples,
         created_at=args.created_at,
     )
     event = build_gradient_event(
@@ -372,6 +373,7 @@ def _handle_build_heartbeat(args: argparse.Namespace) -> int:
         worker_id=_resolve_worker_id(args),
         current_round=args.round,
         heartbeat_interval=args.heartbeat_interval,
+        example_count=args.examples,
         capabilities=tuple(args.capability or ("gradient-event",)),
         advertised_relays=tuple(args.advertise_relay or ()),
         created_at=args.created_at,
@@ -464,6 +466,10 @@ def _handle_publish_event(args: argparse.Namespace) -> int:
 
 
 def _load_delta_input(path: str | Path) -> ModelState:
+    return _load_weighted_delta_input(path)[0]
+
+
+def _load_weighted_delta_input(path: str | Path) -> tuple[ModelState, int]:
     raw_text = Path(path).read_text(encoding="utf-8").strip()
     if not raw_text:
         raise ValueError("delta input file is empty")
@@ -472,17 +478,19 @@ def _load_delta_input(path: str | Path) -> ModelState:
         if not isinstance(data, dict):
             raise ValueError("delta input JSON must be an object")
         if "parameters" in data:
-            return ModelState.from_json_obj(data)
+            return ModelState.from_json_obj(data), 1
         if {"kind", "created_at", "tags", "content"} <= data.keys():
-            return decompress_payload(parse_gradient_event(data).payload)
+            parsed = parse_gradient_event(data)
+            return decompress_payload(parsed.payload), parsed.metadata.example_count or 1
         if "payload" in data:
-            return decompress_payload(str(data["payload"]))
-    return decompress_payload(raw_text)
+            return decompress_payload(str(data["payload"])), 1
+    return decompress_payload(raw_text), 1
 
 
 def _handle_aggregate_payloads(args: argparse.Namespace) -> int:
-    deltas = [_load_delta_input(path) for path in args.inputs]
-    aggregated = aggregate_deltas(deltas)
+    aggregated = aggregate_weighted_deltas(
+        _load_weighted_delta_input(path) for path in args.inputs
+    )
     _write_json(args.output, aggregated.to_json_obj())
     return 0
 
@@ -699,6 +707,9 @@ def _collection_summary(collection: Any) -> str:
             f"invalid_events: {collection.invalid_events}",
             f"sync_strategy: {collection.sync_strategy}",
             f"completion_reason: {collection.completion_reason}",
+            "aggregation: "
+            + ("weighted-by-examples" if collection.aggregation_weighted else "mean"),
+            f"total_aggregation_weight: {collection.total_aggregation_weight}",
             *_retry_summary_lines(collection),
         ]
     )
@@ -944,6 +955,8 @@ def _event_summary(path: str | Path) -> dict[str, Any]:
                 "round": parsed.metadata.round_index,
                 "model": parsed.metadata.model_hash,
                 "steps": parsed.metadata.inner_steps,
+                "example_count": parsed.metadata.example_count,
+                "aggregation_weight": parsed.metadata.example_count or 1,
                 "compression": parsed.payload.compression_label,
                 "parameter_count": parsed.payload.parameter_count,
                 "total_values": parsed.payload.total_values,
@@ -971,6 +984,7 @@ def _event_summary(path: str | Path) -> dict[str, Any]:
                 "run": parsed.metadata.run_name,
                 "round": parsed.metadata.current_round,
                 "heartbeat_interval": parsed.metadata.heartbeat_interval,
+                "example_count": parsed.metadata.example_count,
                 "capabilities": list(parsed.metadata.capabilities),
                 "advertised_relays": list(parsed.metadata.advertised_relays),
             }
@@ -1001,6 +1015,9 @@ def _handle_inspect_event(args: argparse.Namespace) -> int:
             [
                 f"model: {summary['model']}",
                 f"steps: {summary['steps']}",
+                "example_count: "
+                + (str(summary["example_count"]) if summary["example_count"] is not None else "-"),
+                f"aggregation_weight: {summary['aggregation_weight']}",
                 f"compression: {summary['compression']}",
                 f"parameter_count: {summary['parameter_count']}",
                 f"selected_values: {summary['selected_values']}/{summary['total_values']}",
@@ -1028,6 +1045,8 @@ def _handle_inspect_event(args: argparse.Namespace) -> int:
         lines.extend(
             [
                 f"heartbeat_interval: {summary['heartbeat_interval']}",
+                "example_count: "
+                + (str(summary["example_count"]) if summary["example_count"] is not None else "-"),
                 "capabilities: "
                 + (", ".join(summary["capabilities"]) if summary["capabilities"] else "-"),
                 "advertised_relays: "
@@ -1152,7 +1171,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     aggregate_payloads = subparsers.add_parser(
         "aggregate-payloads",
-        help="Average one or more payloads or decoded delta JSON files into a single delta.",
+        help="Aggregate payloads or delta files, using example-count weights when event metadata includes them.",
     )
     aggregate_payloads.add_argument(
         "inputs",
@@ -1190,6 +1209,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=500,
         help="Inner training steps represented by this payload (default: 500).",
+    )
+    build_event.add_argument(
+        "--examples",
+        type=int,
+        help="Optional example count represented by this gradient for weighted aggregation.",
     )
     build_event.add_argument(
         "--sec-key",
@@ -1230,6 +1254,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=60,
         help="Expected heartbeat cadence in seconds (default: 60).",
+    )
+    build_heartbeat.add_argument(
+        "--examples",
+        type=int,
+        help="Optional local example count to advertise for weighting-aware discovery.",
     )
     build_heartbeat.add_argument(
         "--capability",
@@ -1756,7 +1785,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     aggregate_round = subparsers.add_parser(
         "aggregate-round",
-        help="Collect one run/round from a relay and aggregate the embedded worker deltas.",
+        help="Collect one run/round from relays and aggregate worker deltas, weighting by example counts when present.",
     )
     aggregate_round.add_argument(
         "--relay",
