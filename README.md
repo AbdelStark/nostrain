@@ -86,15 +86,145 @@ nostrain run-training model.json data.json \
 
 Workers discover each other via heartbeat events and sync automatically.
 
-## Demo
+## Demo: distributed GPT training over Nostr
 
-Run the full 4-worker demo locally with a single command:
+The repo ships a complete demo that trains a character-level GPT on Shakespeare. Four workers each get a different slice of the text. No single worker sees the full corpus — they have to collaborate through the relay to learn the language.
+
+```bash
+pip install -e ".[torch]"
+bash demo/gpt/run.sh
+```
+
+Or run headless (no tmux, everything in-process):
+
+```bash
+PYTHONPATH=. python demo/gpt/train.py --rounds 5 --inner-steps 100
+```
+
+### The model
+
+The model in `demo/gpt/model.py` is a standard decoder-only transformer — the same architecture behind GPT-2, GPT-3, and every modern LLM, just smaller. Here's what's inside:
+
+```
+CharGPT (834K params)
+├── tok_emb    Embedding(96, 128)     — maps each character to a 128-dim vector
+├── pos_emb    Embedding(128, 128)    — learned position encodings (context = 128 chars)
+├── blocks     4 × TransformerBlock
+│   ├── ln_1   LayerNorm              — normalize before attention
+│   ├── attn   CausalSelfAttention    — 4 heads, each 32-dim, masked so tokens
+│   │          ├── c_attn  Linear(128, 384)  — project to Q, K, V in one shot
+│   │          └── c_proj  Linear(128, 128)  — project attention output back
+│   ├── ln_2   LayerNorm              — normalize before FFN
+│   └── mlp    FFN                    — Linear(128, 512) → GELU → Linear(512, 128)
+├── ln_f       LayerNorm              — final norm
+└── head       Linear(128, 96)        — predict next character (96 = printable ASCII)
+```
+
+The input is a sequence of characters. Each character becomes a 128-dimensional embedding, gets a position encoding added, then flows through 4 transformer blocks. Each block runs **causal self-attention** (every token can only look at tokens before it — this is what makes it autoregressive) followed by a feed-forward network. The output is a probability distribution over the next character.
+
+96 vocabulary tokens (printable ASCII), 128-dimensional embeddings, 4 layers, 4 attention heads, 128 context length. Total: **834,048 parameters**. Small enough to train on a CPU in minutes, large enough to learn non-trivial language structure.
+
+### How the distributed training works
+
+This is [DiLoCo](https://arxiv.org/abs/2311.08105) (Distributed Low-Communication Learning) — the same algorithm Google used to train language models across poorly-connected datacenters. The idea is beautifully simple:
+
+**Inner loop (local).** Each worker trains independently on its own data shard using standard AdamW. This is regular gradient descent — nothing special. Each worker runs 100 steps, sees different text, learns different things.
+
+**Pseudo-gradient.** After local training, each worker computes `delta = trained_params - initial_params`. This is the "pseudo-gradient" — a summary of what the worker learned in that round. Unlike real gradients (which are instantaneous slopes), pseudo-gradients capture the cumulative effect of many training steps.
+
+**Compression.** The pseudo-gradient has 834K float values. We compress it:
+1. **Top-k sparsification** (keep only the 30% largest values by magnitude)
+2. **int8 quantization** (scale to [-127, 127])
+3. **zlib compression**
+
+Result: ~580KB per gradient event. This gets published as a Nostr event.
+
+**Transport.** The compressed pseudo-gradient is packed into a NIP-01 event (kind `33333`), signed with a BIP340 Schnorr signature, and published to the relay. Workers also publish heartbeat events (kind `33334`) so they can discover each other. All standard Nostr — any relay works.
+
+**Outer loop (aggregation).** Each worker subscribes to the relay, collects all peer gradients for the current round, decompresses them, and computes the **mean** across all workers. This averaged pseudo-gradient is applied using **Nesterov momentum** — a second-order update that looks ahead before stepping, converging faster than plain SGD.
+
+Then the cycle repeats.
+
+### What you'll see
+
+The text evolves from random garbage to recognizable English over 5 rounds:
+
+**Round 0 (random init):**
+```
+ROMEO:2NYPp@JTb<;2..qce[vP[qIto9TxFwIHb)D~?>o9[**c!$/?Z"yiFxy
+```
+
+**Round 1 (after first sync):**
+```
+ROMEO: Maf A1Exs w molinounan, sthat pine ted mes I chat, y hethanalher
+```
+
+**Round 3:**
+```
+ROMEO: Whe do he sthe senond pare at o pro ther fakis clotinthont se path
+```
+
+**Round 5:**
+```
+ROMEO: d I shes mear to the ce withat, tre so ther wisho sheath. do wiso
+me ifon ithid An w'd onke r wour sple y thenoreancpe ay ak, hire d hie
+```
+
+Loss drops from ~4.5 to ~2.4. The model starts recognizing common English patterns — "the", "that", "ther", "and" — and begins forming word-like structures. It's not Shakespeare yet (you'd need more parameters and more training), but the trajectory is clear: the four workers, each seeing only 25% of the text, collaboratively learn the structure of the language by exchanging compressed updates through a Nostr relay.
+
+### How nostrain maps to the training loop
+
+Each round in the demo executes this exact sequence of nostrain operations:
+
+```python
+# 1. Publish heartbeat so peers can discover us
+heartbeat = build_heartbeat_event(metadata, secret_key_hex=key)
+await publish_nostrain_events(relay_urls, heartbeat)
+
+# 2. Train locally with PyTorch (standard autograd)
+optimizer = AdamW(model.parameters(), lr=3e-4)
+for step in range(100):
+    x, y = dataset.get_batch(32)
+    loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+
+# 3. Compute pseudo-gradient: what did local training change?
+trained_state = model_state_from_module(model)   # nn.Module → ModelState
+delta = compute_delta(initial_state, trained_state)
+
+# 4. Compress and publish as signed Nostr event
+payload = compress_delta(delta, topk_ratio=0.3)   # 834K → 250K values, int8
+event = build_gradient_event(payload, metadata, secret_key_hex=key)
+await publish_nostrain_events(relay_urls, event)   # → relay
+
+# 5. Collect peer gradients from relay
+collection = await collect_gradient_events_across_relays(
+    relay_urls, run_name=run, round_index=round_idx,
+    idle_timeout=12.0, strategy="timeout", discover_workers=True,
+)
+
+# 6. Aggregate and apply outer step
+outer = nesterov_outer_step(
+    initial_state, collection.aggregate_delta(),
+    learning_rate=0.7, momentum=0.9,
+)
+
+# 7. Load updated state back into PyTorch model
+load_state_into_module(outer.next_state, model)
+```
+
+The PyTorch training (step 2) is completely standard — nostrain doesn't touch your model architecture, optimizer, or loss function. It only cares about the state before and after. Everything between `model_state_from_module` and `load_state_into_module` is framework-agnostic: the compression, signing, relay transport, aggregation, and outer step all operate on flat parameter tensors. You could swap PyTorch for MLX, JAX, or a pure-numpy implementation and the transport layer wouldn't change.
+
+### A simpler demo (linear regression)
+
+If you want something faster to verify the setup, there's also a linear regression demo:
 
 ```bash
 bash demo/run.sh
 ```
 
-This starts a local relay, generates 4 non-overlapping data shards for `y = 3x₁ - 1.5x₂ + 0.5x₃ + 1`, launches 4 workers in tmux, and shows a convergence summary when training completes.
+4 workers learn `y = 3x₁ - 1.5x₂ + 0.5x₃ + 1` from non-overlapping data shards. Takes about 60 seconds, all workers converge to the true weights. Same DiLoCo loop, much smaller model (4 parameters).
 
 ## Compression pipeline
 
