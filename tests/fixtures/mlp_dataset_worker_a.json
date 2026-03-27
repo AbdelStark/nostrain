@@ -1,0 +1,25 @@
+{
+  "task": "mlp-regression",
+  "examples": [
+    {
+      "inputs": [0.0, 0.0],
+      "target": 0.0
+    },
+    {
+      "inputs": [0.0, 1.0],
+      "target": -0.5
+    },
+    {
+      "inputs": [1.0, 0.0],
+      "target": 1.0
+    },
+    {
+      "inputs": [1.0, 1.0],
+      "target": 1.5
+    },
+    {
+      "inputs": [2.0, 1.0],
+      "target": 3.0
+    }
+  ]
+}

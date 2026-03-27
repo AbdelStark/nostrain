@@ -124,13 +124,26 @@ Delivered in the current repository state:
 
 This moves the project from stale-update accounting to a training loop that can actually reincorporate compatible late updates without replaying earlier rounds.
 
-## Next milestone: richer runtimes
+## Completed milestone: richer runtimes
 
-Goal: prepare the transport/runtime boundary for larger models.
+Delivered in the current repository state:
+
+- shared runtime resolution across datasets, model states, checkpoints, and `run-training`
+- pluggable built-in runtimes for `linear-regression` and one-hidden-layer `mlp-regression`
+- deterministic `init-state` CLI support for built-in runtime initialization
+- pure-Python MLP local training plus relay-backed two-worker convergence coverage
+- checkpoint/session metadata that preserves runtime identity across resume boundaries
+
+This moves the project from a linear-only training prototype to a runtime-aware training system that can exercise a non-linear model through the same resilient relay/checkpoint path.
+
+## Next milestone: relay retry and backoff
+
+Goal: make multi-relay collection/publication more production-tolerant under transient failures.
 
 Deliverables:
 
-- compatibility story for richer runtimes such as PyTorch/MLX on top of the resilient transport layer
+- configurable retry and backoff policy for publish/collect/discovery operations
+- richer retry telemetry in CLI summaries and artifacts
 
 ## Deferred polish
 

@@ -10,13 +10,18 @@ import unittest
 
 from nostrain.model import ModelState
 from nostrain.training import (
+    MLP_REGRESSION_RUNTIME,
     LateGradientRecord,
     LateGradientReconciliationSummary,
     LinearRegressionDataset,
     LocalTrainingConfig,
+    RegressionDataset,
     TrainingCheckpoint,
     TrainingRoundSummary,
+    evaluate_regression,
     evaluate_linear_regression,
+    initialize_mlp_regression_state,
+    train_regression,
     train_linear_regression,
 )
 
@@ -63,6 +68,40 @@ class TrainingRuntimeTests(unittest.TestCase):
             places=8,
         )
 
+    def test_train_mlp_regression_reduces_loss(self) -> None:
+        state = ModelState.from_path(FIXTURES / "mlp_initial_state.json")
+        dataset = RegressionDataset.from_path(FIXTURES / "mlp_dataset_worker_a.json")
+
+        result = train_regression(
+            state,
+            dataset,
+            config=LocalTrainingConfig(
+                steps=40,
+                learning_rate=0.05,
+                batch_size=2,
+            ),
+            runtime_name=MLP_REGRESSION_RUNTIME,
+        )
+
+        self.assertLess(result.loss_after, result.loss_before)
+        self.assertEqual(result.runtime_name, MLP_REGRESSION_RUNTIME)
+        self.assertEqual(result.trained_state.parameter_count, 4)
+        self.assertAlmostEqual(
+            evaluate_regression(
+                result.trained_state,
+                dataset,
+                runtime_name=MLP_REGRESSION_RUNTIME,
+            ),
+            result.loss_after,
+            places=8,
+        )
+
+    def test_initialize_mlp_state_is_deterministic(self) -> None:
+        first = initialize_mlp_regression_state(2, 4, seed=7, weight_scale=0.3)
+        second = initialize_mlp_regression_state(2, 4, seed=7, weight_scale=0.3)
+
+        self.assertEqual(first.to_json_obj(), second.to_json_obj())
+
     def test_cli_train_local_writes_state_and_metrics(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             tempdir = Path(temporary_directory)
@@ -92,6 +131,55 @@ class TrainingRuntimeTests(unittest.TestCase):
             self.assertLess(metrics_json["loss_after"], metrics_json["loss_before"])
             self.assertEqual(metrics_json["feature_count"], 2)
             self.assertEqual(metrics_json["example_count"], 4)
+
+    def test_cli_train_local_supports_mlp_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            tempdir = Path(temporary_directory)
+            initialized_state = tempdir / "mlp-state.json"
+            trained_state = tempdir / "trained-mlp-state.json"
+            metrics = tempdir / "mlp-metrics.json"
+
+            self._run(
+                "init-state",
+                "--runtime",
+                "mlp-regression",
+                "--features",
+                "2",
+                "--hidden-size",
+                "4",
+                "--seed",
+                "7",
+                "--weight-scale",
+                "0.3",
+                "-o",
+                str(initialized_state),
+            )
+            self._run(
+                "train-local",
+                str(initialized_state),
+                str(FIXTURES / "mlp_dataset_worker_a.json"),
+                "--runtime",
+                "mlp-regression",
+                "--steps",
+                "40",
+                "--learning-rate",
+                "0.05",
+                "--batch-size",
+                "2",
+                "--metrics-out",
+                str(metrics),
+                "-o",
+                str(trained_state),
+            )
+
+            trained_json = json.loads(trained_state.read_text(encoding="utf-8"))
+            metrics_json = json.loads(metrics.read_text(encoding="utf-8"))
+
+            self.assertIn("parameters", trained_json)
+            self.assertEqual(metrics_json["runtime"], "mlp-regression")
+            self.assertLess(metrics_json["loss_after"], metrics_json["loss_before"])
+            self.assertEqual(metrics_json["feature_count"], 2)
+            self.assertEqual(metrics_json["example_count"], 5)
 
     def test_training_checkpoint_roundtrip_preserves_late_gradients(self) -> None:
         state = ModelState.from_path(FIXTURES / "linear_initial_state.json")
@@ -153,6 +241,7 @@ class TrainingRuntimeTests(unittest.TestCase):
                 ),
             ),
             updated_at=1_700_000_100,
+            runtime_name="mlp-regression",
         )
 
         restored = TrainingCheckpoint.from_json_obj(checkpoint.to_json_obj())
@@ -167,6 +256,7 @@ class TrainingRuntimeTests(unittest.TestCase):
         self.assertEqual(len(restored.late_reconciliations), 1)
         self.assertEqual(restored.late_reconciliations[0].event_count, 1)
         self.assertEqual(restored.late_reconciliations[0].worker_ids, ("worker-b",))
+        self.assertEqual(restored.runtime_name, "mlp-regression")
 
 
 if __name__ == "__main__":

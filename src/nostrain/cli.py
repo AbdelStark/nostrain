@@ -32,13 +32,18 @@ from .relay import (
     publish_nostrain_events,
     publish_nostrain_event,
 )
+from .runtime import (
+    DEFAULT_TRAINING_RUNTIME,
+    RegressionDataset,
+    SUPPORTED_TRAINING_RUNTIMES,
+    initialize_training_state,
+)
 from .training import (
-    LinearRegressionDataset,
     LocalTrainingConfig,
     TrainingCheckpoint,
     TrainingWorkerConfig,
     run_training_session,
-    train_linear_regression,
+    train_regression,
 )
 
 
@@ -114,6 +119,18 @@ def _handle_hash_state(args: argparse.Namespace) -> int:
 
 def _handle_derive_pubkey(args: argparse.Namespace) -> int:
     _write_text(args.output, secret_key_to_public_key(args.sec_key))
+    return 0
+
+
+def _handle_init_state(args: argparse.Namespace) -> int:
+    state = initialize_training_state(
+        args.runtime,
+        feature_count=args.features,
+        hidden_size=args.hidden_size,
+        seed=args.seed,
+        weight_scale=args.weight_scale,
+    )
+    _write_json(args.output, state.to_json_obj())
     return 0
 
 
@@ -315,8 +332,8 @@ def _handle_outer_step(args: argparse.Namespace) -> int:
 
 def _handle_train_local(args: argparse.Namespace) -> int:
     initial_state = ModelState.from_path(args.state)
-    dataset = LinearRegressionDataset.from_path(args.dataset)
-    result = train_linear_regression(
+    dataset = RegressionDataset.from_path(args.dataset)
+    result = train_regression(
         initial_state,
         dataset,
         config=LocalTrainingConfig(
@@ -324,6 +341,7 @@ def _handle_train_local(args: argparse.Namespace) -> int:
             learning_rate=args.learning_rate,
             batch_size=args.batch_size,
         ),
+        runtime_name=args.runtime,
     )
     _write_json(args.output, result.trained_state.to_json_obj())
     if args.metrics_out:
@@ -332,9 +350,10 @@ def _handle_train_local(args: argparse.Namespace) -> int:
 
 
 def _handle_run_training(args: argparse.Namespace) -> int:
-    dataset = LinearRegressionDataset.from_path(args.dataset)
+    dataset = RegressionDataset.from_path(args.dataset)
     relay_urls = _resolve_relay_urls(args.relay)
     worker_id = _resolve_worker_id(args)
+    runtime_name = args.runtime
     if args.resume_from and args.resume_latest_checkpoint:
         raise ValueError("--resume-from cannot be combined with --resume-latest-checkpoint")
     checkpoint = None
@@ -371,6 +390,7 @@ def _handle_run_training(args: argparse.Namespace) -> int:
         prior_late_gradients = checkpoint.late_gradients
         prior_late_reconciliations = checkpoint.late_reconciliations
         late_gradient_since = checkpoint.late_gradient_since or checkpoint.updated_at
+        runtime_name = runtime_name or checkpoint.runtime_name
     else:
         initial_state = ModelState.from_path(args.state)
         previous_momentum = (
@@ -392,6 +412,7 @@ def _handle_run_training(args: argparse.Namespace) -> int:
                 relay_urls=relay_urls,
                 worker_id=worker_id,
                 secret_key_hex=args.sec_key,
+                runtime_name=runtime_name,
                 rounds=args.rounds,
                 start_round=start_round,
                 inner_steps=args.inner_steps,
@@ -798,6 +819,42 @@ def build_parser() -> argparse.ArgumentParser:
     derive_pubkey.add_argument("-o", "--output", help="Optional output path.")
     derive_pubkey.set_defaults(handler=_handle_derive_pubkey)
 
+    init_state = subparsers.add_parser(
+        "init-state",
+        help="Generate a deterministic initial model state JSON for a supported training runtime.",
+    )
+    init_state.add_argument(
+        "--runtime",
+        choices=SUPPORTED_TRAINING_RUNTIMES,
+        default=DEFAULT_TRAINING_RUNTIME,
+        help="Training runtime to initialize (default: linear-regression).",
+    )
+    init_state.add_argument(
+        "--features",
+        type=int,
+        required=True,
+        help="Number of input features in the initialized model.",
+    )
+    init_state.add_argument(
+        "--hidden-size",
+        type=int,
+        help="Hidden width for mlp-regression initial states.",
+    )
+    init_state.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Deterministic random seed for non-linear initializers (default: 0).",
+    )
+    init_state.add_argument(
+        "--weight-scale",
+        type=float,
+        default=0.1,
+        help="Base initialization scale for mlp-regression weights (default: 0.1).",
+    )
+    init_state.add_argument("-o", "--output", help="Optional output path.")
+    init_state.set_defaults(handler=_handle_init_state)
+
     encode_delta = subparsers.add_parser(
         "encode-delta",
         help="Compute a pseudo-gradient between two model state snapshots and compress it.",
@@ -1126,10 +1183,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     train_local = subparsers.add_parser(
         "train-local",
-        help="Run a pure-Python linear-regression inner loop against a model state and dataset JSON.",
+        help="Run a pure-Python training inner loop against a runtime-compatible model state and dataset JSON.",
     )
-    train_local.add_argument("state", help="Path to the initial linear model state JSON.")
-    train_local.add_argument("dataset", help="Path to a linear regression dataset JSON file.")
+    train_local.add_argument("state", help="Path to the initial model state JSON.")
+    train_local.add_argument("dataset", help="Path to a regression dataset JSON file.")
+    train_local.add_argument(
+        "--runtime",
+        choices=SUPPORTED_TRAINING_RUNTIMES,
+        help="Optional runtime override. Defaults to the dataset task or the model state layout.",
+    )
     train_local.add_argument(
         "--steps",
         type=int,
@@ -1163,7 +1225,12 @@ def build_parser() -> argparse.ArgumentParser:
         "state",
         help="Path to the initial global model state JSON. Ignored when resuming from a checkpoint.",
     )
-    run_training.add_argument("dataset", help="Path to a linear regression dataset JSON file.")
+    run_training.add_argument("dataset", help="Path to a regression dataset JSON file.")
+    run_training.add_argument(
+        "--runtime",
+        choices=SUPPORTED_TRAINING_RUNTIMES,
+        help="Optional runtime override. Defaults to the dataset task or checkpoint/model state layout.",
+    )
     run_training.add_argument(
         "--relay",
         action="append",

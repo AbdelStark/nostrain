@@ -2,11 +2,11 @@
 
 Distributed ML training over Nostr relays.
 
-The project vision is still the same: no coordinator, no central server, just workers exchanging sparse pseudo-gradients through Nostr. The repository now ships the protocol/payload toolkit, a signed relay transport slice, and a resilient end-to-end training runner: model snapshots, DiLoCo-style deltas, sparse transport payloads, NIP-01-compatible nostrain gradient/heartbeat/checkpoint events, relay collection with active-worker discovery, cross-relay deduplication, resumable checkpoints, relay-visible checkpoint distribution, deferred late-gradient reconciliation, plus a built-in linear-regression worker loop that can train locally and synchronize through one or more relays.
+The project vision is still the same: no coordinator, no central server, just workers exchanging sparse pseudo-gradients through Nostr. The repository now ships the protocol/payload toolkit, a signed relay transport slice, and a resilient end-to-end training runner: model snapshots, DiLoCo-style deltas, sparse transport payloads, NIP-01-compatible nostrain gradient/heartbeat/checkpoint events, relay collection with active-worker discovery, cross-relay deduplication, resumable checkpoints, relay-visible checkpoint distribution, deferred late-gradient reconciliation, plus runtime-pluggable built-in workers for both linear and non-linear regression over one or more relays.
 
 ## Current status
 
-`nostrain` v0.8.0 is a protocol, relay, and training toolchain. It implements:
+`nostrain` v0.9.0 is a protocol, relay, and training toolchain. It implements:
 
 - canonical model-state JSON loading and hashing
 - pseudo-gradient computation (`current - initial`)
@@ -21,8 +21,9 @@ The project vision is still the same: no coordinator, no central server, just wo
 - replay-safe event collection and round aggregation over a relay
 - cross-relay publish redundancy and replay-safe collection deduplication
 - round sync strategies (`timeout`, `strict`, `quorum`, `async`) driven by discovered workers
-- a deterministic JSON dataset format for built-in linear-regression workloads
-- pure-Python local SGD inner-loop training for linear regression
+- a deterministic JSON dataset format for built-in regression workloads
+- pluggable built-in runtimes for `linear-regression` and `mlp-regression`
+- pure-Python local SGD inner-loop training for both runtimes
 - a relay-backed training runner that publishes heartbeats and gradients to one or more relays, tolerates partial relay outages, and applies the outer step locally
 - resumable training checkpoints carrying model state, momentum state, and prior round history
 - signed checkpoint distribution events carrying the latest recoverable training state
@@ -31,9 +32,10 @@ The project vision is still the same: no coordinator, no central server, just wo
 - checkpointed late-gradient payload tracking plus deferred reconciliation before the next round
 - configurable `run-training --late-gradient-strategy discard` accounting for record-only stale updates
 - bounded checkpoint artifacts plus optional per-round artifact pruning under `run-training`
+- deterministic `init-state` generation for supported built-in runtimes
 - a CLI for encoding, decoding, applying, publishing, collecting, and inspecting payloads
 
-It does **not** yet implement richer runtimes such as PyTorch/MLX. The signed transport path now targets public NIP-01 relays as well as local/mock websocket endpoints, and the built-in runner is intentionally scoped to linear regression so the end-to-end training loop stays dependency-light and testable.
+It does **not** yet implement external runtime adapters such as PyTorch/MLX. The signed transport path now targets public NIP-01 relays as well as local/mock websocket endpoints, and the built-in runners stay dependency-light and testable while exercising a shared runtime boundary.
 
 ## Install
 
@@ -66,9 +68,9 @@ The current toolchain uses a deterministic JSON representation for model snapsho
 }
 ```
 
-This keeps the protocol testable today without depending on PyTorch serialization. The built-in linear runner and future PyTorch/MLX adapters can export/import this structure at the edge.
+This keeps the protocol testable today without depending on PyTorch serialization. The built-in runtimes and future PyTorch/MLX adapters can export/import this structure at the edge.
 
-The built-in linear-regression runtime expects this minimal state:
+The built-in `linear-regression` runtime expects this minimal state:
 
 ```json
 {
@@ -85,9 +87,34 @@ The built-in linear-regression runtime expects this minimal state:
 }
 ```
 
+The built-in `mlp-regression` runtime uses a one-hidden-layer state:
+
+```json
+{
+  "parameters": {
+    "mlp.hidden.bias": {
+      "shape": [4],
+      "values": [0.0, 0.0, 0.0, 0.0]
+    },
+    "mlp.hidden.weight": {
+      "shape": [4, 2],
+      "values": [0.01, -0.02, 0.03, -0.04, 0.05, -0.06, 0.07, -0.08]
+    },
+    "mlp.output.bias": {
+      "shape": [1],
+      "values": [0.0]
+    },
+    "mlp.output.weight": {
+      "shape": [1, 4],
+      "values": [0.02, -0.01, 0.03, -0.02]
+    }
+  }
+}
+```
+
 ## Dataset format
 
-The built-in worker loop consumes deterministic JSON datasets:
+The built-in worker loop consumes deterministic JSON regression datasets:
 
 ```json
 {
@@ -105,9 +132,16 @@ The built-in worker loop consumes deterministic JSON datasets:
 }
 ```
 
-Each example must use the same input width. The runner currently supports scalar regression targets with a single dense linear layer.
+Each example must use the same input width. `task` currently supports `linear-regression` and `mlp-regression`, both with scalar regression targets.
 
 ## CLI
+
+Initialize a deterministic built-in model state:
+
+```bash
+nostrain init-state --runtime linear-regression --features 2 -o linear-initial.json
+nostrain init-state --runtime mlp-regression --features 2 --hidden-size 4 -o mlp-initial.json
+```
 
 Hash a model snapshot:
 
@@ -149,7 +183,7 @@ nostrain outer-step initial.json aggregated.json \
   -o next-state.json
 ```
 
-Run the built-in local linear-regression inner loop:
+Run the built-in local training inner loop:
 
 ```bash
 nostrain train-local linear-initial.json worker-a-dataset.json \
@@ -158,6 +192,18 @@ nostrain train-local linear-initial.json worker-a-dataset.json \
   --batch-size 2 \
   --metrics-out local-training.json \
   -o local-state.json
+```
+
+Run the non-linear MLP runtime against an `mlp-regression` dataset:
+
+```bash
+nostrain train-local mlp-initial.json worker-a-mlp-dataset.json \
+  --runtime mlp-regression \
+  --steps 40 \
+  --learning-rate 0.05 \
+  --batch-size 2 \
+  --metrics-out mlp-training.json \
+  -o mlp-state.json
 ```
 
 Build a nostrain event envelope:
@@ -383,7 +429,7 @@ Heartbeat content is intentionally empty; worker capabilities and relay hints li
 - [x] Replay-safe relay round collection and aggregation
 - [x] Event signing for public relays
 - [x] Worker discovery and heartbeat events
-- [x] Built-in linear-regression training runner with relay-backed DiLoCo-style rounds
+- [x] Runtime-aware built-in training runners for `linear-regression` and `mlp-regression`
 - [x] Multi-relay redundancy
 - [x] Local checkpoint recovery for resumed workers
 - [x] Relay checkpoint advertisement/distribution

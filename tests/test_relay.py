@@ -1187,6 +1187,144 @@ class RelayTransportTests(unittest.TestCase):
                 ["worker-a", "worker-b"],
             )
 
+    def test_cli_run_training_two_mlp_workers_converge_via_relay(self) -> None:
+        seeded_heartbeats = [
+            _build_heartbeat(
+                worker_id="worker-a",
+                created_at=int(time.time()) + 10,
+                current_round=0,
+                run_name="shared-mlp-run",
+            ),
+            _build_heartbeat(
+                worker_id="worker-b",
+                created_at=int(time.time()) + 11,
+                current_round=0,
+                run_name="shared-mlp-run",
+            ),
+        ]
+
+        with tempfile.TemporaryDirectory() as temporary_directory, MockRelay(seeded_heartbeats) as relay:
+            tempdir = Path(temporary_directory)
+            state_a = tempdir / "mlp-state-a.json"
+            state_b = tempdir / "mlp-state-b.json"
+            summary_a = tempdir / "mlp-summary-a.json"
+            summary_b = tempdir / "mlp-summary-b.json"
+
+            env = os.environ.copy()
+            existing_pythonpath = env.get("PYTHONPATH")
+            src_path = str(ROOT / "src")
+            env["PYTHONPATH"] = src_path if not existing_pythonpath else f"{src_path}:{existing_pythonpath}"
+
+            process_a = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "nostrain",
+                    "run-training",
+                    str(FIXTURES / "mlp_initial_state.json"),
+                    str(FIXTURES / "mlp_dataset_worker_a.json"),
+                    "--relay",
+                    relay.url,
+                    "--run",
+                    "shared-mlp-run",
+                    "--worker",
+                    "worker-a",
+                    "--sec-key",
+                    WORKER_SECRET_KEYS["worker-a"],
+                    "--runtime",
+                    "mlp-regression",
+                    "--inner-steps",
+                    "40",
+                    "--local-learning-rate",
+                    "0.05",
+                    "--batch-size",
+                    "2",
+                    "--outer-learning-rate",
+                    "1.0",
+                    "--momentum",
+                    "0.0",
+                    "--round-timeout",
+                    "0.4",
+                    "--summary-out",
+                    str(summary_a),
+                    "-o",
+                    str(state_a),
+                ],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            process_b = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "nostrain",
+                    "run-training",
+                    str(FIXTURES / "mlp_initial_state.json"),
+                    str(FIXTURES / "mlp_dataset_worker_b.json"),
+                    "--relay",
+                    relay.url,
+                    "--run",
+                    "shared-mlp-run",
+                    "--worker",
+                    "worker-b",
+                    "--sec-key",
+                    WORKER_SECRET_KEYS["worker-b"],
+                    "--runtime",
+                    "mlp-regression",
+                    "--inner-steps",
+                    "40",
+                    "--local-learning-rate",
+                    "0.05",
+                    "--batch-size",
+                    "2",
+                    "--outer-learning-rate",
+                    "1.0",
+                    "--momentum",
+                    "0.0",
+                    "--round-timeout",
+                    "0.4",
+                    "--summary-out",
+                    str(summary_b),
+                    "-o",
+                    str(state_b),
+                ],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+            stdout_a, stderr_a = process_a.communicate(timeout=20)
+            stdout_b, stderr_b = process_b.communicate(timeout=20)
+
+            if process_a.returncode != 0:
+                self.fail(f"worker-a failed: {stderr_a or stdout_a}")
+            if process_b.returncode != 0:
+                self.fail(f"worker-b failed: {stderr_b or stdout_b}")
+
+            final_state_a = ModelState.from_path(state_a)
+            final_state_b = ModelState.from_path(state_b)
+            summary_json_a = json.loads(summary_a.read_text(encoding="utf-8"))
+            summary_json_b = json.loads(summary_b.read_text(encoding="utf-8"))
+
+            assert_model_state_almost_equal(self, final_state_a, final_state_b, places=8)
+            self.assertEqual(summary_json_a["runtime"], "mlp-regression")
+            self.assertEqual(summary_json_b["runtime"], "mlp-regression")
+            self.assertEqual(summary_json_a["rounds"][0]["collected_event_count"], 2)
+            self.assertEqual(summary_json_b["rounds"][0]["collected_event_count"], 2)
+            self.assertEqual(
+                sorted(summary_json_a["rounds"][0]["known_workers"]),
+                ["worker-a", "worker-b"],
+            )
+            self.assertEqual(
+                sorted(summary_json_b["rounds"][0]["collected_workers"]),
+                ["worker-a", "worker-b"],
+            )
+
     def test_collect_gradient_events_across_relays_deduplicates_replays(self) -> None:
         worker_a_event = _build_event(
             worker_id="worker-a",

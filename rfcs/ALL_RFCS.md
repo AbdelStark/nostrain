@@ -2,7 +2,7 @@
 
 Inner optimizer: AdamW (lr=4e-4, weight_decay=0.1, warmup=1000 steps). Outer optimizer: Nesterov SGD (lr=0.7, momentum=0.9). Inner steps H=500 (configurable). Each worker maintains theta (current weights) and theta_initial (snapshot at start of round). Pseudo-gradient = theta - theta_initial. After outer step, all workers have the same theta and begin next round. Reference implementation: OpenDiLoCo by Prime Intellect.
 
-Implementation status: the current codebase implements the payload math, multi-worker averaging, a local Nesterov-style outer step, and a built-in linear-regression inner/outer training runner. Richer runtimes such as PyTorch/MLX are still pending.
+Implementation status: the current codebase implements the payload math, multi-worker averaging, a local Nesterov-style outer step, and runtime-aware built-in inner/outer runners for `linear-regression` and `mlp-regression`. External adapters such as PyTorch/MLX are still pending.
 
 # RFC-002: Nostr Event Protocol
 
@@ -44,6 +44,7 @@ Implementation status: distributed checkpoint discovery/resume and late-gradient
 Implemented commands:
 
 - `hash-state`
+- `init-state`
 - `encode-delta`
 - `decode-payload`
 - `aggregate-payloads`
@@ -68,4 +69,4 @@ Deferred commands:
 - `monitor`
 - `list`
 
-The current CLI is intentionally protocol-first. Training orchestration and relay UX will be added once the transport layer exists.
+The current CLI is intentionally protocol-first, but it now includes runtime-aware state initialization and training flows on top of the transport layer.

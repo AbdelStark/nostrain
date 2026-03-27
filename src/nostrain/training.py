@@ -11,7 +11,6 @@ from .aggregation import aggregate_deltas, nesterov_outer_step
 from .compression import CompressionCodec, compress_delta, decompress_payload
 from .model import (
     ModelState,
-    TensorState,
     add_states,
     compute_delta,
     state_digest,
@@ -30,277 +29,41 @@ from .relay import (
     collect_late_gradient_events_across_relays,
     publish_nostrain_events,
 )
+from .runtime import (
+    DEFAULT_TRAINING_RUNTIME,
+    LINEAR_BIAS_PARAMETER,
+    LINEAR_WEIGHT_PARAMETER,
+    MLP_HIDDEN_BIAS_PARAMETER,
+    MLP_HIDDEN_WEIGHT_PARAMETER,
+    MLP_OUTPUT_BIAS_PARAMETER,
+    MLP_OUTPUT_WEIGHT_PARAMETER,
+    MLPModel,
+    MLPModelAdapter,
+    LocalTrainingConfig,
+    LocalTrainingResult,
+    RegressionDataset,
+    RegressionExample,
+    LinearModel,
+    LinearModelAdapter,
+    LinearRegressionDataset,
+    MLP_REGRESSION_RUNTIME,
+    LINEAR_REGRESSION_RUNTIME,
+    RuntimeAdapter,
+    SUPPORTED_TRAINING_RUNTIMES,
+    evaluate_linear_regression,
+    evaluate_mlp_regression,
+    evaluate_regression,
+    infer_training_runtime_from_state,
+    initialize_linear_regression_state,
+    initialize_mlp_regression_state,
+    initialize_training_state,
+    resolve_training_runtime,
+    train_linear_regression,
+    train_mlp_regression,
+    train_regression,
+)
 
-LINEAR_WEIGHT_PARAMETER = "linear.weight"
-LINEAR_BIAS_PARAMETER = "linear.bias"
 LATE_GRADIENT_STRATEGIES = {"discard", "deferred"}
-
-
-@dataclass(frozen=True)
-class RegressionExample:
-    inputs: tuple[float, ...]
-    target: float
-
-    def __post_init__(self) -> None:
-        if not self.inputs:
-            raise ValueError("regression examples must contain at least one input feature")
-
-    def to_json_obj(self) -> dict[str, Any]:
-        return {
-            "inputs": list(self.inputs),
-            "target": self.target,
-        }
-
-
-@dataclass(frozen=True)
-class LinearRegressionDataset:
-    examples: tuple[RegressionExample, ...]
-
-    def __post_init__(self) -> None:
-        if not self.examples:
-            raise ValueError("linear regression datasets must contain at least one example")
-        feature_count = len(self.examples[0].inputs)
-        if feature_count <= 0:
-            raise ValueError("linear regression datasets must contain at least one feature")
-        for example in self.examples:
-            if len(example.inputs) != feature_count:
-                raise ValueError("all regression examples must use the same feature count")
-
-    @property
-    def feature_count(self) -> int:
-        return len(self.examples[0].inputs)
-
-    @property
-    def example_count(self) -> int:
-        return len(self.examples)
-
-    def to_json_obj(self) -> dict[str, Any]:
-        return {
-            "task": "linear-regression",
-            "examples": [example.to_json_obj() for example in self.examples],
-        }
-
-    @classmethod
-    def from_json_obj(cls, data: Any) -> "LinearRegressionDataset":
-        if not isinstance(data, dict):
-            raise ValueError("dataset JSON must be an object")
-        task = str(data.get("task", "linear-regression")).strip().lower()
-        if task != "linear-regression":
-            raise ValueError("only the 'linear-regression' dataset task is supported")
-        raw_examples = data.get("examples")
-        if not isinstance(raw_examples, list) or not raw_examples:
-            raise ValueError("dataset JSON must contain a non-empty 'examples' array")
-
-        examples: list[RegressionExample] = []
-        for raw_example in raw_examples:
-            if not isinstance(raw_example, dict):
-                raise ValueError("dataset examples must be objects")
-            if "inputs" not in raw_example or "target" not in raw_example:
-                raise ValueError("dataset examples must contain 'inputs' and 'target'")
-            raw_inputs = raw_example["inputs"]
-            if not isinstance(raw_inputs, list) or not raw_inputs:
-                raise ValueError("dataset example 'inputs' must be a non-empty array")
-            examples.append(
-                RegressionExample(
-                    inputs=tuple(float(value) for value in raw_inputs),
-                    target=float(raw_example["target"]),
-                )
-            )
-        return cls(examples=tuple(examples))
-
-    @classmethod
-    def from_path(cls, path: str | Path) -> "LinearRegressionDataset":
-        return cls.from_json_obj(json.loads(Path(path).read_text(encoding="utf-8")))
-
-
-@dataclass(frozen=True)
-class LinearModel:
-    weights: tuple[float, ...]
-    bias: float
-
-    def __post_init__(self) -> None:
-        if not self.weights:
-            raise ValueError("linear models must contain at least one weight")
-
-    @property
-    def feature_count(self) -> int:
-        return len(self.weights)
-
-    def predict(self, inputs: tuple[float, ...]) -> float:
-        if len(inputs) != self.feature_count:
-            raise ValueError(
-                f"example feature count {len(inputs)} does not match model width {self.feature_count}"
-            )
-        return sum(weight * value for weight, value in zip(self.weights, inputs)) + self.bias
-
-
-@dataclass(frozen=True)
-class LinearModelAdapter:
-    weight_parameter: str = LINEAR_WEIGHT_PARAMETER
-    bias_parameter: str = LINEAR_BIAS_PARAMETER
-
-    def export_state(self, model: LinearModel) -> ModelState:
-        return ModelState(
-            parameters=(
-                TensorState(
-                    name=self.bias_parameter,
-                    shape=(1,),
-                    values=(model.bias,),
-                ),
-                TensorState(
-                    name=self.weight_parameter,
-                    shape=(1, model.feature_count),
-                    values=model.weights,
-                ),
-            )
-        )
-
-    def import_state(self, state: ModelState, *, feature_count: int | None = None) -> LinearModel:
-        parameter_map = state.parameter_map()
-        if self.weight_parameter not in parameter_map or self.bias_parameter not in parameter_map:
-            raise ValueError(
-                "linear model state must contain "
-                f"{self.weight_parameter!r} and {self.bias_parameter!r} parameters"
-            )
-        extra_parameters = sorted(
-            name
-            for name in parameter_map
-            if name not in {self.weight_parameter, self.bias_parameter}
-        )
-        if extra_parameters:
-            raise ValueError(
-                "linear model state contains unexpected parameters: "
-                + ", ".join(extra_parameters)
-            )
-
-        weight_tensor = parameter_map[self.weight_parameter]
-        if weight_tensor.shape == (len(weight_tensor.values),):
-            weights = weight_tensor.values
-        elif len(weight_tensor.shape) == 2 and weight_tensor.shape[0] == 1:
-            weights = weight_tensor.values
-        else:
-            raise ValueError(
-                f"{self.weight_parameter!r} must use shape [features] or [1, features]"
-            )
-
-        if feature_count is not None and len(weights) != feature_count:
-            raise ValueError(
-                f"state feature count {len(weights)} does not match dataset feature count {feature_count}"
-            )
-
-        bias_tensor = parameter_map[self.bias_parameter]
-        if len(bias_tensor.values) != 1 or bias_tensor.shape not in {(), (1,)}:
-            raise ValueError(f"{self.bias_parameter!r} must contain exactly one scalar bias value")
-
-        return LinearModel(weights=tuple(weights), bias=float(bias_tensor.values[0]))
-
-
-def evaluate_linear_regression(
-    state: ModelState,
-    dataset: LinearRegressionDataset,
-    *,
-    adapter: LinearModelAdapter | None = None,
-) -> float:
-    adapter = adapter or LinearModelAdapter()
-    model = adapter.import_state(state, feature_count=dataset.feature_count)
-    total_squared_error = 0.0
-    for example in dataset.examples:
-        error = model.predict(example.inputs) - example.target
-        total_squared_error += error * error
-    return total_squared_error / dataset.example_count
-
-
-@dataclass(frozen=True)
-class LocalTrainingConfig:
-    steps: int = 500
-    learning_rate: float = 0.01
-    batch_size: int = 1
-
-    def __post_init__(self) -> None:
-        if self.steps <= 0:
-            raise ValueError("inner training steps must be positive")
-        if self.learning_rate <= 0:
-            raise ValueError("inner learning rate must be positive")
-        if self.batch_size <= 0:
-            raise ValueError("batch size must be positive")
-
-
-@dataclass(frozen=True)
-class LocalTrainingResult:
-    initial_state: ModelState
-    trained_state: ModelState
-    loss_before: float
-    loss_after: float
-    steps: int
-    learning_rate: float
-    batch_size: int
-    example_count: int
-    feature_count: int
-
-    def to_json_obj(self) -> dict[str, Any]:
-        return {
-            "task": "linear-regression",
-            "steps": self.steps,
-            "learning_rate": self.learning_rate,
-            "batch_size": self.batch_size,
-            "example_count": self.example_count,
-            "feature_count": self.feature_count,
-            "loss_before": self.loss_before,
-            "loss_after": self.loss_after,
-        }
-
-
-def train_linear_regression(
-    initial_state: ModelState,
-    dataset: LinearRegressionDataset,
-    *,
-    config: LocalTrainingConfig | None = None,
-    adapter: LinearModelAdapter | None = None,
-) -> LocalTrainingResult:
-    config = config or LocalTrainingConfig()
-    adapter = adapter or LinearModelAdapter()
-
-    model = adapter.import_state(initial_state, feature_count=dataset.feature_count)
-    weights = list(model.weights)
-    bias = model.bias
-    loss_before = evaluate_linear_regression(initial_state, dataset, adapter=adapter)
-    example_index = 0
-
-    for _ in range(config.steps):
-        batch: list[RegressionExample] = []
-        for offset in range(config.batch_size):
-            batch.append(dataset.examples[(example_index + offset) % dataset.example_count])
-        example_index = (example_index + config.batch_size) % dataset.example_count
-
-        gradients = [0.0 for _ in weights]
-        bias_gradient = 0.0
-        batch_scale = 1.0 / len(batch)
-
-        for example in batch:
-            prediction = sum(weight * value for weight, value in zip(weights, example.inputs)) + bias
-            error = prediction - example.target
-            factor = 2.0 * error * batch_scale
-            for index, feature_value in enumerate(example.inputs):
-                gradients[index] += factor * feature_value
-            bias_gradient += factor
-
-        for index, gradient in enumerate(gradients):
-            weights[index] -= config.learning_rate * gradient
-        bias -= config.learning_rate * bias_gradient
-
-    trained_state = adapter.export_state(LinearModel(weights=tuple(weights), bias=bias))
-    loss_after = evaluate_linear_regression(trained_state, dataset, adapter=adapter)
-    return LocalTrainingResult(
-        initial_state=initial_state,
-        trained_state=trained_state,
-        loss_before=loss_before,
-        loss_after=loss_after,
-        steps=config.steps,
-        learning_rate=config.learning_rate,
-        batch_size=config.batch_size,
-        example_count=dataset.example_count,
-        feature_count=dataset.feature_count,
-    )
 
 
 @dataclass(frozen=True)
@@ -309,6 +72,7 @@ class TrainingWorkerConfig:
     relay_urls: tuple[str, ...]
     worker_id: str
     secret_key_hex: str
+    runtime_name: str | None = None
     rounds: int = 1
     start_round: int = 0
     inner_steps: int = 500
@@ -337,6 +101,10 @@ class TrainingWorkerConfig:
             raise ValueError("worker id cannot be empty")
         if not self.secret_key_hex:
             raise ValueError("secret key cannot be empty")
+        if self.runtime_name is not None and self.runtime_name not in SUPPORTED_TRAINING_RUNTIMES:
+            raise ValueError(
+                "runtime must be one of: " + ", ".join(SUPPORTED_TRAINING_RUNTIMES)
+            )
         if self.rounds <= 0:
             raise ValueError("round count must be positive")
         if self.start_round < 0:
@@ -390,6 +158,8 @@ class TrainingWorkerConfig:
         )
         if not normalized_relays:
             raise ValueError("at least one relay URL is required")
+        if self.runtime_name is not None:
+            object.__setattr__(self, "runtime_name", resolve_training_runtime(self.runtime_name))
         object.__setattr__(self, "relay_urls", normalized_relays)
         object.__setattr__(
             self,
@@ -659,6 +429,7 @@ class TrainingSessionResult:
     final_state: ModelState
     final_momentum_state: ModelState | None
     rounds: tuple[TrainingRoundSummary, ...]
+    runtime_name: str = DEFAULT_TRAINING_RUNTIME
     checkpoint_history: int = 1
     artifact_retention_rounds: int | None = None
     late_gradients: tuple[LateGradientRecord, ...] = ()
@@ -691,6 +462,7 @@ class TrainingSessionResult:
             "run": self.run_name,
             "worker": self.worker_id,
             "relays": list(self.relay_urls),
+            "runtime": self.runtime_name,
             "start_round": self.start_round,
             "rounds_completed": self.rounds_completed,
             "final_model_hash": self.final_model_hash,
@@ -731,6 +503,7 @@ class TrainingCheckpoint:
     late_reconciliations: tuple[LateGradientReconciliationSummary, ...]
     updated_at: int
     late_gradient_since: int = 0
+    runtime_name: str = DEFAULT_TRAINING_RUNTIME
 
     @property
     def rounds_completed(self) -> int:
@@ -749,6 +522,7 @@ class TrainingCheckpoint:
             "run": self.run_name,
             "worker": self.worker_id,
             "relays": list(self.relay_urls),
+            "runtime": self.runtime_name,
             "next_round": self.next_round,
             "rounds_completed": self.rounds_completed,
             "updated_at": self.updated_at,
@@ -795,6 +569,9 @@ class TrainingCheckpoint:
             ),
             late_gradient_since=int(data.get("late_gradient_since", 0)),
             updated_at=int(data.get("updated_at", 0)),
+            runtime_name=resolve_training_runtime(
+                str(data.get("runtime", DEFAULT_TRAINING_RUNTIME))
+            ),
         )
 
     @classmethod
@@ -1079,10 +856,10 @@ def _reconcile_late_gradients(
 
 async def run_training_session(
     initial_state: ModelState,
-    dataset: LinearRegressionDataset,
+    dataset: RegressionDataset,
     *,
     config: TrainingWorkerConfig,
-    adapter: LinearModelAdapter | None = None,
+    adapter: RuntimeAdapter | None = None,
     previous_momentum: ModelState | None = None,
     artifact_dir: str | Path | None = None,
     prior_rounds: tuple[TrainingRoundSummary, ...] = (),
@@ -1091,7 +868,12 @@ async def run_training_session(
     late_gradient_since: int | None = None,
     checkpoint_out: str | Path | None = None,
 ) -> TrainingSessionResult:
-    adapter = adapter or LinearModelAdapter()
+    runtime_name = resolve_training_runtime(
+        config.runtime_name,
+        dataset,
+        state=initial_state,
+        adapter=adapter,
+    )
     current_state = initial_state
     current_momentum = previous_momentum
     round_summaries: list[TrainingRoundSummary] = list(prior_rounds)
@@ -1163,7 +945,7 @@ async def run_training_session(
                 worker_id=config.worker_id,
                 current_round=round_index,
                 heartbeat_interval=config.heartbeat_interval,
-                capabilities=("gradient-event", "linear-regression"),
+                capabilities=("gradient-event", runtime_name),
                 advertised_relays=config.advertised_relays or config.relay_urls,
                 created_at=round_start,
             ),
@@ -1181,7 +963,7 @@ async def run_training_session(
                 + _format_failed_relays(heartbeat_publish.failed_relays)
             )
 
-        local_training = train_linear_regression(
+        local_training = train_regression(
             current_state,
             dataset,
             config=LocalTrainingConfig(
@@ -1189,6 +971,7 @@ async def run_training_session(
                 learning_rate=config.local_learning_rate,
                 batch_size=config.batch_size,
             ),
+            runtime_name=runtime_name,
             adapter=adapter,
         )
         local_delta = compute_delta(current_state, local_training.trained_state)
@@ -1243,9 +1026,10 @@ async def run_training_session(
             momentum=config.outer_momentum,
             previous_momentum=current_momentum,
         )
-        local_loss_after_outer = evaluate_linear_regression(
+        local_loss_after_outer = evaluate_regression(
             outer_result.next_state,
             dataset,
+            runtime_name=runtime_name,
             adapter=adapter,
         )
 
@@ -1339,6 +1123,7 @@ async def run_training_session(
                 )
                 if value is not None
             ),
+            runtime_name=runtime_name,
         )
         checkpoint_event = build_checkpoint_event(
             CheckpointEventMetadata(
@@ -1457,6 +1242,7 @@ async def run_training_session(
         final_state=current_state,
         final_momentum_state=current_momentum,
         rounds=tuple(round_summaries),
+        runtime_name=runtime_name,
         checkpoint_history=config.checkpoint_history,
         artifact_retention_rounds=config.artifact_retention_rounds,
         late_gradients=tuple(late_gradients),

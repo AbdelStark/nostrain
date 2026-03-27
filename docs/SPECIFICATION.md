@@ -1,8 +1,8 @@
-# nostrain: Specification v0.8.0
+# nostrain: Specification v0.9.0
 
 ## Overview
 
-nostrain is a protocol for distributed ML training over Nostr relays. The implemented repository milestone now covers the payload layer, a signed transport slice, and a resilient end-to-end runner: deterministic model snapshots, pseudo-gradient generation, sparse quantized wire encoding, NIP-01-compatible gradient/heartbeat/checkpoint event envelopes, websocket discovery/collection across one or more relays, resumable checkpoints, rolling checkpoint-slot retention, deferred late-gradient reconciliation, and a built-in linear-regression worker loop that trains locally and synchronizes through relays.
+nostrain is a protocol for distributed ML training over Nostr relays. The implemented repository milestone now covers the payload layer, a signed transport slice, and a resilient end-to-end runner: deterministic model snapshots, pseudo-gradient generation, sparse quantized wire encoding, NIP-01-compatible gradient/heartbeat/checkpoint event envelopes, websocket discovery/collection across one or more relays, resumable checkpoints, rolling checkpoint-slot retention, deferred late-gradient reconciliation, and a runtime-aware built-in worker loop that trains both linear and non-linear regression models through relays.
 
 ## Implemented core
 
@@ -23,8 +23,8 @@ nostrain is a protocol for distributed ML training over Nostr relays. The implem
 15. Build and validate signed worker heartbeat discovery events (kind `33334`)
 16. Discover active workers from relay heartbeats while discarding stale workers
 17. Stop round collection via `timeout`, `strict`, `quorum`, or `async` strategies using discovered workers
-18. Load deterministic JSON datasets for built-in linear-regression workloads
-19. Import/export linear-regression weights through the shared `ModelState` schema
+18. Load deterministic JSON datasets for built-in regression workloads
+19. Import/export `linear-regression` and `mlp-regression` weights through the shared `ModelState` schema
 20. Run configurable local SGD inner loops over JSON datasets
 21. Publish heartbeat + gradient events for each round and apply the aggregated outer step locally
 22. Persist machine-readable per-round/session artifacts for relay-backed training runs
@@ -39,6 +39,9 @@ nostrain is a protocol for distributed ML training over Nostr relays. The implem
 31. Bound relay-visible checkpoint history per worker by publishing checkpoints into configurable rolling slots
 32. Bound local checkpoint artifacts and optionally prune old per-round artifact directories under `run-training`
 33. Persist late-gradient payloads in checkpoints and fold compatible stale updates back into the next round through a deferred reconciliation pass
+34. Resolve training runtimes from dataset metadata, checkpoint metadata, or model-state layout
+35. Generate deterministic built-in initial states for supported runtimes from the CLI
+36. Train a one-hidden-layer `mlp-regression` runtime end to end through the same relay/checkpoint path
 
 ## Model state schema
 
@@ -60,14 +63,18 @@ Rules:
 - `len(values)` must equal the product of `shape`
 - model digests are SHA-256 over the canonical parameter stream
 
-Built-in runner state:
+Built-in runner states:
 
 - `linear.weight`: shape `[1, feature_count]`
 - `linear.bias`: shape `[1]`
+- `mlp.hidden.weight`: shape `[hidden_size, feature_count]`
+- `mlp.hidden.bias`: shape `[hidden_size]`
+- `mlp.output.weight`: shape `[1, hidden_size]`
+- `mlp.output.bias`: shape `[1]`
 
-The protocol remains generic, but the built-in training runtime currently targets this linear schema so the full loop stays dependency-light and deterministic.
+The protocol remains generic, but the built-in training runtimes currently target these dependency-light regression schemas so the full loop stays deterministic and easy to test.
 
-## Linear regression dataset schema
+## Regression dataset schema
 
 ```json
 {
@@ -83,7 +90,7 @@ The protocol remains generic, but the built-in training runtime currently target
 
 Rules:
 
-- `task` must be `linear-regression`
+- `task` must be `linear-regression` or `mlp-regression`
 - `examples` must be non-empty
 - every example must provide the same number of input features
 - targets are scalar floating-point regression values
@@ -239,6 +246,7 @@ Implemented commands:
 
 ```bash
 nostrain hash-state <state.json>
+nostrain init-state --runtime linear-regression|mlp-regression --features <n> [--hidden-size <h>]
 nostrain derive-pubkey <sec-key>
 nostrain encode-delta <initial.json> <current.json> [--topk 0.01] [--codec zlib|zstd]
 nostrain decode-payload <payload.json>
@@ -253,8 +261,8 @@ nostrain discover-workers --relay <ws://...> [--relay <ws://...> ...] --run <nam
 nostrain discover-checkpoints --relay <ws://...> [--relay <ws://...> ...] --run <name> [--worker <id>]
 nostrain collect-events --relay <ws://...> [--relay <ws://...> ...] --run <name> --round <n> [--sync timeout|strict|quorum|async] [--discover-workers]
 nostrain aggregate-round --relay <ws://...> [--relay <ws://...> ...] --run <name> --round <n> [--sync timeout|strict|quorum|async] [--discover-workers]
-nostrain train-local <state.json> <dataset.json> [--steps 500] [--learning-rate 0.01] [--batch-size 1]
-nostrain run-training <state.json> <dataset.json> --relay <ws://...> [--relay <ws://...> ...] --run <name> --sec-key <hex> [--rounds 1] [--checkpoint-out path.json] [--checkpoint-history 4] [--artifact-retention-rounds N] [--late-gradient-strategy deferred|discard] [--late-gradient-learning-rate X] [--late-gradient-momentum Y] [--resume-from checkpoint.json | --resume-latest-checkpoint]
+nostrain train-local <state.json> <dataset.json> [--runtime linear-regression|mlp-regression] [--steps 500] [--learning-rate 0.01] [--batch-size 1]
+nostrain run-training <state.json> <dataset.json> [--runtime linear-regression|mlp-regression] --relay <ws://...> [--relay <ws://...> ...] --run <name> --sec-key <hex> [--rounds 1] [--checkpoint-out path.json] [--checkpoint-history 4] [--artifact-retention-rounds N] [--late-gradient-strategy deferred|discard] [--late-gradient-learning-rate X] [--late-gradient-momentum Y] [--resume-from checkpoint.json | --resume-latest-checkpoint]
 nostrain inspect-event <event.json> [--json]
 ```
 
@@ -294,7 +302,7 @@ Fault-tolerance boundary:
 - late gradients from older rounds are surfaced separately and can be folded into the next round through a separate deferred outer step without replaying earlier rounds
 - total relay failure or zero collected gradients still aborts the round to avoid silent model divergence
 
-## Deferred from v0.8.0
+## Deferred from v0.9.0
 
-- DiLoCo training loop integration with PyTorch or MLX
+- External runtime adapters for PyTorch or MLX
 - live dashboarding
