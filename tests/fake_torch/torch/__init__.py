@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from collections import OrderedDict
 import pickle
+from collections import OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any

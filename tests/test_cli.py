@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-from pathlib import Path
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 from tests.helpers import assert_state_json_almost_equal
-
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = Path(__file__).resolve().parent / "fixtures"

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from pathlib import Path
 import tempfile
 import unittest
+from pathlib import Path
 
 import numpy as np
 
@@ -14,7 +14,6 @@ from nostrain.stateio import (
     write_model_state,
 )
 from tests.helpers import fake_torch_imports
-
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 

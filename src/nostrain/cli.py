@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .aggregation import aggregate_deltas, nesterov_outer_step
-from .compression import CompressionCodec, compress_delta, decompress_payload, inspect_payload
+from .compression import CompressionCodec, compress_delta, decompress_payload
 from .crypto import secret_key_to_public_key
 from .model import ModelState, apply_delta, compute_delta, state_digest
 from .protocol import (
@@ -33,16 +33,16 @@ from .relay import (
     collect_gradient_events_across_relays,
     collect_heartbeat_events,
     collect_heartbeat_events_across_relays,
-    publish_nostrain_events,
     publish_nostrain_event,
+    publish_nostrain_events,
 )
 from .retry import RelayRetryPolicy
 from .runtime import (
     DEFAULT_TRAINING_BACKEND,
     DEFAULT_TRAINING_RUNTIME,
-    RegressionDataset,
     SUPPORTED_TRAINING_BACKENDS,
     SUPPORTED_TRAINING_RUNTIMES,
+    RegressionDataset,
     infer_training_runtime_from_state,
     initialize_training_state,
 )

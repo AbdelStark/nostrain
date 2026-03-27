@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
 import math
-from pathlib import Path
 import random
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from .model import ModelState, TensorState

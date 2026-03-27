@@ -18,9 +18,20 @@ import torch
 
 sys.path.insert(0, "src")
 
+from demo.gpt.data import (
+    VOCAB_SIZE,
+    ShardDataset,
+    decode,
+    download_shakespeare,
+    encode,
+    make_shards,
+)
+
+# Must be importable from demo/gpt/
+from demo.gpt.model import CharGPT, GPTConfig
 from nostrain import (
-    HeartbeatEventMetadata,
     GradientEventMetadata,
+    HeartbeatEventMetadata,
     RelayRetryPolicy,
     build_gradient_event,
     build_heartbeat_event,
@@ -31,19 +42,8 @@ from nostrain import (
     publish_nostrain_events,
     state_digest,
 )
-from nostrain.pytorch import model_state_from_module, load_state_into_module
 from nostrain.crypto import secret_key_to_public_key
-
-# Must be importable from demo/gpt/
-from demo.gpt.model import CharGPT, GPTConfig
-from demo.gpt.data import (
-    VOCAB_SIZE,
-    ShardDataset,
-    decode,
-    download_shakespeare,
-    encode,
-    make_shards,
-)
+from nostrain.pytorch import load_state_into_module, model_state_from_module
 
 # Reuse the test relay
 from tests.test_relay import MockRelay

@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import string
 
-
 SECP256K1_FIELD_SIZE = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
 SECP256K1_ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 _GENERATOR = (
@@ -142,7 +141,7 @@ def _bytes_from_int(value: int) -> bytes:
 
 
 def _xor_bytes(left: bytes, right: bytes) -> bytes:
-    return bytes(l ^ r for l, r in zip(left, right))
+    return bytes(left_byte ^ right_byte for left_byte, right_byte in zip(left, right))
 
 
 def _has_even_y(point: Point) -> bool:

@@ -59,7 +59,7 @@ sequenceDiagram
 **1. Install**
 
 ```bash
-pip install -e .
+python -m pip install -e .
 ```
 
 **2. Initialize a model**
@@ -91,7 +91,7 @@ Workers discover each other via heartbeat events and sync automatically.
 The repo ships a complete demo that trains a character-level GPT on Shakespeare. Four workers each get a different slice of the text. No single worker sees the full corpus — they have to collaborate through the relay to learn the language.
 
 ```bash
-pip install -e ".[torch]"
+python -m pip install -e ".[torch]"
 bash demo/gpt/run.sh
 ```
 
@@ -342,10 +342,11 @@ nostrain run-training           Full distributed training session
 
 ```python
 from nostrain import (
-    compute_delta, compress_delta, state_digest,
-    aggregate_deltas, nesterov_outer_step,
-    build_gradient_event, schnorr_sign,
-    run_training_session, TrainingWorkerConfig,
+    GradientEventMetadata,
+    build_gradient_event,
+    compress_delta,
+    compute_delta,
+    state_digest,
 )
 
 # Compress a pseudo-gradient
@@ -353,13 +354,17 @@ delta = compute_delta(initial_state, trained_state)
 payload = compress_delta(delta, topk_ratio=0.1)
 
 # Publish as a signed Nostr event
-event = build_gradient_event(
-    payload=payload,
+metadata = GradientEventMetadata(
     run_name="experiment-1",
-    round_number=0,
-    worker_id=pubkey,
+    round_index=0,
+    worker_id=worker_pubkey,
     model_hash=state_digest(initial_state),
-    secret_key=secret_key,
+    inner_steps=100,
+)
+event = build_gradient_event(
+    metadata,
+    payload,
+    secret_key_hex=secret_key_hex,
 )
 ```
 
@@ -372,7 +377,7 @@ event = build_gradient_event(
 | `zstd` | `zstandard>=0.22` | zstd compression (default: zlib) |
 
 ```bash
-pip install -e ".[numpy,torch,zstd]"
+python -m pip install -e ".[numpy,torch,zstd]"
 ```
 
 ## Design decisions
@@ -383,6 +388,28 @@ pip install -e ".[numpy,torch,zstd]"
 
 **Why framework-agnostic transport?** The wire protocol never imports `torch` or `numpy`. Framework code lives at the edges and is entirely optional.
 
+## Project docs
+
+- Architecture and operational notes: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+- Contributor workflow: [`CONTRIBUTING.md`](CONTRIBUTING.md)
+- Changelog: [`CHANGELOG.md`](CHANGELOG.md)
+- Agent context: [`AGENTS.md`](AGENTS.md)
+
+## Development
+
+```bash
+python -m pip install -e ".[dev,numpy]"
+make lint
+make test
+make coverage
+```
+
+Relay changes are the slowest path in the repo. Run this suite before shipping transport or checkpoint changes:
+
+```bash
+python -m pytest tests/test_relay.py -q
+```
+
 ## License
 
-MIT
+This project is licensed under the MIT License. See [`LICENSE`](LICENSE).

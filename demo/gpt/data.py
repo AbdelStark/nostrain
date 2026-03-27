@@ -7,7 +7,6 @@ so each worker trains on different parts of the corpus.
 
 from __future__ import annotations
 
-import os
 import urllib.request
 from pathlib import Path
 
@@ -39,7 +38,7 @@ def download_shakespeare() -> str:
     """Download tiny-shakespeare if not cached, return text."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if not SHAKESPEARE_PATH.exists():
-        print(f"  Downloading tiny-shakespeare...", flush=True)
+        print("  Downloading tiny-shakespeare...", flush=True)
         urllib.request.urlretrieve(SHAKESPEARE_URL, SHAKESPEARE_PATH)
     text = SHAKESPEARE_PATH.read_text(encoding="utf-8")
     # Filter to printable ASCII

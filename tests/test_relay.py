@@ -3,20 +3,19 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import threading
 import time
-from typing import Any
 import unittest
+from pathlib import Path
+from typing import Any
 
 import websockets
 
 from nostrain.aggregation import nesterov_outer_step
-from nostrain.compression import compress_delta
-from nostrain.compression import decompress_payload
+from nostrain.compression import compress_delta, decompress_payload
 from nostrain.model import ModelState, compute_delta, state_digest
 from nostrain.protocol import (
     CheckpointEventMetadata,
@@ -26,12 +25,11 @@ from nostrain.protocol import (
     build_checkpoint_event,
     build_gradient_event,
     build_heartbeat_event,
-    parse_nostrain_event,
     parse_gradient_event,
+    parse_nostrain_event,
 )
 from nostrain.relay import (
     collect_checkpoint_events,
-    collect_checkpoint_events_across_relays,
     collect_gradient_events,
     collect_gradient_events_across_relays,
     collect_heartbeat_events,
@@ -44,7 +42,6 @@ from tests.helpers import (
     assert_state_json_almost_equal,
     build_test_env,
 )
-
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = Path(__file__).resolve().parent / "fixtures"

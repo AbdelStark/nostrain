@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, replace
 import json
 import secrets
 import time
+from dataclasses import dataclass, replace
 from typing import Any, Awaitable, Callable, Iterable, Sequence, TypeVar
 
 from .aggregation import aggregate_deltas

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import json
 import struct
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 

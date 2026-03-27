@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
 import os
-from pathlib import Path
 import sys
-from typing import Any
 import unittest
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any
 
 from nostrain.model import ModelState
 

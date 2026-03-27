@@ -7,23 +7,22 @@ Usage: python demo/worker.py --name alice --color 31 --sec-key HEX ...
 import argparse
 import asyncio
 import json
-import sys
 import time
 
 from nostrain import (
-    HeartbeatEventMetadata,
     GradientEventMetadata,
+    HeartbeatEventMetadata,
     LocalTrainingConfig,
     RegressionDataset,
     RelayRetryPolicy,
     build_gradient_event,
     build_heartbeat_event,
+    collect_gradient_events_across_relays,
     compress_delta,
     compute_delta,
     evaluate_regression,
     nesterov_outer_step,
     publish_nostrain_events,
-    collect_gradient_events_across_relays,
     state_digest,
     train_regression,
 )
@@ -165,7 +164,6 @@ async def run_worker(
 
     # Write result file for summary script
     if result_out:
-        pmap = current_state.parameter_map()
         result = {
             "name": name,
             "initial_loss": initial_loss,

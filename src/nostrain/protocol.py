@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
-from dataclasses import dataclass, replace
 import hashlib
 import json
 import time
+from collections.abc import Iterable
+from dataclasses import dataclass, replace
 from typing import Any
 
 from .compression import CompressedGradientPayload, inspect_payload

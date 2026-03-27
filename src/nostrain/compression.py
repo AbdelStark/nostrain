@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from enum import Enum
 import base64
 import heapq
 import math
 import struct
-from typing import Any
 import zlib
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any
 
 from .model import ModelState, TensorLayout
 

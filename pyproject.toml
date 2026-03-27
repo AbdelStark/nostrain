@@ -8,6 +8,8 @@ version = "0.12.0"
 description = "Protocol, payload, and relay tooling for distributed ML training over Nostr relays."
 readme = "README.md"
 requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
   { name = "Abdel Bakhta" }
 ]
@@ -23,6 +25,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+dev = [
+  "build>=1.2,<2",
+  "coverage>=7.13,<8",
+  "pytest>=9,<10",
+  "pytest-cov>=7,<8",
+  "ruff>=0.15,<0.16",
+]
 numpy = ["numpy>=1.26"]
 torch = ["torch>=2.1"]
 zstd = ["zstandard>=0.22"]
@@ -32,3 +41,21 @@ nostrain = "nostrain.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.coverage.run]
+branch = true
+source = ["nostrain"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]

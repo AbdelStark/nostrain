@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from pathlib import Path
 import unittest
+from pathlib import Path
 
 from nostrain.model import ModelState, apply_delta, compute_delta, state_digest
 from tests.helpers import assert_model_state_almost_equal
-
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 

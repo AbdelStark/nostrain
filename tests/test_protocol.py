@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from pathlib import Path
 import unittest
+from pathlib import Path
 
 from nostrain.compression import compress_delta
 from nostrain.crypto import secret_key_to_public_key
@@ -18,7 +18,6 @@ from nostrain.protocol import (
     parse_heartbeat_event,
 )
 from nostrain.training import TrainingCheckpoint, TrainingRoundSummary
-
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 TEST_SECRET_KEY = "0000000000000000000000000000000000000000000000000000000000000003"

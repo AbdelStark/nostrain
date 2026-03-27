@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from pathlib import Path
 import unittest
+from pathlib import Path
 
 from nostrain.model import ModelState, TensorState
 from nostrain.pytorch import (
@@ -13,7 +13,6 @@ from nostrain.pytorch import (
 )
 from nostrain.runtime import LINEAR_REGRESSION_RUNTIME, MLP_REGRESSION_RUNTIME
 from tests.helpers import assert_model_state_almost_equal, fake_torch_imports
-
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 

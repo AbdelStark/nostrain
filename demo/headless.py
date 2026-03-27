@@ -5,16 +5,14 @@ Runs everything in-process with asyncio tasks. Validates training converges.
 """
 
 import asyncio
-import json
 import sys
 import time
-import threading
 
 sys.path.insert(0, "src")
 
 from nostrain import (
-    HeartbeatEventMetadata,
     GradientEventMetadata,
+    HeartbeatEventMetadata,
     LocalTrainingConfig,
     ModelState,
     RegressionDataset,
@@ -31,11 +29,9 @@ from nostrain import (
     train_regression,
 )
 from nostrain.crypto import secret_key_to_public_key
-from nostrain.stateio import load_model_state
 
 # Import MockRelay from tests
 from tests.test_relay import MockRelay
-
 
 # ── Config ───────────────────────────────────────────────────
 ROUNDS = 5
@@ -105,7 +101,7 @@ async def run_worker(
             relay_urls, heartbeat, open_timeout=10.0, reply_timeout=10.0, retry_policy=retry_policy,
         )
         if not hb_pub.accepted:
-            log(name, color, "!!", f"Heartbeat publish FAILED")
+            log(name, color, "!!", "Heartbeat publish FAILED")
             break
 
         # Inner training
@@ -136,7 +132,7 @@ async def run_worker(
             relay_urls, grad_event, open_timeout=10.0, reply_timeout=10.0, retry_policy=retry_policy,
         )
         if not gp.accepted:
-            log(name, color, "!!", f"Gradient publish FAILED")
+            log(name, color, "!!", "Gradient publish FAILED")
             break
         log(name, color, "^^", f"R{round_index} gradient published ({payload.wire_bytes}B)")
 

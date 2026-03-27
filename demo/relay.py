@@ -31,10 +31,10 @@ class DemoRelay:
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, stop.set)
 
-        async with websockets.serve(self._handle, "127.0.0.1", self.port) as server:
+        async with websockets.serve(self._handle, "127.0.0.1", self.port):
             url = f"ws://127.0.0.1:{self.port}"
             print(f"\033[1;36m{'=' * 60}\033[0m")
-            print(f"\033[1;36m  NOSTRAIN RELAY\033[0m")
+            print("\033[1;36m  NOSTRAIN RELAY\033[0m")
             print(f"\033[1;36m  {url}\033[0m")
             print(f"\033[1;36m{'=' * 60}\033[0m")
             print()
